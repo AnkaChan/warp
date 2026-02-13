@@ -46,6 +46,8 @@
   ([GH-1234](https://github.com/NVIDIA/warp/issues/1234)).
 - Add support for `tile * tile`, `tile * constant`, and `constant * tile` syntax for element-wise and broadcast multiplication ([GH-1006](https://github.com/NVIDIA/warp/issues/1006)).
 - Add support for `tile / tile`, `tile / constant`, and `constant / tile` syntax for element-wise and broadcast division ([GH-1009](https://github.com/NVIDIA/warp/issues/1009)).
+- Add `wp.config.legacy_scalar_return_types` to restore legacy behavior where built-in function calls
+  and vector/matrix indexing return Python native scalar types instead of Warp scalar instances.
 
 ### Removed
 
