@@ -4,6 +4,9 @@
 
 ### Added
 
+- Add `wp.tile_query_count()` for tile BVH and mesh AABB queries, providing a cleaner loop condition that avoids the
+  `wp.tile_max()` reduction overhead.
+
 ### Removed
 
 ### Deprecated
