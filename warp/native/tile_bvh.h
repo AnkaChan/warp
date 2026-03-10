@@ -347,7 +347,7 @@ CUDA_CALLABLE inline auto tile_bvh_query_next(bvh_query_thread_block_t& query)
     return tile_bvh_query_next_impl<WP_TILE_BLOCK_DIM>(query);
 }
 
-CUDA_CALLABLE inline int tile_bvh_query_count(const bvh_query_thread_block_t& query)
+CUDA_CALLABLE inline int tile_query_count(const bvh_query_thread_block_t& query)
 {
     return query.result_counter_shared_mem[0] + query.count_shared_mem[0];
 }
@@ -391,7 +391,7 @@ adj_tile_bvh_query_next(bvh_query_thread_block_t& query, bvh_query_thread_block_
 {
 }
 
-CUDA_CALLABLE inline void adj_tile_bvh_query_count(const bvh_query_thread_block_t&, bvh_query_thread_block_t&, int&) { }
+CUDA_CALLABLE inline void adj_tile_query_count(const bvh_query_thread_block_t&, bvh_query_thread_block_t&, int&) { }
 
 #else
 
@@ -422,7 +422,7 @@ inline auto tile_bvh_query_next(bvh_query_thread_block_t& query)
     return tile_bvh_query_next_impl<1>(query);
 }
 
-inline int tile_bvh_query_count(const bvh_query_thread_block_t& query) { return query.count; }
+inline int tile_query_count(const bvh_query_thread_block_t& query) { return query.count; }
 
 // CPU version: tile_bvh_query_aabb just creates a regular query
 inline bvh_query_thread_block_t tile_bvh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper)
@@ -466,7 +466,7 @@ adj_tile_bvh_query_next(bvh_query_thread_block_t& query, bvh_query_thread_block_
 {
 }
 
-inline void adj_tile_bvh_query_count(const bvh_query_thread_block_t&, bvh_query_thread_block_t&, int&) { }
+inline void adj_tile_query_count(const bvh_query_thread_block_t&, bvh_query_thread_block_t&, int&) { }
 
 #endif  // __CUDA_ARCH__
 

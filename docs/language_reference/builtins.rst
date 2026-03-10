@@ -184,7 +184,6 @@ Tile Primitives
    tile_atomic_add_indexed
    tile_broadcast
    tile_bvh_query_aabb
-   tile_bvh_query_count
    tile_bvh_query_next
    tile_bvh_query_ray
    tile_cholesky
@@ -205,10 +204,10 @@ Tile Primitives
    tile_matmul
    tile_max
    tile_mesh_query_aabb
-   tile_mesh_query_aabb_count
    tile_mesh_query_aabb_next
    tile_min
    tile_ones
+   tile_query_count
    tile_randf
    tile_randi
    tile_reduce
@@ -240,7 +239,6 @@ Geometry
    bvh_get_group_root
    bvh_query_aabb
    bvh_query_aabb_tiled
-   bvh_query_count_tiled
    bvh_query_next
    bvh_query_next_tiled
    bvh_query_ray
@@ -259,7 +257,6 @@ Geometry
    mesh_get_point
    mesh_get_velocity
    mesh_query_aabb
-   mesh_query_aabb_count_tiled
    mesh_query_aabb_next
    mesh_query_aabb_next_tiled
    mesh_query_aabb_tiled

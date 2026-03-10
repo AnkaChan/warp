@@ -630,7 +630,7 @@ def tile_mesh_query_aabb_count_kernel(
 ):
     query = wp.tile_mesh_query_aabb(mesh_id, lower, upper)
 
-    while wp.tile_mesh_query_aabb_count(query) > 0:
+    while wp.tile_query_count(query) > 0:
         result_tile = wp.tile_mesh_query_aabb_next(query)
         result_idx = wp.untile(result_tile)
 

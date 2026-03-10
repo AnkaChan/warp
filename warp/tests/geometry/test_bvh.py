@@ -706,7 +706,7 @@ def tile_bvh_query_count_aabb_kernel(
 ):
     query = wp.tile_bvh_query_aabb(bvh_id, lower, upper)
 
-    while wp.tile_bvh_query_count(query) > 0:
+    while wp.tile_query_count(query) > 0:
         result_tile = wp.tile_bvh_query_next(query)
         result_idx = wp.untile(result_tile)
 
@@ -723,7 +723,7 @@ def tile_bvh_query_count_ray_kernel(
 ):
     query = wp.tile_bvh_query_ray(bvh_id, start, dir)
 
-    while wp.tile_bvh_query_count(query) > 0:
+    while wp.tile_query_count(query) > 0:
         result_tile = wp.tile_bvh_query_next(query)
         result_idx = wp.untile(result_tile)
 
