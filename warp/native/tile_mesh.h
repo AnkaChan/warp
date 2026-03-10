@@ -337,6 +337,11 @@ CUDA_CALLABLE inline auto tile_mesh_query_aabb_next(mesh_query_aabb_thread_block
     return tile_mesh_query_aabb_next_impl<WP_TILE_BLOCK_DIM>(query);
 }
 
+CUDA_CALLABLE inline int tile_mesh_query_aabb_count(const mesh_query_aabb_thread_block_t& query)
+{
+    return query.result_counter_shared_mem[0] + query.count_shared_mem[0];
+}
+
 // New tile-based alias for the query function
 CUDA_CALLABLE inline mesh_query_aabb_thread_block_t
 tile_mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper)
@@ -363,6 +368,11 @@ CUDA_CALLABLE inline void adj_tile_mesh_query_aabb_next_impl(
 CUDA_CALLABLE inline void adj_tile_mesh_query_aabb_next(
     mesh_query_aabb_thread_block_t& query, mesh_query_aabb_thread_block_t&, decltype(tile<int>(0))&
 )
+{
+}
+
+CUDA_CALLABLE inline void
+adj_tile_mesh_query_aabb_count(const mesh_query_aabb_thread_block_t&, mesh_query_aabb_thread_block_t&, int&)
 {
 }
 
@@ -395,6 +405,8 @@ inline auto tile_mesh_query_aabb_next(mesh_query_aabb_thread_block_t& query)
     return tile_mesh_query_aabb_next_impl<1>(query);
 }
 
+inline int tile_mesh_query_aabb_count(const mesh_query_aabb_thread_block_t& query) { return query.count; }
+
 // CPU version: tile_mesh_query_aabb just creates a regular query
 inline mesh_query_aabb_thread_block_t tile_mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper)
 {
@@ -421,6 +433,10 @@ inline void adj_tile_mesh_query_aabb_next_impl(
 inline void adj_tile_mesh_query_aabb_next(
     mesh_query_aabb_thread_block_t& query, mesh_query_aabb_thread_block_t&, decltype(tile_register<int, 1>())&
 )
+{
+}
+
+inline void adj_tile_mesh_query_aabb_count(const mesh_query_aabb_thread_block_t&, mesh_query_aabb_thread_block_t&, int&)
 {
 }
 
