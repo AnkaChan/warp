@@ -51,7 +51,7 @@ except ImportError:
 # The following variables are NVIDIA Modifications
 START_DIRECTORY = os.path.join(os.path.dirname(__file__), "..")  # The directory to start test discovery
 _SUITE_TIMEOUT = (
-    2400  # Timeout in seconds: total wall-clock limit for parallel execution, per-suite limit during isolated fallback
+    3600  # Timeout in seconds: total wall-clock limit for parallel execution, per-suite limit during isolated fallback
 )
 
 
@@ -105,7 +105,7 @@ def main(argv=None):
         "--suite",
         type=str,
         default="default",
-        choices=["autodetect", "default", "kit"],
+        choices=["autodetect", "default", "debug", "kit"],
         help="Name of the test suite to run (default is 'default').",
     )  # NVIDIA Modification
     group_parallel = parser.add_argument_group("parallelization options")
