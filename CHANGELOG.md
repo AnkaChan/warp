@@ -4,7 +4,7 @@
 
 ### Added
 
-- Add `wp.tile_query_count()` for tile BVH and mesh AABB queries, providing a cleaner loop condition that avoids the
+- Add `wp.tile_query_valid()` for tile BVH and mesh AABB queries, providing a cleaner loop condition that avoids the
   `wp.tile_max()` reduction overhead.
 - Add external CUDA texture interoperability, e.g., `wp.Texture2D(cuda_array=handle)` ([GH-1238](https://github.com/NVIDIA/warp/issues/1238)).
 - Add OpenGL texture interoperability using `wp.GLTextureResource` ([GH-1238](https://github.com/NVIDIA/warp/issues/1238)).

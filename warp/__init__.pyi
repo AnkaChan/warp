@@ -4324,10 +4324,10 @@ def tile_bvh_query_next(query: BvhQueryTiled) -> Tile[int32, tuple[int]]:
     ...
 
 @over
-def tile_query_count(query: BvhQueryTiled) -> int:
-    """Return the number of remaining results in a thread-block parallel BVH query.
+def tile_query_valid(query: BvhQueryTiled) -> bool:
+    """Return whether there are remaining results in a thread-block parallel BVH query.
 
-    This function returns a positive value when the query has more results to process, and zero
+    This function returns ``True`` when the query has more results to process, and ``False``
     when the query is fully exhausted. The value is uniform across all threads in the block.
 
     This can be used as a loop condition instead of :func:`tile_max`:
@@ -4335,7 +4335,7 @@ def tile_query_count(query: BvhQueryTiled) -> int:
     .. code-block:: python
 
         query = wp.tile_bvh_query_aabb(bvh_id, lower, upper)
-        while wp.tile_query_count(query) > 0:
+        while wp.tile_query_valid(query):
             result_tile = wp.tile_bvh_query_next(query)
             result_idx = wp.untile(result_tile)
             if result_idx >= 0: ...
@@ -4344,15 +4344,15 @@ def tile_query_count(query: BvhQueryTiled) -> int:
         query: The thread-block BVH query object
 
     Returns:
-        The number of remaining results (positive if more results are available, zero if exhausted)
+        ``True`` if more results are available, ``False`` if exhausted
     """
     ...
 
 @over
-def tile_query_count(query: MeshQueryAABBTiled) -> int:
-    """Return the number of remaining results in a thread-block parallel mesh AABB query.
+def tile_query_valid(query: MeshQueryAABBTiled) -> bool:
+    """Return whether there are remaining results in a thread-block parallel mesh AABB query.
 
-    This function returns a positive value when the query has more results to process, and zero
+    This function returns ``True`` when the query has more results to process, and ``False``
     when the query is fully exhausted. The value is uniform across all threads in the block.
 
     This can be used as a loop condition instead of :func:`tile_max`:
@@ -4360,7 +4360,7 @@ def tile_query_count(query: MeshQueryAABBTiled) -> int:
     .. code-block:: python
 
         query = wp.tile_mesh_query_aabb(mesh_id, lower, upper)
-        while wp.tile_query_count(query) > 0:
+        while wp.tile_query_valid(query):
             result_tile = wp.tile_mesh_query_aabb_next(query)
             result_idx = wp.untile(result_tile)
             if result_idx >= 0: ...
@@ -4369,7 +4369,7 @@ def tile_query_count(query: MeshQueryAABBTiled) -> int:
         query: The thread-block mesh query object
 
     Returns:
-        The number of remaining results (positive if more results are available, zero if exhausted)
+        ``True`` if more results are available, ``False`` if exhausted
     """
     ...
 

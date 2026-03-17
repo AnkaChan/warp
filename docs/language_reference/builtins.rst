@@ -207,7 +207,7 @@ Tile Primitives
    tile_mesh_query_aabb_next
    tile_min
    tile_ones
-   tile_query_count
+   tile_query_valid
    tile_randf
    tile_randi
    tile_reduce

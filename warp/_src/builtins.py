@@ -6452,13 +6452,13 @@ add_builtin(
 )
 
 add_builtin(
-    "tile_query_count",
+    "tile_query_valid",
     input_types={"query": BvhQueryTiled},
-    value_type=int,
+    value_type=bool,
     group="Tile Primitives",
-    doc="""Return the number of remaining results in a thread-block parallel BVH query.
+    doc="""Return whether there are remaining results in a thread-block parallel BVH query.
 
-    This function returns a positive value when the query has more results to process, and zero
+    This function returns ``True`` when the query has more results to process, and ``False``
     when the query is fully exhausted. The value is uniform across all threads in the block.
 
     This can be used as a loop condition instead of :func:`tile_max`:
@@ -6466,7 +6466,7 @@ add_builtin(
     .. code-block:: python
 
         query = wp.tile_bvh_query_aabb(bvh_id, lower, upper)
-        while wp.tile_query_count(query) > 0:
+        while wp.tile_query_valid(query):
             result_tile = wp.tile_bvh_query_next(query)
             result_idx = wp.untile(result_tile)
             if result_idx >= 0:
@@ -6476,8 +6476,8 @@ add_builtin(
         query: The thread-block BVH query object
 
     Returns:
-        The number of remaining results (positive if more results are available, zero if exhausted)""",
-    native_func="tile_query_count",
+        ``True`` if more results are available, ``False`` if exhausted""",
+    native_func="tile_query_valid",
     export=False,
     is_differentiable=False,
 )
@@ -7183,13 +7183,13 @@ add_builtin(
 )
 
 add_builtin(
-    "tile_query_count",
+    "tile_query_valid",
     input_types={"query": MeshQueryAABBTiled},
-    value_type=int,
+    value_type=bool,
     group="Tile Primitives",
-    doc="""Return the number of remaining results in a thread-block parallel mesh AABB query.
+    doc="""Return whether there are remaining results in a thread-block parallel mesh AABB query.
 
-    This function returns a positive value when the query has more results to process, and zero
+    This function returns ``True`` when the query has more results to process, and ``False``
     when the query is fully exhausted. The value is uniform across all threads in the block.
 
     This can be used as a loop condition instead of :func:`tile_max`:
@@ -7197,7 +7197,7 @@ add_builtin(
     .. code-block:: python
 
         query = wp.tile_mesh_query_aabb(mesh_id, lower, upper)
-        while wp.tile_query_count(query) > 0:
+        while wp.tile_query_valid(query):
             result_tile = wp.tile_mesh_query_aabb_next(query)
             result_idx = wp.untile(result_tile)
             if result_idx >= 0:
@@ -7207,8 +7207,8 @@ add_builtin(
         query: The thread-block mesh query object
 
     Returns:
-        The number of remaining results (positive if more results are available, zero if exhausted)""",
-    native_func="tile_query_count",
+        ``True`` if more results are available, ``False`` if exhausted""",
+    native_func="tile_query_valid",
     export=False,
     is_differentiable=False,
 )
