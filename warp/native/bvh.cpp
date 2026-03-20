@@ -853,3 +853,85 @@ void wp_bvh_destroy_device(uint64_t id) { }
 void wp_bvh_rebuild_device(uint64_t id) { }
 
 #endif  // !WP_ENABLE_CUDA
+
+// -----------------------------------------------------------------------
+// Exclusive BVH — sequential top-down construction
+// -----------------------------------------------------------------------
+
+namespace wp {
+
+static inline bounds3 ebvh_node_inclusive(const BVH& bvh, int node)
+{
+    const BVHPackedNodeHalf& lo = bvh.node_lowers[node];
+    const BVHPackedNodeHalf& hi = bvh.node_uppers[node];
+    return bounds3(vec3(lo.x, lo.y, lo.z), vec3(hi.x, hi.y, hi.z));
+}
+
+static inline bool ebvh_node_is_leaf(const BVH& bvh, int node)
+{
+    return bvh.node_lowers[node].b == 1;
+}
+
+static inline int ebvh_node_left(const BVH& bvh, int node)  { return (int)bvh.node_lowers[node].i; }
+static inline int ebvh_node_right(const BVH& bvh, int node) { return (int)bvh.node_uppers[node].i; }
+
+static void ebvh_build_recursive(BVH& bvh, int node, const bounds3& parent_exc)
+{
+    bvh.exclusive[node] = parent_exc;
+
+    if (ebvh_node_is_leaf(bvh, node))
+        return;
+
+    int L = ebvh_node_left(bvh, node);
+    int R = ebvh_node_right(bvh, node);
+
+    if (parent_exc.empty())
+    {
+        ebvh_build_recursive(bvh, L, parent_exc);
+        ebvh_build_recursive(bvh, R, parent_exc);
+        return;
+    }
+
+    bounds3 iL = ebvh_node_inclusive(bvh, L);
+    bounds3 iR = ebvh_node_inclusive(bvh, R);
+
+    int a = ebvh_choose_axis(parent_exc, iL, iR);
+
+    bounds3 eL = parent_exc;
+    bounds3 eR = parent_exc;
+
+    eL.upper[a] = min(parent_exc.upper[a], iR.lower[a]);
+    eR.lower[a] = max(parent_exc.lower[a], iL.upper[a]);
+
+    ebvh_build_recursive(bvh, L, eL);
+    ebvh_build_recursive(bvh, R, eR);
+}
+
+void ebvh_build_host(BVH& bvh)
+{
+    assert(bvh.exclusive != nullptr);
+    assert(bvh.root != nullptr);
+
+    // Use I(root) for construction so axis selection has finite extents.
+    // Then set E(root) = infinite so the walk-up always terminates at root.
+    bounds3 root_box = ebvh_node_inclusive(bvh, *bvh.root);
+    ebvh_build_recursive(bvh, *bvh.root, root_box);
+
+    bvh.exclusive[*bvh.root] = bounds3(
+        vec3(-FLT_MAX, -FLT_MAX, -FLT_MAX),
+        vec3( FLT_MAX,  FLT_MAX,  FLT_MAX));
+}
+
+void ebvh_create_host(BVH& bvh)
+{
+    bvh.exclusive = new bounds3[bvh.max_nodes];
+    ebvh_build_host(bvh);
+}
+
+void ebvh_destroy_host(BVH& bvh)
+{
+    delete[] bvh.exclusive;
+    bvh.exclusive = nullptr;
+}
+
+}  // namespace wp

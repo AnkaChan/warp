@@ -189,6 +189,11 @@ struct BVH {
 
     // cuda context
     void* context;
+
+    // Exclusive BVH: per-node exclusive box, parallel to node_lowers/node_uppers.
+    // nullptr when exclusive boxes have not been computed.
+    // Allocated by ebvh_create_host(), freed by ebvh_destroy_host().
+    bounds3* exclusive;
 };
 
 CUDA_CALLABLE inline BVHPackedNodeHalf make_node(const vec3& bound, int child, bool leaf)
@@ -580,6 +585,160 @@ void bvh_destroy_device(BVH& bvh);
 void bvh_refit_device(BVH& bvh);
 
 #endif  // WP_ENABLE_CUDA
+
+// -----------------------------------------------------------------------
+// Exclusive BVH construction
+// -----------------------------------------------------------------------
+
+// Accessor for the exclusive box of a node.
+CUDA_CALLABLE inline const bounds3& bvh_exclusive(const BVH& bvh, int node) { return bvh.exclusive[node]; }
+
+// Choose split axis: try all 3 axes, pick the one that maximizes
+// total preserved extent (eL_extent + eR_extent) for the two children.
+// When the parent exclusive box has infinite extent (e.g., near root),
+// the score is infinite on those axes — fall back to the axis with the
+// largest gap between the sibling inclusive boxes.
+CUDA_CALLABLE inline int ebvh_choose_axis(const bounds3& parent_exc,
+                                          const bounds3& iL, const bounds3& iR)
+{
+    int best_axis = 0;
+    float best_score = -FLT_MAX;
+    bool any_finite = false;
+
+    for (int a = 0; a < 3; a++)
+    {
+        float p_extent = parent_exc.upper[a] - parent_exc.lower[a];
+        if (p_extent < FLT_MAX * 0.5f)  // finite extent on this axis
+        {
+            float eL_extent = min(parent_exc.upper[a], iR.lower[a]) - parent_exc.lower[a];
+            float eR_extent = parent_exc.upper[a] - max(parent_exc.lower[a], iL.upper[a]);
+            float score = eL_extent + eR_extent;
+            if (!any_finite || score > best_score) { best_score = score; best_axis = a; }
+            any_finite = true;
+        }
+    }
+
+    if (!any_finite)
+    {
+        // All axes infinite — use the axis with largest sibling gap
+        for (int a = 0; a < 3; a++)
+        {
+            float gap = iR.lower[a] - iL.upper[a];
+            if (gap < 0) gap = iL.lower[a] - iR.upper[a];  // try other order
+            if (gap > best_score) { best_score = gap; best_axis = a; }
+        }
+    }
+
+    return best_axis;
+}
+
+// Build exclusive boxes for an already-constructed BVH.
+// Caller must have allocated bvh.exclusive[max_nodes].
+void ebvh_build_host(BVH& bvh);
+
+// Convenience: allocate bvh.exclusive[] + build. BVH must already be constructed.
+void ebvh_create_host(BVH& bvh);
+
+// Free exclusive[]. Does NOT free other BVH fields.
+void ebvh_destroy_host(BVH& bvh);
+
+// -----------------------------------------------------------------------
+// Exclusive BVH bottom-up query
+// -----------------------------------------------------------------------
+
+// Strict containment: Q must be properly inside ebox (not touching boundary).
+// This ensures correctness under both strict and non-strict overlap semantics.
+CUDA_CALLABLE inline bool ebvh_contains_strict(const bounds3& ebox,
+                                               const vec3& q_lower, const vec3& q_upper)
+{
+    return q_lower[0] > ebox.lower[0] && q_lower[1] > ebox.lower[1] && q_lower[2] > ebox.lower[2] &&
+           q_upper[0] < ebox.upper[0] && q_upper[1] < ebox.upper[1] && q_upper[2] < ebox.upper[2];
+}
+
+// Walk up from seed to find the lowest ancestor whose exclusive box strictly
+// contains the query. Returns *bvh.root if no ancestor qualifies.
+CUDA_CALLABLE inline int ebvh_find_containment(const BVH& bvh,
+                                                const vec3& q_lower, const vec3& q_upper,
+                                                int seed)
+{
+    int node = seed;
+    while (node != -1)
+    {
+        if (bvh.exclusive && ebvh_contains_strict(bvh.exclusive[node], q_lower, q_upper))
+            return node;
+        node = bvh.node_parents[node];
+    }
+    return *bvh.root;
+}
+
+// Bottom-up AABB query: find containment node from seed, then top-down from there.
+CUDA_CALLABLE inline bvh_query_t ebvh_query_aabb(uint64_t id,
+                                                  const vec3& lower, const vec3& upper,
+                                                  int seed)
+{
+    BVH bvh = bvh_get(id);
+    int start = ebvh_find_containment(bvh, lower, upper, seed);
+    return bvh_query(id, false, lower, upper, start);
+}
+
+// Interleaved bottom-up query: search seed subtree, then escalate one level
+// at a time, searching only the unvisited sibling at each step.
+// Results are collected via a callback: fn(int primitive_index).
+// Returns the containment node where the query terminated.
+template <typename ResultFn>
+CUDA_CALLABLE inline int ebvh_query_aabb_interleaved(const BVH& bvh,
+                                                      const vec3& q_lower, const vec3& q_upper,
+                                                      int seed, ResultFn fn)
+{
+    // Helper: top-down AABB query from a given node, calling fn for each hit primitive
+    struct Local {
+        CUDA_CALLABLE static void topdown(const BVH& bvh, int node,
+                                          const vec3& q_lower, const vec3& q_upper,
+                                          ResultFn& fn)
+        {
+            float nx = bvh.node_lowers[node].x, ny = bvh.node_lowers[node].y, nz = bvh.node_lowers[node].z;
+            float ux = bvh.node_uppers[node].x, uy = bvh.node_uppers[node].y, uz = bvh.node_uppers[node].z;
+
+            if (q_lower[0] > ux || q_upper[0] < nx ||
+                q_lower[1] > uy || q_upper[1] < ny ||
+                q_lower[2] > uz || q_upper[2] < nz)
+                return;
+
+            if (bvh.node_lowers[node].b == 1) {
+                int prim_begin = (int)bvh.node_lowers[node].i;
+                int prim_end   = (int)bvh.node_uppers[node].i;
+                for (int i = prim_begin; i < prim_end; i++)
+                    fn(bvh.primitive_indices[i]);
+                return;
+            }
+            topdown(bvh, (int)bvh.node_lowers[node].i, q_lower, q_upper, fn);
+            topdown(bvh, (int)bvh.node_uppers[node].i, q_lower, q_upper, fn);
+        }
+    };
+
+    // Search seed's subtree
+    Local::topdown(bvh, seed, q_lower, q_upper, fn);
+
+    // Escalate
+    int prev = seed;
+    while (true)
+    {
+        if (bvh.exclusive && ebvh_contains_strict(bvh.exclusive[prev], q_lower, q_upper))
+            return prev;
+
+        int parent = bvh.node_parents[prev];
+        if (parent == -1)
+            return *bvh.root;
+
+        // Search the sibling (the child of parent that is not prev)
+        int left  = (int)bvh.node_lowers[parent].i;
+        int right = (int)bvh.node_uppers[parent].i;
+        int sibling = (prev == left) ? right : left;
+        Local::topdown(bvh, sibling, q_lower, q_upper, fn);
+
+        prev = parent;
+    }
+}
 
 }  // namespace wp
 
