@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
@@ -2876,7 +2864,7 @@ class array(Array[DType, NDim]):
         ``wp.empty()``, ``wp.zeros()``, or ``wp.full()`` instead to create new arrays.
 
         If none of the above arguments are specified, a simple type annotation is constructed.  This is used when annotating
-        kernel arguments or struct members (e.g.,``arr: wp.array(dtype=float)``).  In this case, only ``dtype`` and ``ndim``
+        kernel arguments or struct members (e.g., ``arr: wp.array[float]``).  In this case, only ``dtype`` and ``ndim``
         are taken into account and no memory is allocated for the array.
 
         Args:
@@ -4110,7 +4098,7 @@ class array(Array[DType, NDim]):
         Note: The transpose operation will return an array with a non-contiguous access pattern.
 
         Args:
-            axes (optional): Specifies the how the axes are permuted. If not specified, the axes order will be reversed.
+            axes: Specifies how the axes are permuted. If not specified, the axes order will be reversed.
         """
         # noop if 1d array
         if self.ndim == 1:
@@ -4265,7 +4253,6 @@ def from_ptr(ptr, length, dtype=None, shape=None, device=None):
     .. deprecated::
         Use the :class:`array` constructor with a ``ptr`` argument instead.
 
-    For OmniGraph applications, use :func:`from_omni_graph_ptr`.
     To create an array from a C pointer, use the :class:`array` constructor
     with the ``ptr`` argument as a ``uint64`` representing the memory address.
 
@@ -6037,7 +6024,7 @@ class Volume:
 
         Args:
             min_world: The 3D coordinate of the lower corner of the volume.
-            voxel_size (float or array-like): The size of each voxel in spatial
+            voxel_size: The size of each voxel in spatial
                 coordinates. Can be a scalar for isotropic voxels or a 3-element
                 sequence ``(sx, sy, sz)`` for anisotropic voxels.
             bg_value: Background value
@@ -6138,13 +6125,13 @@ class Volume:
         the resulting tiles will be available in the new volume.
 
         Args:
-            min (array-like): Lower 3D coordinates of the bounding box in index space or world space, inclusive.
-            max (array-like): Upper 3D coordinates of the bounding box in index space or world space, inclusive.
-            voxel_size (float or array-like): Voxel size(s) of the new volume. Can be a scalar for isotropic
+            min: Lower 3D coordinates of the bounding box in index space or world space, inclusive.
+            max: Upper 3D coordinates of the bounding box in index space or world space, inclusive.
+            voxel_size: Voxel size(s) of the new volume. Can be a scalar for isotropic
                 voxels or a 3-element sequence ``(sx, sy, sz)`` for anisotropic voxels.
-            bg_value (float or array-like): Value of unallocated voxels of the volume, also defines the volume's type,
+            bg_value: Value of unallocated voxels of the volume, also defines the volume's type,
               a :class:`warp.vec3` volume is created if this is `array-like`, otherwise a float volume is created
-            translation (array-like): Translation between the index and world spaces.
+            translation: Translation between the index and world spaces.
             device: The CUDA device to create the volume on, e.g.: ``"cuda"`` or ``"cuda:0"``.
         """
         voxel_size = cls._normalize_voxel_size(voxel_size)
@@ -6252,12 +6239,12 @@ class Volume:
               The array may use an integer scalar type (2D N-by-3 array of :class:`warp.int32` or 1D array of :class:`warp.vec3i` values), indicating index space positions,
               or a floating point scalar type (2D N-by-3 array of :class:`warp.float32` or 1D array of :class:`warp.vec3f` values), indicating world space positions.
               Repeated points per tile are allowed and will be efficiently deduplicated.
-            voxel_size (float or array-like): Voxel size(s) of the new volume. Ignored if ``transform`` is given.
-            bg_value (array-like, scalar or None): Value of unallocated voxels of the volume, also defines the volume's type.
+            voxel_size: Voxel size(s) of the new volume. Ignored if ``transform`` is given.
+            bg_value: Value of unallocated voxels of the volume, also defines the volume's type.
               An index volume will be created if ``bg_value`` is ``None``.
               Other supported grid types are ``int``, ``float``, ``vec3f``, and ``vec4f``.
-            translation (array-like): Translation between the index and world spaces.
-            transform (array-like): Linear transform between the index and world spaces.
+            translation: Translation between the index and world spaces.
+            transform: Linear transform between the index and world spaces.
               If ``None``, deduced from ``voxel_size``.
             device: The CUDA device to create the volume on, e.g. ``"cuda"`` or ``"cuda:0"``.
 
@@ -6358,9 +6345,9 @@ class Volume:
                 The array may use an integer scalar type (2D N-by-3 array of :class:`warp.int32` or 1D array of :class:`warp.vec3i` values), indicating index space positions,
                 or a floating point scalar type (2D N-by-3 array of :class:`warp.float32` or 1D array of :class:`warp.vec3f` values), indicating world space positions.
                 Repeated points per tile are allowed and will be efficiently deduplicated.
-            voxel_size (float or array-like): Voxel size(s) of the new volume. Ignored if ``transform`` is given.
-            translation (array-like): Translation between the index and world spaces.
-            transform (array-like): Linear transform between the index and world spaces.
+            voxel_size: Voxel size(s) of the new volume. Ignored if ``transform`` is given.
+            translation: Translation between the index and world spaces.
+            transform: Linear transform between the index and world spaces.
               If ``None``, deduced from ``voxel_size``.
             device: The CUDA device to create the volume on, e.g. ``"cuda"`` or ``"cuda:0"``.
 
@@ -6463,7 +6450,7 @@ class MeshQueryRay:
         normal (vec3f): Face normal.
 
     See Also:
-        :func:`mesh_query_ray`.
+        :func:`mesh_query_ray() <warp._src.lang.mesh_query_ray>`.
     """
 
     from warp._src.codegen import Var as _Var  # noqa: PLC0415

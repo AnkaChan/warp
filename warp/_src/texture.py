@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """Texture classes for hardware-accelerated sampling on GPU and software sampling on CPU."""
 
@@ -24,6 +12,8 @@ from typing import TYPE_CHECKING, ClassVar
 import numpy as np
 
 if TYPE_CHECKING:
+    import numpy
+
     from warp._src.context import DeviceLike
 
 from warp._src.types import (
@@ -206,7 +196,7 @@ class Texture:
     def __init__(
         self,
         ndim: int,
-        data: np.ndarray | array | None = None,
+        data: numpy.ndarray | array | None = None,
         width: int = 0,
         height: int = 0,
         depth: int = 0,
@@ -523,7 +513,7 @@ class Texture:
         else:
             return (*shape, self._num_channels)
 
-    def copy_from(self, src: array | np.ndarray | Texture):
+    def copy_from(self, src: array | numpy.ndarray | Texture):
         """Copy texture data from a source.
 
         Args:
@@ -613,7 +603,7 @@ class Texture:
             self_array = array(ptr=self._host_ptr, shape=self._get_shape(), dtype=self.dtype, device=self.device)
             warp._src.context.copy(self_array, src)
 
-    def copy_to(self, dst: array | np.ndarray | Texture):
+    def copy_to(self, dst: array | numpy.ndarray | Texture):
         """Copy texture data to a destination.
 
         Args:
@@ -933,7 +923,7 @@ class Texture1D(Texture):
 
     def __init__(
         self,
-        data: np.ndarray | array | None = None,
+        data: numpy.ndarray | array | None = None,
         width: int = 0,
         num_channels: int = 0,
         dtype=None,
@@ -1009,7 +999,7 @@ class Texture2D(Texture):
 
     def __init__(
         self,
-        data: np.ndarray | array | None = None,
+        data: numpy.ndarray | array | None = None,
         width: int = 0,
         height: int = 0,
         num_channels: int = 0,
@@ -1087,7 +1077,7 @@ class Texture3D(Texture):
 
     def __init__(
         self,
-        data: np.ndarray | array | None = None,
+        data: numpy.ndarray | array | None = None,
         width: int = 0,
         height: int = 0,
         depth: int = 0,

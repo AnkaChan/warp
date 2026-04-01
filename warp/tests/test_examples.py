@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """Test Warp examples with unittest.
 
 This module tests the Warp examples registered in it using the unittest
@@ -417,6 +405,36 @@ add_example_test(
 #     name="fem.example_nonconforming_contact",
 #     devices=test_devices,
 #     test_options={"headless": True, "resolution": 16, "num_steps": 2},
+# )
+# add_example_test(
+#     TestFemExamples,
+#     name="fem.example_elastic_shape_optimization",
+#     devices=cuda_test_devices,
+#     test_options={"num_iters": 5, "headless": True},
+# )
+# add_example_test(
+#     TestFemExamples,
+#     name="fem.example_darcy_ls_optimization",
+#     devices=cuda_test_devices,
+#     test_options={"num_iters": 5, "resolution": 25, "headless": True},
+# )
+# add_example_test(
+#     TestFemExamples,
+#     name="fem.example_taylor_green",
+#     devices=cuda_test_devices,
+#     test_options={"num_frames": 10, "resolution": 10, "headless": True},
+# )
+# add_example_test(
+#     TestFemExamples,
+#     name="fem.example_shallow_water",
+#     devices=cuda_test_devices,
+#     test_options={"num_frames": 10, "resolution": 10, "headless": True},
+# )
+# add_example_test(
+#     TestFemExamples,
+#     name="fem.example_kelvin_helmholtz",
+#     devices=cuda_test_devices,
+#     test_options={"num_frames": 25, "resolution": 20, "headless": True},
 # )
 
 
