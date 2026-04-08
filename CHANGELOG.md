@@ -6,10 +6,6 @@
 
 - Add `wp.tile_query_valid()` for tile BVH and mesh AABB queries, providing a cleaner loop condition that avoids the
   `wp.tile_max()` reduction overhead.
-- Add external CUDA texture interoperability, e.g., `wp.Texture2D(cuda_array=handle)` ([GH-1238](https://github.com/NVIDIA/warp/issues/1238)).
-- Add OpenGL texture interoperability using `wp.GLTextureResource` ([GH-1238](https://github.com/NVIDIA/warp/issues/1238)).
-- Add `Texture.copy_from()` that can copy from host and device arrays as well as other textures.
-- Add `Texture.copy_to()` that can copy to host and device arrays as well as other textures.
 - Add double-precision (`wp.float64`) support to `warp.fem`.
   Precision is selected via the geometry (e.g. `scalar_type=wp.float64` on grid constructors)
   and propagated automatically to function spaces, quadrature, fields, and integration kernels
