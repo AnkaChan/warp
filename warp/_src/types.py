@@ -13,11 +13,10 @@ import struct
 import sys
 import types
 import zlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     ClassVar,
     Generic,
     Literal,
@@ -596,11 +595,11 @@ def constant(x):
     return x
 
 
-def float_to_half_bits(value):
+def float_to_half_bits(value: float) -> int:
     return warp._src.context.runtime.core.wp_float_to_half_bits(value)
 
 
-def half_bits_to_float(value):
+def half_bits_to_float(value: int) -> float:
     return warp._src.context.runtime.core.wp_half_bits_to_float(value)
 
 
@@ -711,7 +710,7 @@ def _binary_op(self, op, x, t, cw=True):
     if kind == BuiltinOpDispatchKind.BROADCAST_SCALAR:
         return t(*(warp._src.context.call_builtin_from_desc(desc, (a, x)) for a in self))
 
-    return t(*(warp._src.context.call_builtin_from_desc(desc, (a, b)) for a, b in zip(self, x)))
+    return t(*(warp._src.context.call_builtin_from_desc(desc, (a, b)) for a, b in zip(self, x, strict=True)))
 
 
 def _rbinary_op(self, op, x, t, cw=True):
@@ -739,7 +738,7 @@ def _rbinary_op(self, op, x, t, cw=True):
     if kind == BuiltinOpDispatchKind.BROADCAST_SCALAR:
         return t(*(warp._src.context.call_builtin_from_desc(desc, (x, a)) for a in self))
 
-    return t(*(warp._src.context.call_builtin_from_desc(desc, (b, a)) for a, b in zip(self, x)))
+    return t(*(warp._src.context.call_builtin_from_desc(desc, (b, a)) for a, b in zip(self, x, strict=True)))
 
 
 @functools.cache
@@ -858,7 +857,7 @@ def vector(length, dtype):
                     try:
                         for x in value:
                             converted.append(vec_t.scalar_import(x))
-                    except ctypes.ArgumentError:
+                    except (ctypes.ArgumentError, TypeError):
                         raise TypeError(
                             f"Expected to assign a slice from a sequence of `float16` values "
                             f"but got `{type(x).__name__}` instead"
@@ -869,12 +868,12 @@ def vector(length, dtype):
                 try:
                     return super().__setitem__(key, value)
                 except TypeError:
-                    # ctypes.Array doesn't accept this sequence type (e.g. torch tensors)
-                    # or the sequence has a different size, fall back to element-by-element assignment
+                    # ctypes.Array doesn't accept this sequence type (e.g. torch tensors),
+                    # fall back to element-by-element assignment
                     if indices is None:
                         indices = range(*key.indices(self._length_))
 
-                    for idx, x in zip(indices, value):
+                    for idx, x in zip(indices, value, strict=True):
                         try:
                             super().__setitem__(idx, self._type_(x))
                         except TypeError:
@@ -1170,7 +1169,7 @@ def matrix(shape, dtype):
                 try:
                     for x in v:
                         converted.append(mat_t.scalar_import(x))
-                except ctypes.ArgumentError:
+                except (ctypes.ArgumentError, TypeError):
                     raise TypeError(
                         f"Expected to assign a slice from a sequence of `float16` values "
                         f"but got `{type(x).__name__}` instead"
@@ -1207,7 +1206,7 @@ def matrix(shape, dtype):
                 try:
                     for x in v:
                         converted.append(mat_t.scalar_import(x))
-                except ctypes.ArgumentError:
+                except (ctypes.ArgumentError, TypeError):
                     raise TypeError(
                         f"Expected to assign a slice from a sequence of `float16` values "
                         f"but got `{type(x).__name__}` instead"
@@ -2373,7 +2372,7 @@ def type_repr(t) -> str:
     if is_tuple(t):
         return f"tuple({', '.join(type_repr(x) for x in t.types)})"
     if get_origin(t) is tuple:
-        # Handle Python 3.9+ native tuple[...] syntax
+        # Handle native tuple[...] syntax
         args = get_args(t)
         if args:
             return f"tuple({', '.join(type_repr(x) for x in args)})"
@@ -2399,7 +2398,7 @@ def type_repr(t) -> str:
         return f"vector(length={t._shape_[0]}, dtype={type_repr(t._wp_scalar_type_)})"
     if type_is_matrix(t):
         if sn is not None and t._shape_[0] <= 4 and t._shape_[1] <= 4:
-            return f"mat{t._shape_[0]}{t._shape_[1]}({sn})"
+            return f"mat{t._shape_[0]}{t._shape_[1]}{sn}"
         return f"matrix(shape=({t._shape_[0]}, {t._shape_[1]}), dtype={type_repr(t._wp_scalar_type_)})"
     if t in scalar_types:
         return t.__name__
@@ -2666,7 +2665,7 @@ def types_equal_generic(a, b, match_generic=True):
                 return seq_match_ellipsis(b, a)
 
             return len(a) == len(b) and all(
-                types_equal_generic(x, y, match_generic=match_generic) for x, y in zip(a, b)
+                types_equal_generic(x, y, match_generic=match_generic) for x, y in zip(a, b, strict=True)
             )
         elif a_is_seq or b_is_seq:
             # A sequence can only match to another sequence.
@@ -2691,7 +2690,7 @@ def types_equal_generic(a, b, match_generic=True):
         if not isinstance(a, type) or not isinstance(b, type):
             return False
 
-        for p1, p2 in zip(a._wp_type_params_, b._wp_type_params_):
+        for p1, p2 in zip(a._wp_type_params_, b._wp_type_params_, strict=True):
             if not scalars_equal_generic(p1, p2, match_generic=match_generic):
                 return False
 
@@ -4645,7 +4644,22 @@ class _ArrayAnnotationBase:
         self.ndim = ndim
 
     def __repr__(self):
-        dtype_str = "Any" if self.dtype is Any else self.dtype
+        if self.dtype is Any:
+            dtype_str = "Any"
+        elif hasattr(self.dtype, "key"):
+            # Struct instances use .key instead of __name__
+            dtype_str = self.dtype.key
+        else:
+            name = getattr(self.dtype, "__name__", None)
+            if name and getattr(warp, name, None) is self.dtype:
+                dtype_str = f"wp.{name}"
+            else:
+                # Custom vector/matrix/quaternion/transformation types
+                repr_name = type_repr(self.dtype)
+                if getattr(warp, repr_name, None) is not None:
+                    dtype_str = f"wp.{repr_name}"
+                else:
+                    dtype_str = repr_name
         ndim_str = "Any" if self.ndim is Any else self.ndim
         return f"wp.{self._concrete_cls.__name__}(dtype={dtype_str}, ndim={ndim_str})"
 
@@ -6617,7 +6631,7 @@ def type_generic_equal(a, b):
     if getattr(a, "_wp_generic_type_hint_", "a") is not getattr(b, "_wp_generic_type_hint_", "b"):
         return False
 
-    for p1, p2 in zip(a._wp_type_params_, b._wp_type_params_):
+    for p1, p2 in zip(a._wp_type_params_, b._wp_type_params_, strict=True):
         if not scalars_equal(p1, p2):
             return False
 

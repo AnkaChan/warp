@@ -6,8 +6,8 @@ from __future__ import annotations
 import builtins
 import functools
 import math
-from collections.abc import Mapping, Sequence
-from typing import Any, Callable
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 import warp._src.build
 import warp._src.context
@@ -26,7 +26,7 @@ def seq_check_equal(seq_1, seq_2):
     if len(seq_1) != len(seq_2):
         return False
 
-    return all(x == y for x, y in zip(seq_1, seq_2))
+    return all(x == y for x, y in zip(seq_1, seq_2, strict=True))
 
 
 def sametypes(arg_types: Mapping[str, Any]):
@@ -529,7 +529,7 @@ def _check_vars_match_dtype(arg_values, arg_types, dtype, msg):
     else:
         values = tuple(v for k, v in arg_values.items() if k not in skip_keys)
 
-    for t, v in zip(arg_types, values):
+    for t, v in zip(arg_types, values, strict=True):
         if not isinstance(v, Var):
             continue  # compile-time constant — will be cast in dispatch
         # Extract the scalar type from compound types (vec, mat, quat).
@@ -6044,10 +6044,10 @@ def tile_n_map_value_func(arg_types, arg_values):
     if overload.value_func is None:
         overload.build(None)
 
-    arg_type_map = dict(zip(overload.input_types, dtypes))
-    assert len(arg_type_map) == len(dtypes) == len(overload.input_types), (
+    assert len(dtypes) == len(overload.input_types), (
         f"Overload parameter count mismatch: expected {len(dtypes)}, got {len(overload.input_types)}"
     )
+    arg_type_map = dict(zip(overload.input_types, dtypes, strict=True))
     value_type = overload.value_func(arg_type_map, None)
 
     if not type_is_scalar(value_type) and not type_is_vector(value_type) and not type_is_matrix(value_type):
@@ -7832,6 +7832,36 @@ add_builtin(
     value_type=vec3,
     group="Volumes",
     doc="""Transform a direction ``xyz`` defined in volume world space to the volume's index space given the volume's intrinsic affine transformation.""",
+)
+
+# fp64 overloads for volume transform functions
+add_builtin(
+    "volume_index_to_world",
+    input_types={"id": uint64, "uvw": vec3d},
+    value_type=vec3d,
+    group="Volumes",
+    doc="""Transform a point ``uvw`` defined in volume index space to world space, using double precision.""",
+)
+add_builtin(
+    "volume_world_to_index",
+    input_types={"id": uint64, "xyz": vec3d},
+    value_type=vec3d,
+    group="Volumes",
+    doc="""Transform a point ``xyz`` defined in volume world space to index space, using double precision.""",
+)
+add_builtin(
+    "volume_index_to_world_dir",
+    input_types={"id": uint64, "uvw": vec3d},
+    value_type=vec3d,
+    group="Volumes",
+    doc="""Transform a direction ``uvw`` defined in volume index space to world space, using double precision.""",
+)
+add_builtin(
+    "volume_world_to_index_dir",
+    input_types={"id": uint64, "xyz": vec3d},
+    value_type=vec3d,
+    group="Volumes",
+    doc="""Transform a direction ``xyz`` defined in volume world space to index space, using double precision.""",
 )
 
 
@@ -12235,6 +12265,9 @@ def tile_fft_generic_value_func(arg_types, arg_values, func_name="tile_fft"):
             f"{func_name}() argument must be a tile of vec2f or vec2d (interpreted as complex) entries, got {inout.dtype!r}"
         )
 
+    if len(inout.shape) < 2:
+        raise ValueError(f"{func_name}() argument must be a tile with at least 2 dimensions, got {len(inout.shape)}D")
+
     return None
 
 
@@ -12271,8 +12304,8 @@ def tile_fft_generic_lto_dispatch_func(
     else:
         raise TypeError(f"Unsupported data type, got {dtype!r}")
 
-    # M FFTs of size N each
-    batch, size = inout.type.shape[0], inout.type.shape[1]
+    # batch = product of all leading dims, size = last (FFT) dim
+    batch, size = math.prod(inout.type.shape[:-1]), inout.type.shape[-1]
     num_threads = options["block_dim"]
     arch = options["output_arch"]
     ept = size // num_threads
@@ -12324,16 +12357,18 @@ def tile_fft_generic_lto_dispatch_func(
 
 add_builtin(
     "tile_fft",
-    input_types={"inout": tile(dtype=vector(length=2, dtype=Float), shape=tuple[int, int])},
+    input_types={"inout": tile(dtype=vector(length=2, dtype=Float), shape=tuple[int, ...])},
     value_func=functools.partial(tile_fft_generic_value_func, func_name="tile_fft"),
     lto_dispatch_func=functools.partial(tile_fft_generic_lto_dispatch_func, direction="forward"),
     variadic=True,
-    doc="""Compute the forward FFT along the second dimension of a 2D tile of data.
+    doc="""Compute the forward FFT along the last dimension of an N-D tile of data.
 
-    This function cooperatively computes the forward FFT on a tile of data inplace, treating each row individually.
+    This function cooperatively computes the forward FFT on a tile of data inplace.
+    All leading dimensions are treated as independent batch dimensions.
+    The tile must have at least two dimensions.
 
     The transform is unnormalized, meaning that applying :func:`tile_fft` followed by :func:`tile_ifft`
-    will scale the data by N, where N is the FFT size (the second dimension of the tile).
+    will scale the data by N, where N is the FFT size (the last dimension of the tile).
     Normalization is left to the user to perform as needed.
 
     Supported datatypes are:
@@ -12348,16 +12383,18 @@ add_builtin(
 
 add_builtin(
     "tile_ifft",
-    input_types={"inout": tile(dtype=vector(length=2, dtype=Float), shape=tuple[int, int])},
+    input_types={"inout": tile(dtype=vector(length=2, dtype=Float), shape=tuple[int, ...])},
     value_func=functools.partial(tile_fft_generic_value_func, func_name="tile_ifft"),
     lto_dispatch_func=functools.partial(tile_fft_generic_lto_dispatch_func, direction="inverse"),
     variadic=True,
-    doc="""Compute the inverse FFT along the second dimension of a 2D tile of data.
+    doc="""Compute the inverse FFT along the last dimension of an N-D tile of data.
 
-    This function cooperatively computes the inverse FFT on a tile of data inplace, treating each row individually.
+    This function cooperatively computes the inverse FFT on a tile of data inplace.
+    All leading dimensions are treated as independent batch dimensions.
+    The tile must have at least two dimensions.
 
     The transform is unnormalized, meaning that applying :func:`tile_fft` followed by :func:`tile_ifft`
-    will scale the data by N, where N is the FFT size (the second dimension of the tile).
+    will scale the data by N, where N is the FFT size (the last dimension of the tile).
     Normalization is left to the user to perform as needed.
 
     Supported datatypes are:
