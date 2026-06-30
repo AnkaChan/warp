@@ -54,7 +54,7 @@ def compute_num_contacts(
     upper = uppers[tid]
     lower = lowers[tid]
 
-    query = wp.mesh_query_aabb(mesh_id, lower, upper)
+    query = wp.mesh_query_aabb(mesh_id, lower, upper, False)
     count = int(0)
 
     # index = int(-1)
@@ -199,7 +199,7 @@ def compute_num_contact_with_checksums(
     upper = uppers[tid]
     lower = lowers[tid]
 
-    query = wp.mesh_query_aabb(mesh_id, lower, upper)
+    query = wp.mesh_query_aabb(mesh_id, lower, upper, False)
     count = int(0)
 
     check_sum = int(0)
@@ -368,7 +368,7 @@ def mesh_query_aabb_kernel(
     upper: wp.vec3,
     faces_intersected: wp.array[int],
 ):
-    query = wp.mesh_query_aabb(mesh_id, lower, upper)
+    query = wp.mesh_query_aabb(mesh_id, lower, upper, False)
 
     index = int(0)
     while wp.mesh_query_aabb_next(query, index):
@@ -629,6 +629,166 @@ def tile_mesh_query_aabb_valid_kernel(
             wp.atomic_add(faces_intersected, result_idx, 1)
 
 
+@wp.kernel
+def mesh_query_sphere_hits(mesh_id: wp.uint64, center: wp.vec3, radius: float, hits: wp.array(dtype=int)):
+    query = wp.mesh_query_sphere(mesh_id, center, radius)
+    face = int(0)
+    while wp.mesh_query_aabb_next(query, face):
+        hits[face] = 1
+
+
+@wp.kernel
+def mesh_query_aabb_precise_hits(mesh_id: wp.uint64, low: wp.vec3, high: wp.vec3, hits: wp.array(dtype=int)):
+    query = wp.mesh_query_aabb(mesh_id, low, high)  # precise=True by default
+    face = int(0)
+    while wp.mesh_query_aabb_next(query, face):
+        hits[face] = 1
+
+
+@wp.kernel
+def mesh_bvh_sphere_hits(mesh_id: wp.uint64, center: wp.vec3, radius: float, hits: wp.array(dtype=int)):
+    bvh = wp.mesh_get_bvh(mesh_id)
+    query = wp.bvh_query_sphere(bvh, center, radius)
+    bound = int(0)
+    while wp.bvh_query_next(query, bound):
+        hits[bound] = 1
+
+
+def _random_triangle_mesh(device, rng, num_tris=2000):
+    """A mesh of small, randomly placed triangles (one independent triangle per face)."""
+    centers = rng.random((num_tris, 3)).astype(np.float32) * 8.0
+    verts = (centers[:, None, :] + (rng.random((num_tris, 3, 3)) - 0.5).astype(np.float32) * 0.4).reshape(-1, 3)
+    indices = np.arange(3 * num_tris, dtype=np.int32)
+    m = wp.Mesh(
+        points=wp.array(verts, dtype=wp.vec3, device=device),
+        indices=wp.array(indices, dtype=int, device=device),
+    )
+    tris = verts.reshape(num_tris, 3, 3)
+    lowers = tris.min(axis=1)  # per-triangle AABB == mesh BVH leaf bounds
+    uppers = tris.max(axis=1)
+    return m, tris, lowers, uppers
+
+
+def _point_tri_dist2(p, A, B, C):
+    """Squared distance from point ``p`` to each triangle (A,B,C), vectorized (Ericson regions)."""
+    ab, ac, ap = B - A, C - A, p - A
+    d1 = (ab * ap).sum(-1)
+    d2 = (ac * ap).sum(-1)
+    bp = p - B
+    d3 = (ab * bp).sum(-1)
+    d4 = (ac * bp).sum(-1)
+    cp_ = p - C
+    d5 = (ab * cp_).sum(-1)
+    d6 = (ac * cp_).sum(-1)
+    va = d3 * d6 - d5 * d4
+    vb = d5 * d2 - d1 * d6
+    vc = d1 * d4 - d3 * d2
+    denom = va + vb + vc
+    inv = np.divide(1.0, denom, out=np.zeros_like(denom), where=denom != 0)
+    Q = A + (vb * inv)[:, None] * ab + (vc * inv)[:, None] * ac  # interior (face) region
+    Q = np.where(((d1 <= 0) & (d2 <= 0))[:, None], A, Q)  # vertex A
+    Q = np.where(((d3 >= 0) & (d4 <= d3))[:, None], B, Q)  # vertex B
+    Q = np.where(((d6 >= 0) & (d5 <= d6))[:, None], C, Q)  # vertex C
+    tAB = np.divide(d1, d1 - d3, out=np.zeros_like(d1), where=(d1 - d3) != 0)
+    Q = np.where(((vc <= 0) & (d1 >= 0) & (d3 <= 0))[:, None], A + tAB[:, None] * ab, Q)  # edge AB
+    tAC = np.divide(d2, d2 - d6, out=np.zeros_like(d2), where=(d2 - d6) != 0)
+    Q = np.where(((vb <= 0) & (d2 >= 0) & (d6 <= 0))[:, None], A + tAC[:, None] * ac, Q)  # edge AC
+    dBC = (d4 - d3) + (d5 - d6)
+    tBC = np.divide(d4 - d3, dBC, out=np.zeros_like(d4), where=dBC != 0)
+    Q = np.where(((va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0))[:, None], B + tBC[:, None] * (C - B), Q)  # edge BC
+    d = p - Q
+    return (d * d).sum(-1)
+
+
+def _tri_aabb_overlap(A, B, C, lo, hi):
+    """Exact triangle-vs-box overlap per triangle (SAT, vectorized) -- mirrors intersect_tri_aabb."""
+    c = 0.5 * (lo + hi)
+    h = 0.5 * (hi - lo)
+    t0, t1, t2 = A - c, B - c, C - c
+    ok = np.ones(A.shape[0], bool)
+    for i in range(3):
+        mn = np.minimum(np.minimum(t0[:, i], t1[:, i]), t2[:, i])
+        mx = np.maximum(np.maximum(t0[:, i], t1[:, i]), t2[:, i])
+        ok &= ~((mn > h[i]) | (mx < -h[i]))
+    e0, e1, e2 = t1 - t0, t2 - t1, t0 - t2
+    n = np.cross(e0, e1)
+    ok &= ~(np.abs((n * t0).sum(-1)) > (np.abs(n) * h).sum(-1))
+    for e in (e0, e1, e2):
+        z = np.zeros_like(e[:, 0])
+        for ax in (np.stack([z, -e[:, 2], e[:, 1]], -1),
+                   np.stack([e[:, 2], z, -e[:, 0]], -1),
+                   np.stack([-e[:, 1], e[:, 0], z], -1)):
+            p0 = (ax * t0).sum(-1)
+            p1 = (ax * t1).sum(-1)
+            p2 = (ax * t2).sum(-1)
+            mn = np.minimum(np.minimum(p0, p1), p2)
+            mx = np.maximum(np.maximum(p0, p1), p2)
+            rr = (np.abs(ax) * h).sum(-1)
+            ok &= ~(((ax * ax).sum(-1) > 1e-12) & ((mn > rr) | (mx < -rr)))
+    return ok
+
+
+def test_mesh_query_sphere(test, device):
+    # Narrow phase: returned faces are exactly the triangles the sphere actually intersects (closest point
+    # on the triangle within radius), not merely AABB overlaps. Use dilate/erode bands to stay robust to
+    # float32-vs-float64 rounding right at the boundary.
+    rng = np.random.default_rng(123)
+    m, tris, lowers, uppers = _random_triangle_mesh(device, rng)
+    A, B, C = tris[:, 0].astype(np.float64), tris[:, 1].astype(np.float64), tris[:, 2].astype(np.float64)
+    num_tris = tris.shape[0]
+    hits = wp.zeros(num_tris, dtype=int, device=device)
+    eps = 1e-4
+    for _ in range(20):
+        center = (rng.random(3) * 8.0).astype(np.float32)
+        radius = float(rng.random() * 0.8 + 0.1)
+        hits.zero_()
+        wp.launch(mesh_query_sphere_hits, dim=1, inputs=[m.id, wp.vec3(*center), radius, hits], device=device)
+        got = hits.numpy().astype(bool)
+        dist = np.sqrt(_point_tri_dist2(center.astype(np.float64), A, B, C))
+        assert np.all(got <= (dist <= radius + eps)), "sphere reported a triangle farther than radius"
+        assert np.all((dist <= radius - eps) <= got), "sphere missed a triangle within radius"
+
+
+def test_mesh_query_aabb_precise(test, device):
+    # precise=True (default) returns exactly the triangles that intersect the box (SAT), a subset of the
+    # broad AABB-overlap set. Dilate/erode the box by eps to stay robust to boundary rounding.
+    rng = np.random.default_rng(4242)
+    m, tris, lowers, uppers = _random_triangle_mesh(device, rng)
+    A, B, C = tris[:, 0].astype(np.float64), tris[:, 1].astype(np.float64), tris[:, 2].astype(np.float64)
+    num_tris = tris.shape[0]
+    hits = wp.zeros(num_tris, dtype=int, device=device)
+    eps = 1e-4
+    for _ in range(20):
+        c = (rng.random(3) * 8.0).astype(np.float32)
+        half = (rng.random(3) * 0.6 + 0.1).astype(np.float32)
+        low, high = c - half, c + half
+        hits.zero_()
+        wp.launch(mesh_query_aabb_precise_hits, dim=1, inputs=[m.id, wp.vec3(*low), wp.vec3(*high), hits], device=device)
+        got = hits.numpy().astype(bool)
+        lo, hi = low.astype(np.float64), high.astype(np.float64)
+        assert np.all(got <= _tri_aabb_overlap(A, B, C, lo - eps, hi + eps)), "precise reported a triangle outside the box"
+        assert np.all(_tri_aabb_overlap(A, B, C, lo + eps, hi - eps) <= got), "precise missed a triangle inside the box"
+        broad = ~((lowers > high).any(1) | (uppers < low).any(1))
+        assert np.all(got <= broad), "precise hit outside the broad AABB set"
+
+
+def test_mesh_get_bvh(test, device):
+    # mesh_get_bvh exposes the mesh BVH; bvh_query_sphere on it returns the broad (per-triangle AABB) set.
+    rng = np.random.default_rng(99)
+    m, tris, lowers, uppers = _random_triangle_mesh(device, rng)
+    num_tris = tris.shape[0]
+    hits = wp.zeros(num_tris, dtype=int, device=device)
+    for _ in range(10):
+        center = (rng.random(3) * 8.0).astype(np.float32)
+        radius = float(rng.random() * 0.8 + 0.1)
+        hits.zero_()
+        wp.launch(mesh_bvh_sphere_hits, dim=1, inputs=[m.id, wp.vec3(*center), radius, hits], device=device)
+        got = hits.numpy().astype(bool)
+        cp = np.clip(center, lowers, uppers)
+        expected = ((center - cp) ** 2).sum(axis=1) <= radius * radius
+        assert_np_equal(got, expected)
+
+
 devices = get_test_devices()
 
 
@@ -681,6 +841,9 @@ add_function_test(
     test_mesh_query_aabb_tiled,
     devices=devices,
 )
+add_function_test(TestMeshQueryAABBMethods, "test_mesh_query_sphere", test_mesh_query_sphere, devices=devices)
+add_function_test(TestMeshQueryAABBMethods, "test_mesh_query_aabb_precise", test_mesh_query_aabb_precise, devices=devices)
+add_function_test(TestMeshQueryAABBMethods, "test_mesh_get_bvh", test_mesh_get_bvh, devices=devices)
 
 
 if __name__ == "__main__":

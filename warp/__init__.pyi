@@ -4282,7 +4282,7 @@ def bvh_query_aabb(id: uint64, low: vec3f, high: vec3f, root: int32) -> BvhQuery
             [[0.5, 0.5, 0.5], [2.5, 0.5, 0.5], [0.0, 0.0, 0.0]]"""
     ...
 
-def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32) -> BvhQuery:
+def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32 = ..., radius: float32 = ...) -> BvhQuery:
     """Construct a ray query against a BVH.
 
     Returns a query that iterates over every item in the BVH whose stored bounding box is
@@ -4296,11 +4296,20 @@ def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32) -> BvhQuery
     group root is obtained from :func:`bvh_get_group_root`). If ``root`` is -1 (default),
     traversal starts at the BVH's global root.
 
+    Setting ``radius`` > 0 expands each node's bounds by that radius before the ray test. With a
+    finite ``max_dist`` this is a *conservative* capsule-style query: because the bounds are expanded as an
+    axis-aligned box (not a sphere), it never misses a primitive within ``radius`` of the segment
+    but may return extra candidates near the box corners (a broad-phase superset). Combine it with ``max_dist``
+    in :func:`bvh_query_next` to bound the length: e.g. pass ``dir = p1 - p0`` (unnormalized) and
+    ``max_dist = 1.0`` to sweep from ``p0`` to ``p1``. ``radius = 0`` (default) reproduces the
+    original ray query exactly.
+
     Args:
         id: The BVH identifier
         start: The ray origin, in BVH space
         dir: The ray direction, in BVH space (see above on normalization)
         root: The node to begin the query from, or -1 (default) for the BVH's global root
+        radius: Radius to inflate node bounds by, sweeping the ray into a capsule; must be >= 0 (optional, default: 0.0)
 
     Returns:
         A :class:`warp.BvhQuery`. It is opaque; pass it to :func:`bvh_query_next`, which writes
@@ -4330,6 +4339,21 @@ def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32) -> BvhQuery
         .. testoutput::
 
             [[0.5, 0.5, 0.5], [2.5, 0.5, 0.5], [4.5, 0.5, 0.5]]"""
+    ...
+
+def bvh_query_sphere(id: uint64, center: vec3f, radius: float32, root: int32 = ...) -> BvhQuery:
+    """Construct a sphere query against a BVH object.
+
+    This query iterates over all bounds whose closest point to ``center`` lies within ``radius`` (an
+    exact sphere-AABB overlap test). The sphere is inscribed in the radius-padded AABB, so this is a
+    tighter broad-phase query than padding a query AABB by the radius.
+    To start a query from a specific node, set ``root`` to the index of the node (see :func:`bvh_query_aabb`).
+
+    Args:
+        id: The BVH identifier
+        center: The center of the sphere in BVH space
+        radius: The radius of the sphere; must be >= 0
+        root: The root to begin the query from (optional, default: -1)"""
     ...
 
 def bvh_query_next(query: BvhQuery, index: int32, max_dist: float32) -> bool:
@@ -5352,19 +5376,34 @@ def mesh_query_ray_count_intersections(id: uint64, start: vec3f, dir: vec3f, roo
             crossings: 2"""
     ...
 
-def mesh_query_aabb(id: uint64, low: vec3f, high: vec3f) -> MeshQueryAABB:
+def mesh_get_bvh(id: uint64) -> uint64:
+    """Return the identifier of a mesh's internal BVH.
+
+    The returned id can be passed directly to the ``bvh_query_*`` builtins (:func:`bvh_query_aabb`,
+    :func:`bvh_query_sphere`, :func:`bvh_query_ray`) to run broad-phase bounding-volume queries against
+    the mesh's triangle BVH; the bound indices they return are triangle (face) indices. Only valid for
+    meshes built with the default BVH backend, matching :func:`mesh_query_ray` and :func:`mesh_query_point`.
+
+    Args:
+        id: The mesh identifier"""
+    ...
+
+def mesh_query_aabb(id: uint64, low: vec3f, high: vec3f, precise: bool = ...) -> MeshQueryAABB:
     """Construct an axis-aligned bounding box (AABB) query against a :class:`warp.Mesh`.
 
     Returns a query that iterates over every triangle (face) whose own axis-aligned bounding box
-    overlaps the query box ``[low, high]``, given in the mesh's local space. This is a broad-phase
-    test on bounding boxes: a reported face's triangle may not actually intersect the box, so
-    perform an exact test yourself if required. Advance the query and read each result with
+    overlaps the query box ``[low, high]``, given in the mesh's local space. By default
+    (``precise=True``) an exact triangle-vs-box SAT test keeps only triangles that truly intersect
+    the box; with ``precise=False`` it is a broad-phase-only query and a reported face's triangle
+    may not actually intersect the box. Advance the query and read each result with
     :func:`mesh_query_aabb_next`.
 
     Args:
         id: The mesh identifier
         low: The lower bound of the query box, in the mesh's local space
         high: The upper bound of the query box, in the mesh's local space
+        precise: If true, keep only triangles that exactly intersect the box; if false, return all
+            triangles whose bounding box overlaps (optional, default: True)
 
     Returns:
         A :class:`warp.MeshQueryAABB`. It is opaque; pass it to :func:`mesh_query_aabb_next`, which
@@ -5393,6 +5432,20 @@ def mesh_query_aabb(id: uint64, low: vec3f, high: vec3f) -> MeshQueryAABB:
         .. testoutput::
 
             overlapping faces: 12"""
+    ...
+
+def mesh_query_sphere(id: uint64, center: vec3f, radius: float32) -> MeshQueryAABB:
+    """Construct a sphere query against a :class:`warp.Mesh`.
+
+    This query iterates over the triangles of the mesh that intersect the sphere of the given ``radius``
+    about ``center``: a broad phase keeps triangles whose bounding box is within ``radius`` (an exact
+    sphere-AABB test), then a narrow phase keeps only those whose closest point is within ``radius``.
+    Advance it with the same :func:`mesh_query_aabb_next`.
+
+    Args:
+        id: The mesh identifier
+        center: The center of the sphere in mesh space
+        radius: The radius of the sphere; must be >= 0"""
     ...
 
 def mesh_query_aabb_next(query: MeshQueryAABB, index: int32) -> bool:

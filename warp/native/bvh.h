@@ -400,17 +400,23 @@ struct bvh_stack_t {
 
 // stores state required to traverse the BVH nodes that
 // overlap with a query AABB.
+// bvh_query_t::query_type values (a single bool-sized discriminant)
+#define BVH_QUERY_AABB 0
+#define BVH_QUERY_RAY 1
+#define BVH_QUERY_SPHERE 2
+
 struct bvh_query_t {
     CUDA_CALLABLE bvh_query_t()
         : bvh()
         , stack()
         , count(0)
-        , is_ray(false)
+        , query_type(BVH_QUERY_AABB)
         , input_lower()
         , input_upper()
         , bounds_nr(0)
         , primitive_counter(-1)
         , last_query_valid(true)
+        , radius(0.0f)
     {
     }
 
@@ -436,18 +442,30 @@ struct bvh_query_t {
     wp::vec3 input_upper;  // dir for ray
 
     int bounds_nr;
-    bool is_ray;
+    // Query kind: a single bool-sized discriminant, BVH_QUERY_AABB / _RAY / _SPHERE.
+    // RAY with radius > 0 is a conservative (box-inflated) capsule.
+    uint8_t query_type;
     // Tracks whether the most recent bvh_query_next() / tile_bvh_query_next() call
     // produced a valid index. Seeded to true on construction so an initial
     // tile_query_valid() check (before any next() call) reports valid.
     bool last_query_valid;
+    // Minkowski-offset: sphere radius, or ray inflation radius (0 => plain ray / aabb).
+    float radius;
 };
 
 CUDA_CALLABLE inline bool
 bvh_query_intersection_test(const bvh_query_t& query, const vec3& node_lower, const vec3& node_upper, float& t)
 {
-    if (query.is_ray) {
-        return intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
+    if (query.query_type == BVH_QUERY_SPHERE) {
+        // exact sphere-AABB node test; query.radius is the sphere radius
+        return intersect_sphere_aabb(query.input_lower, query.radius, node_lower, node_upper);
+    } else if (query.query_type == BVH_QUERY_RAY) {
+        // ray with node bounds expanded by query.radius (axis-aligned box) => conservative capsule when
+        // bounded by max_dist; over-approximates a true (spherical) capsule at the box corners.
+        // radius == 0 reproduces the original ray test byte-for-byte.
+        return intersect_ray_aabb(
+            query.input_lower, query.input_upper, node_lower - vec3(query.radius), node_upper + vec3(query.radius), t
+        );
     } else {
         return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
     }
@@ -472,7 +490,7 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(uint64_t id, bool is_ray, const vec3&
     BVH bvh = bvh_get(id);
 
     query.bvh = bvh;
-    query.is_ray = is_ray;
+    query.query_type = is_ray ? BVH_QUERY_RAY : BVH_QUERY_AABB;
 
     // optimization: make the latest
     query.stack[0] = root == -1 ? *bvh.root : root;
@@ -490,9 +508,22 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_aabb(uint64_t id, const vec3& lower, 
     return bvh_query(id, false, lower, upper, root);
 }
 
-CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir, int root)
+CUDA_CALLABLE inline bvh_query_t
+bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir, int root, float radius = 0.0f)
 {
-    return bvh_query(id, true, start, 1.0f / dir, root);
+    bvh_query_t query = bvh_query(id, true, start, 1.0f / dir, root);
+    query.radius = radius;
+    return query;
+}
+
+// Sphere query: returns all bounds within `radius` of `center` using an exact sphere-AABB
+// node test. Reuses the shared bvh_query_next() iterator.
+CUDA_CALLABLE inline bvh_query_t bvh_query_sphere(uint64_t id, const vec3& center, float radius, int root)
+{
+    bvh_query_t query = bvh_query(id, false, center, center, root);
+    query.query_type = BVH_QUERY_SPHERE;
+    query.radius = radius;
+    return query;
 }
 
 CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const float& max_dist)
@@ -511,7 +542,7 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
             bool hit = bvh_query_intersection_test(
                 query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
             );
-            if (!hit || (query.is_ray && t >= max_dist)) {
+            if (!hit || (query.query_type == BVH_QUERY_RAY && t >= max_dist)) {
                 continue;
             }
         }
@@ -545,7 +576,7 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
                 bool hit = bvh_query_intersection_test(
                     query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], t
                 );
-                if (!hit || (query.is_ray && t >= max_dist)) {
+                if (!hit || (query.query_type == BVH_QUERY_RAY && t >= max_dist)) {
                     continue;
                 }
                 index = primitive_index;

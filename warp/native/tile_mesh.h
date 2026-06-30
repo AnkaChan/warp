@@ -311,7 +311,7 @@ CUDA_CALLABLE inline mesh_query_aabb_thread_block_t
 mesh_query_aabb_thread_block_impl(uint64_t id, const vec3& lower, const vec3& upper)
 {
     // On CPU, mesh_query_aabb_thread_block_t is just mesh_query_aabb_t
-    return mesh_query_aabb(id, lower, upper);
+    return mesh_query_aabb(id, lower, upper, false);
 }
 
 // CPU version: single-threaded, just calls regular mesh_query_aabb_next
@@ -394,7 +394,7 @@ inline bool tile_query_valid(const mesh_query_aabb_thread_block_t& query) { retu
 inline mesh_query_aabb_thread_block_t tile_mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper)
 {
     // On CPU, this is just mesh_query_aabb since mesh_query_aabb_thread_block_t = mesh_query_aabb_t
-    return mesh_query_aabb(id, lower, upper);
+    return mesh_query_aabb(id, lower, upper, false);
 }
 
 #endif  // __CUDA_ARCH__

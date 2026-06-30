@@ -72,6 +72,10 @@ struct Mesh {
 
 CUDA_CALLABLE inline Mesh mesh_get(uint64_t id) { return *(Mesh*)(id); }
 
+// Return the id of the mesh's internal BVH so it can be queried directly with the bvh_query_* builtins.
+// The id is simply the address of the embedded BVH (bvh_get() casts it straight back to a BVH*).
+CUDA_CALLABLE inline uint64_t mesh_get_bvh(uint64_t id) { return (uint64_t)&(((Mesh*)id)->bvh); }
+
 CUDA_CALLABLE inline int mesh_get_group_root(uint64_t id, int group_id)
 {
     Mesh* mesh = (Mesh*)(id);
@@ -2399,6 +2403,9 @@ struct mesh_query_aabb_t {
         , face(0)
         , primitive_counter(-1)
         , last_query_valid(true)
+        , query_type(0)
+        , precise(true)
+        , radius(0.0f)
     {
     }
 
@@ -2430,17 +2437,40 @@ struct mesh_query_aabb_t {
     // call produced a valid face index. Seeded to true so an initial tile_query_valid()
     // check (before any next() call) reports valid.
     bool last_query_valid;
+    // Minkowski-offset query extension (sphere): bool-sized discriminant.
+    uint8_t query_type;  // MESH_QUERY_AABB | MESH_QUERY_SPHERE
+    bool precise;  // narrow phase: keep only triangles that exactly intersect the query volume
+    float radius;  // sphere radius (0 for plain aabb)
 };
 
 
-CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper)
+// mesh_query_aabb_t::query_type values
+#define MESH_QUERY_AABB 0
+#define MESH_QUERY_SPHERE 1
+
+// Node-overlap test for a mesh query, dispatched on query_type. AABB reproduces the original test.
+CUDA_CALLABLE inline bool
+mesh_query_node_test(const mesh_query_aabb_t& query, const vec3& node_lower, const vec3& node_upper)
+{
+    if (query.query_type == MESH_QUERY_SPHERE) {
+        return intersect_sphere_aabb(query.input_lower, query.radius, node_lower, node_upper);
+    } else {
+        return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
+    }
+}
+
+CUDA_CALLABLE inline mesh_query_aabb_t
+mesh_query_create(uint64_t id, int query_type, const vec3& a, const vec3& b, float radius, bool precise)
 {
     // This routine traverses the BVH tree until it finds
-    // the first triangle with an overlapping bvh.
+    // the first triangle with an overlapping bound.
 
     // initialize empty
     mesh_query_aabb_t query;
     query.face = -1;
+    query.query_type = query_type;
+    query.precise = precise;
+    query.radius = radius;
 
     Mesh mesh = mesh_get(id);
     query.mesh = mesh;
@@ -2452,8 +2482,8 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& 
 
     query.stack[0] = *mesh.bvh.root;
     query.count = 1;
-    query.input_lower = lower;
-    query.input_upper = upper;
+    query.input_lower = a;
+    query.input_upper = b;
 
     // Navigate through the bvh, find the first overlapping leaf node.
     while (query.count) {
@@ -2462,11 +2492,10 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& 
         BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
 
         if (query.primitive_counter == 0) {
-            if (!intersect_aabb_aabb(
-                    query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
-                    reinterpret_cast<vec3&>(node_upper)
+            if (!mesh_query_node_test(
+                    query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper)
                 )) {
-                // Skip this box, it doesn't overlap with our target box.
+                // Skip this box, it doesn't overlap with our query volume.
                 continue;
             }
         }
@@ -2490,6 +2519,52 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& 
     return query;
 }
 
+CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper, bool precise)
+{
+    return mesh_query_create(id, MESH_QUERY_AABB, lower, upper, 0.0f, precise);
+}
+
+// Sphere query: iterate triangles that intersect the sphere. The broad phase keeps triangles whose AABB is
+// within `radius` of `center` (exact sphere-AABB test); the narrow phase keeps only those whose closest
+// point to `center` is within `radius`.
+CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_sphere(uint64_t id, const vec3& center, float radius)
+{
+    return mesh_query_create(id, MESH_QUERY_SPHERE, center, center, radius, true);
+}
+
+// Per-primitive candidate test: broad phase (primitive AABB vs the query volume) plus, when query.precise
+// is set, an exact triangle test (triangle-vs-box for AABB queries, closest-point for sphere queries).
+CUDA_CALLABLE inline bool mesh_query_prim_test(const mesh_query_aabb_t& query, const Mesh& mesh, int primitive_index)
+{
+    if (!mesh_query_node_test(query, mesh.lowers[primitive_index], mesh.uppers[primitive_index]))
+        return false;
+    if (!query.precise)
+        return true;
+
+    int i = mesh.indices[primitive_index * 3 + 0];
+    int j = mesh.indices[primitive_index * 3 + 1];
+    int k = mesh.indices[primitive_index * 3 + 2];
+    vec3 a = mesh.points[i];
+    vec3 b = mesh.points[j];
+    vec3 c = mesh.points[k];
+
+    if (query.query_type == MESH_QUERY_SPHERE) {
+        vec2 uv = closest_point_to_triangle(a, b, c, query.input_lower);
+        vec3 cp = a * uv[0] + b * uv[1] + c * (1.0f - uv[0] - uv[1]);
+        vec3 d = cp - query.input_lower;
+        return dot(d, d) <= query.radius * query.radius;
+    }
+    // MESH_QUERY_AABB precise: exact triangle vs axis-aligned box
+    return intersect_tri_aabb(a, b, c, query.input_lower, query.input_upper);
+}
+
+// Stub
+CUDA_CALLABLE inline void
+adj_mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper, uint64_t, vec3&, vec3&, mesh_query_aabb_t&)
+{
+}
+
+
 CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& index)
 {
     Mesh mesh = query.mesh;
@@ -2500,11 +2575,8 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
         BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
         BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
 
-        if (!intersect_aabb_aabb(
-                query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
-                reinterpret_cast<vec3&>(node_upper)
-            )) {
-            // Skip this box, it doesn't overlap with our target box.
+        if (!mesh_query_node_test(query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper))) {
+            // Skip this box, it doesn't overlap with our query volume.
             continue;
         }
 
@@ -2519,9 +2591,11 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
 
             if (end - start == 1) {
                 int primitive_index = mesh.bvh.primitive_indices[start];
-                index = primitive_index;
-                query.face = primitive_index;
-                return true;
+                if (mesh_query_prim_test(query, mesh, primitive_index)) {
+                    index = primitive_index;
+                    query.face = primitive_index;
+                    return true;
+                }
             } else {
                 int primitive_index = mesh.bvh.primitive_indices[start + (query.primitive_counter++)];
                 // if already visited the last primitive in the leaf node
@@ -2534,9 +2608,7 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
                     query.count++;
                 }
 
-                if (intersect_aabb_aabb(
-                        query.input_lower, query.input_upper, mesh.lowers[primitive_index], mesh.uppers[primitive_index]
-                    )) {
+                if (mesh_query_prim_test(query, mesh, primitive_index)) {
                     index = primitive_index;
                     query.face = primitive_index;
 

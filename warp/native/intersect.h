@@ -191,6 +191,75 @@ intersect_aabb_aabb(const vec3& a_lower, const vec3& a_upper, const vec3& b_lowe
     }
 }
 
+// Sphere-AABB overlap: squared distance from the sphere center to the AABB <= r^2.
+// The sphere is inscribed in the radius-padded AABB (no wasted corners), so this is a
+// tighter broad-phase node test than padding the query AABB by the radius.
+CUDA_CALLABLE inline bool
+intersect_sphere_aabb(const vec3& center, float radius, const vec3& lower, const vec3& upper)
+{
+    // squared distance from center to the AABB, accumulated per axis (Ericson, RTCD):
+    // branchless, and avoids materializing the closest point
+    float dx = max(max(lower[0] - center[0], center[0] - upper[0]), 0.0f);
+    float dy = max(max(lower[1] - center[1], center[1] - upper[1]), 0.0f);
+    float dz = max(max(lower[2] - center[2], center[2] - upper[2]), 0.0f);
+    return dx * dx + dy * dy + dz * dz <= radius * radius;
+}
+
+// Exact triangle vs axis-aligned box overlap (Akenine-Moller separating-axis test, 13 axes). Returns
+// true iff the triangle (v0,v1,v2) actually intersects the box [lower, upper] -- the narrow-phase test
+// behind a precise mesh_query_aabb.
+CUDA_CALLABLE inline bool intersect_tri_aabb(const vec3& v0, const vec3& v1, const vec3& v2,
+                                             const vec3& lower, const vec3& upper)
+{
+    vec3 bc = 0.5f * (lower + upper);
+    vec3 h = 0.5f * (upper - lower);
+
+    // triangle in box-centered coordinates
+    vec3 t0 = v0 - bc;
+    vec3 t1 = v1 - bc;
+    vec3 t2 = v2 - bc;
+
+    // 1) three box face normals: the triangle's AABB must overlap the box
+    for (int i = 0; i < 3; ++i) {
+        float mn = min(t0[i], min(t1[i], t2[i]));
+        float mx = max(t0[i], max(t1[i], t2[i]));
+        if (mn > h[i] || mx < -h[i])
+            return false;
+    }
+
+    vec3 e0 = t1 - t0;
+    vec3 e1 = t2 - t1;
+    vec3 e2 = t0 - t2;
+
+    // 2) triangle face normal: the box must straddle the triangle's plane
+    vec3 nrm = cross(e0, e1);
+    float pr = h[0] * (nrm[0] < 0.0f ? -nrm[0] : nrm[0]) + h[1] * (nrm[1] < 0.0f ? -nrm[1] : nrm[1]) +
+               h[2] * (nrm[2] < 0.0f ? -nrm[2] : nrm[2]);
+    float pd = dot(nrm, t0);
+    if ((pd < 0.0f ? -pd : pd) > pr)
+        return false;
+
+    // 3) nine edge-edge axes: cross(box axis, triangle edge)
+    for (int ei = 0; ei < 3; ++ei) {
+        vec3 e = (ei == 0) ? e0 : (ei == 1) ? e1 : e2;
+        for (int k = 0; k < 3; ++k) {
+            vec3 ax = (k == 0) ? vec3(0.0f, -e[2], e[1]) : (k == 1) ? vec3(e[2], 0.0f, -e[0]) : vec3(-e[1], e[0], 0.0f);
+            if (dot(ax, ax) < 1.0e-12f)
+                continue;  // edge parallel to this box axis: degenerate, skip
+            float p0 = dot(ax, t0);
+            float p1 = dot(ax, t1);
+            float p2 = dot(ax, t2);
+            float mn = min(p0, min(p1, p2));
+            float mx = max(p0, max(p1, p2));
+            float rr = h[0] * (ax[0] < 0.0f ? -ax[0] : ax[0]) + h[1] * (ax[1] < 0.0f ? -ax[1] : ax[1]) +
+                       h[2] * (ax[2] < 0.0f ? -ax[2] : ax[2]);
+            if (mn > rr || mx < -rr)
+                return false;
+        }
+    }
+
+    return true;
+}
 
 // Moller and Trumbore's method
 CUDA_CALLABLE inline bool intersect_ray_tri_moller(
