@@ -209,8 +209,28 @@ def test_bvh_query_sphere(test, device):
     for leaf_size in [1, 2, 4]:
         test_bvh(test, "sphere", device, leaf_size)
 
+    # Zero-radius sphere should behave like a point query (only bounds that contain the point).
+    lowers = wp.array([(0.0, 0.0, 0.0), (2.0, 2.0, 2.0)], dtype=wp.vec3, device=device)
+    uppers = wp.array([(1.0, 1.0, 1.0), (3.0, 3.0, 3.0)], dtype=wp.vec3, device=device)
+    bvh = wp.Bvh(lowers, uppers)
+
+    hit_count = wp.zeros(1, dtype=int, device=device)
+
+    @wp.kernel
+    def count_sphere_hits(bvh_id: wp.uint64, center: wp.vec3, radius: float, hits: wp.array(dtype=int)):
+        q = wp.bvh_query_sphere(bvh_id, center, radius)
+        idx = int(0)
+        while wp.bvh_query_next(q, idx):
+            wp.atomic_add(hits, 0, 1)
+
+    wp.launch(count_sphere_hits, dim=1, inputs=[bvh.id, wp.vec3(0.5, 0.5, 0.5), 0.0, hit_count], device=device)
+    test.assertEqual(hit_count.numpy()[0], 1)
+
 
 def test_bvh_query_capsule(test, device):
+    # The broad-phase inflates node AABBs by radius as an axis-aligned box, not a true sphere,
+    # so it is conservative: it never misses a primitive within radius of the segment but may
+    # return extra candidates near box corners. Tests validate this conservative semantics.
     for leaf_size in [1, 2, 4]:
         test_bvh(test, "capsule", device, leaf_size)
 

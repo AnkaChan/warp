@@ -410,11 +410,11 @@ struct bvh_query_t {
         : bvh()
         , stack()
         , count(0)
-        , query_type(BVH_QUERY_AABB)
+        , primitive_counter(-1)
         , input_lower()
         , input_upper()
         , bounds_nr(0)
-        , primitive_counter(-1)
+        , query_type(BVH_QUERY_AABB)
         , last_query_valid(true)
         , radius(0.0f)
     {
