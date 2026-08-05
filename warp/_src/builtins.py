@@ -7418,9 +7418,11 @@ add_builtin(
     index into the ``lowers``/``uppers`` arrays passed to :class:`warp.Bvh`. Used in a ``while``
     loop together with :func:`bvh_query_aabb` or :func:`bvh_query_ray`.
 
-    For ray queries, ``max_dist`` bounds how far along the ray to look for intersections, measured
-    in multiples of the ray direction's length (so it is a distance only if ``dir`` was normalized).
-    It has no effect on AABB queries.
+    For plain ray queries, ``max_dist`` bounds how far along the ray to look for intersections,
+    measured in multiples of ``dir``'s length (so it is a distance only if ``dir`` was normalized).
+    For capsule-style queries (``bvh_query_ray`` with ``radius > 0``), pass an unnormalized
+    ``dir = p1 - p0`` together with ``max_dist = 1.0`` to sweep from ``p0`` to ``p1``.
+    ``max_dist`` has no effect on AABB or sphere queries.
 
     Note that increasing ``max_dist`` may miss intersections: a subtree already rejected for being
     beyond ``max_dist`` is never revisited, even if a later, larger ``max_dist`` would reach it. It
@@ -9074,25 +9076,26 @@ add_builtin(
 
 add_builtin(
     "mesh_query_aabb",
-    input_types={"id": uint64, "low": vec3, "high": vec3, "precise": builtins.bool},
-    defaults={"precise": True},
+    input_types={"id": uint64, "low": vec3, "high": vec3, "exact_filter_triangles": builtins.bool},
+    defaults={"exact_filter_triangles": False},
     value_type=MeshQueryAABB,
     group="Geometry",
     doc="""Construct an axis-aligned bounding box (AABB) query against a :class:`warp.Mesh`.
 
     Returns a query that iterates over every triangle (face) whose own axis-aligned bounding box
     overlaps the query box ``[low, high]``, given in the mesh's local space. By default
-    (``precise=True``) an exact triangle-vs-box SAT test keeps only triangles that truly intersect
-    the box; with ``precise=False`` it is a broad-phase-only query and a reported face's triangle
-    may not actually intersect the box. Advance the query and read each result with
-    :func:`mesh_query_aabb_next`.
+    (``exact_filter_triangles=False``) this is a broad-phase-only query: a reported face's triangle
+    bounding box overlaps the box, but the triangle itself may not. Pass ``exact_filter_triangles=True``
+    to enable an exact triangle-vs-box SAT test that keeps only triangles that truly intersect the box.
+    Advance the query and read each result with :func:`mesh_query_aabb_next`.
 
     Args:
         id: The mesh identifier
         low: The lower bound of the query box, in the mesh's local space
         high: The upper bound of the query box, in the mesh's local space
-        precise: If true, keep only triangles that exactly intersect the box; if false, return all
-            triangles whose bounding box overlaps (optional, default: True)
+        exact_filter_triangles: If ``True``, keep only triangles that exactly intersect the box
+            (exact SAT test); if ``False``, return all triangles whose bounding box overlaps
+            (optional, default: ``False``)
 
     Returns:
         A :class:`warp.MeshQueryAABB`. It is opaque; pass it to :func:`mesh_query_aabb_next`, which
@@ -9150,17 +9153,17 @@ add_builtin(
     input_types={"query": MeshQueryAABB, "index": int},
     value_type=builtins.bool,
     group="Geometry",
-    doc="""Advance a mesh AABB query to the next overlapping triangle and report whether one was found.
+    doc="""Advance a mesh query to the next candidate triangle and report whether one was found.
 
     Writes the index of the current face to ``index`` and returns ``True``; returns ``False`` once
-    no overlapping triangles remain (``index`` is then left unchanged). The reported index is a
+    no more triangles remain (``index`` is then left unchanged). The reported index is a
     face index (0-based, into the mesh's triangles), suitable for :func:`mesh_eval_position`,
     :func:`mesh_eval_face_normal`, and the other face-indexed functions. Used in a ``while`` loop
-    together with :func:`mesh_query_aabb`.
+    together with :func:`mesh_query_aabb` or :func:`mesh_query_sphere`.
 
     Args:
-        query: The query to advance, from :func:`mesh_query_aabb`
-        index: Output; receives the index of the current overlapping face
+        query: The query to advance, from :func:`mesh_query_aabb` or :func:`mesh_query_sphere`
+        index: Output; receives the index of the current candidate face
 
     Returns:
         ``True`` if another overlapping triangle was found (its face index written to ``index``),

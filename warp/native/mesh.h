@@ -2404,7 +2404,7 @@ struct mesh_query_aabb_t {
         , primitive_counter(-1)
         , last_query_valid(true)
         , query_type(0)
-        , precise(true)
+        , precise(false)
         , radius(0.0f)
     {
     }
@@ -2470,7 +2470,7 @@ mesh_query_create(uint64_t id, int query_type, const vec3& a, const vec3& b, flo
     query.face = -1;
     query.query_type = query_type;
     query.precise = precise;
-    query.radius = radius;
+    query.radius = max(radius, 0.0f);
 
     Mesh mesh = mesh_get(id);
     query.mesh = mesh;

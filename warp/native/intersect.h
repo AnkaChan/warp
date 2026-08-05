@@ -192,10 +192,7 @@ intersect_aabb_aabb(const vec3& a_lower, const vec3& a_upper, const vec3& b_lowe
 }
 
 // Sphere-AABB overlap: squared distance from the sphere center to the AABB <= r^2.
-// The sphere is inscribed in the radius-padded AABB (no wasted corners), so this is a
-// tighter broad-phase node test than padding the query AABB by the radius.
-CUDA_CALLABLE inline bool
-intersect_sphere_aabb(const vec3& center, float radius, const vec3& lower, const vec3& upper)
+CUDA_CALLABLE inline bool intersect_sphere_aabb(const vec3& center, float radius, const vec3& lower, const vec3& upper)
 {
     // squared distance from center to the AABB, accumulated per axis (Ericson, RTCD):
     // branchless, and avoids materializing the closest point
@@ -208,10 +205,10 @@ intersect_sphere_aabb(const vec3& center, float radius, const vec3& lower, const
 // Exact triangle vs axis-aligned box overlap (Akenine-Moller separating-axis test, 13 axes). Returns
 // true iff the triangle (v0,v1,v2) actually intersects the box [lower, upper] -- the narrow-phase test
 // behind a precise mesh_query_aabb.
-CUDA_CALLABLE inline bool intersect_tri_aabb(const vec3& v0, const vec3& v1, const vec3& v2,
-                                             const vec3& lower, const vec3& upper)
+CUDA_CALLABLE inline bool
+intersect_tri_aabb(const vec3& v0, const vec3& v1, const vec3& v2, const vec3& lower, const vec3& upper)
 {
-    vec3 bc = 0.5f * (lower + upper);
+    vec3 bc = lower + 0.5f * (upper - lower);
     vec3 h = 0.5f * (upper - lower);
 
     // triangle in box-centered coordinates
@@ -233,8 +230,8 @@ CUDA_CALLABLE inline bool intersect_tri_aabb(const vec3& v0, const vec3& v1, con
 
     // 2) triangle face normal: the box must straddle the triangle's plane
     vec3 nrm = cross(e0, e1);
-    float pr = h[0] * (nrm[0] < 0.0f ? -nrm[0] : nrm[0]) + h[1] * (nrm[1] < 0.0f ? -nrm[1] : nrm[1]) +
-               h[2] * (nrm[2] < 0.0f ? -nrm[2] : nrm[2]);
+    float pr = h[0] * (nrm[0] < 0.0f ? -nrm[0] : nrm[0]) + h[1] * (nrm[1] < 0.0f ? -nrm[1] : nrm[1])
+        + h[2] * (nrm[2] < 0.0f ? -nrm[2] : nrm[2]);
     float pd = dot(nrm, t0);
     if ((pd < 0.0f ? -pd : pd) > pr)
         return false;
@@ -251,8 +248,8 @@ CUDA_CALLABLE inline bool intersect_tri_aabb(const vec3& v0, const vec3& v1, con
             float p2 = dot(ax, t2);
             float mn = min(p0, min(p1, p2));
             float mx = max(p0, max(p1, p2));
-            float rr = h[0] * (ax[0] < 0.0f ? -ax[0] : ax[0]) + h[1] * (ax[1] < 0.0f ? -ax[1] : ax[1]) +
-                       h[2] * (ax[2] < 0.0f ? -ax[2] : ax[2]);
+            float rr = h[0] * (ax[0] < 0.0f ? -ax[0] : ax[0]) + h[1] * (ax[1] < 0.0f ? -ax[1] : ax[1])
+                + h[2] * (ax[2] < 0.0f ? -ax[2] : ax[2]);
             if (mn > rr || mx < -rr)
                 return false;
         }

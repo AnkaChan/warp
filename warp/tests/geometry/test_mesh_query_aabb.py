@@ -639,7 +639,7 @@ def mesh_query_sphere_hits(mesh_id: wp.uint64, center: wp.vec3, radius: float, h
 
 @wp.kernel
 def mesh_query_aabb_precise_hits(mesh_id: wp.uint64, low: wp.vec3, high: wp.vec3, hits: wp.array(dtype=int)):
-    query = wp.mesh_query_aabb(mesh_id, low, high)  # precise=True by default
+    query = wp.mesh_query_aabb(mesh_id, low, high, exact_filter_triangles=True)
     face = int(0)
     while wp.mesh_query_aabb_next(query, face):
         hits[face] = 1
@@ -715,9 +715,11 @@ def _tri_aabb_overlap(A, B, C, lo, hi):
     ok &= ~(np.abs((n * t0).sum(-1)) > (np.abs(n) * h).sum(-1))
     for e in (e0, e1, e2):
         z = np.zeros_like(e[:, 0])
-        for ax in (np.stack([z, -e[:, 2], e[:, 1]], -1),
-                   np.stack([e[:, 2], z, -e[:, 0]], -1),
-                   np.stack([-e[:, 1], e[:, 0], z], -1)):
+        for ax in (
+            np.stack([z, -e[:, 2], e[:, 1]], -1),
+            np.stack([e[:, 2], z, -e[:, 0]], -1),
+            np.stack([-e[:, 1], e[:, 0], z], -1),
+        ):
             p0 = (ax * t0).sum(-1)
             p1 = (ax * t1).sum(-1)
             p2 = (ax * t2).sum(-1)
@@ -733,7 +735,7 @@ def test_mesh_query_sphere(test, device):
     # on the triangle within radius), not merely AABB overlaps. Use dilate/erode bands to stay robust to
     # float32-vs-float64 rounding right at the boundary.
     rng = np.random.default_rng(123)
-    m, tris, lowers, uppers = _random_triangle_mesh(device, rng)
+    m, tris, _lowers, _uppers = _random_triangle_mesh(device, rng)
     A, B, C = tris[:, 0].astype(np.float64), tris[:, 1].astype(np.float64), tris[:, 2].astype(np.float64)
     num_tris = tris.shape[0]
     hits = wp.zeros(num_tris, dtype=int, device=device)
@@ -763,10 +765,14 @@ def test_mesh_query_aabb_precise(test, device):
         half = (rng.random(3) * 0.6 + 0.1).astype(np.float32)
         low, high = c - half, c + half
         hits.zero_()
-        wp.launch(mesh_query_aabb_precise_hits, dim=1, inputs=[m.id, wp.vec3(*low), wp.vec3(*high), hits], device=device)
+        wp.launch(
+            mesh_query_aabb_precise_hits, dim=1, inputs=[m.id, wp.vec3(*low), wp.vec3(*high), hits], device=device
+        )
         got = hits.numpy().astype(bool)
         lo, hi = low.astype(np.float64), high.astype(np.float64)
-        assert np.all(got <= _tri_aabb_overlap(A, B, C, lo - eps, hi + eps)), "precise reported a triangle outside the box"
+        assert np.all(got <= _tri_aabb_overlap(A, B, C, lo - eps, hi + eps)), (
+            "precise reported a triangle outside the box"
+        )
         assert np.all(_tri_aabb_overlap(A, B, C, lo + eps, hi - eps) <= got), "precise missed a triangle inside the box"
         broad = ~((lowers > high).any(1) | (uppers < low).any(1))
         assert np.all(got <= broad), "precise hit outside the broad AABB set"
@@ -842,7 +848,9 @@ add_function_test(
     devices=devices,
 )
 add_function_test(TestMeshQueryAABBMethods, "test_mesh_query_sphere", test_mesh_query_sphere, devices=devices)
-add_function_test(TestMeshQueryAABBMethods, "test_mesh_query_aabb_precise", test_mesh_query_aabb_precise, devices=devices)
+add_function_test(
+    TestMeshQueryAABBMethods, "test_mesh_query_aabb_precise", test_mesh_query_aabb_precise, devices=devices
+)
 add_function_test(TestMeshQueryAABBMethods, "test_mesh_get_bvh", test_mesh_get_bvh, devices=devices)
 
 

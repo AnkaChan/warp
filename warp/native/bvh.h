@@ -512,7 +512,7 @@ CUDA_CALLABLE inline bvh_query_t
 bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir, int root, float radius = 0.0f)
 {
     bvh_query_t query = bvh_query(id, true, start, 1.0f / dir, root);
-    query.radius = radius;
+    query.radius = max(radius, 0.0f);
     return query;
 }
 
@@ -522,7 +522,7 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_sphere(uint64_t id, const vec3& cente
 {
     bvh_query_t query = bvh_query(id, false, center, center, root);
     query.query_type = BVH_QUERY_SPHERE;
-    query.radius = radius;
+    query.radius = max(radius, 0.0f);
     return query;
 }
 
