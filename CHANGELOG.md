@@ -54,9 +54,6 @@
   dimension-collapsing integer indices with negative-index support (`t[5, :]`, `t[-1, :]`), and slice assignment
   (`t[0:4, :] = src`). Also add `wp.tile_slice_indexed()`, which gathers elements along a single axis using a
   1D integer index tile (`t[indices, :]`) ([GH-1176](https://github.com/NVIDIA/warp/issues/1176)).
-- Add `wp.bvh_query_sphere()` and `wp.mesh_query_sphere()` for Minkowski-offset broad-phase queries
-  (exact sphere-AABB test, tighter than AABB inflation). Extend `wp.bvh_query_ray()` with an optional
-  `radius` parameter for conservative capsule sweeps over a BVH.
 - Expose CUDA graph capture mode via `ScopedCapture` / `capture_begin()`
   ([GH-1410](https://github.com/NVIDIA/warp/issues/1410)).
 - Add pre-allocated functors for `warp.optim.linear` solvers. Passing `run=False` to `cg`, `cr`, `bicgstab`, or `gmres`
