@@ -2406,6 +2406,7 @@ struct mesh_query_aabb_t {
         , query_type(0)
         , precise(false)
         , radius(0.0f)
+        , radius_sq(0.0f)
     {
     }
 
@@ -2441,6 +2442,7 @@ struct mesh_query_aabb_t {
     uint8_t query_type;  // MESH_QUERY_AABB | MESH_QUERY_SPHERE
     bool precise;  // narrow phase: keep only triangles that exactly intersect the query volume
     float radius;  // sphere radius (0 for plain aabb)
+    float radius_sq;  // pre-computed radius*radius for sphere node/prim tests
 };
 
 
@@ -2453,14 +2455,14 @@ CUDA_CALLABLE inline bool
 mesh_query_node_test(const mesh_query_aabb_t& query, const vec3& node_lower, const vec3& node_upper)
 {
     if (query.query_type == MESH_QUERY_SPHERE) {
-        return intersect_sphere_aabb(query.input_lower, query.radius, node_lower, node_upper);
+        return intersect_sphere_aabb(query.input_lower, query.radius_sq, node_lower, node_upper);
     } else {
         return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
     }
 }
 
 CUDA_CALLABLE inline mesh_query_aabb_t
-mesh_query_create(uint64_t id, int query_type, const vec3& a, const vec3& b, float radius, bool precise)
+mesh_query(uint64_t id, int query_type, const vec3& a, const vec3& b, float radius, bool precise)
 {
     // This routine traverses the BVH tree until it finds
     // the first triangle with an overlapping bound.
@@ -2471,6 +2473,7 @@ mesh_query_create(uint64_t id, int query_type, const vec3& a, const vec3& b, flo
     query.query_type = query_type;
     query.precise = precise;
     query.radius = max(radius, 0.0f);
+    query.radius_sq = query.radius * query.radius;
 
     Mesh mesh = mesh_get(id);
     query.mesh = mesh;
@@ -2521,7 +2524,7 @@ mesh_query_create(uint64_t id, int query_type, const vec3& a, const vec3& b, flo
 
 CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper, bool precise)
 {
-    return mesh_query_create(id, MESH_QUERY_AABB, lower, upper, 0.0f, precise);
+    return mesh_query(id, MESH_QUERY_AABB, lower, upper, 0.0f, precise);
 }
 
 // Sphere query: iterate triangles that intersect the sphere. The broad phase keeps triangles whose AABB is
@@ -2529,7 +2532,7 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& 
 // point to `center` is within `radius`.
 CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_sphere(uint64_t id, const vec3& center, float radius)
 {
-    return mesh_query_create(id, MESH_QUERY_SPHERE, center, center, radius, true);
+    return mesh_query(id, MESH_QUERY_SPHERE, center, center, radius, true);
 }
 
 // Per-primitive candidate test: broad phase (primitive AABB vs the query volume) plus, when query.precise
@@ -2552,7 +2555,7 @@ CUDA_CALLABLE inline bool mesh_query_prim_test(const mesh_query_aabb_t& query, c
         vec2 uv = closest_point_to_triangle(a, b, c, query.input_lower);
         vec3 cp = a * uv[0] + b * uv[1] + c * (1.0f - uv[0] - uv[1]);
         vec3 d = cp - query.input_lower;
-        return dot(d, d) <= query.radius * query.radius;
+        return dot(d, d) <= query.radius_sq;
     }
     // MESH_QUERY_AABB precise: exact triangle vs axis-aligned box
     return intersect_tri_aabb(a, b, c, query.input_lower, query.input_upper);

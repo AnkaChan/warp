@@ -256,6 +256,7 @@ Geometry
    bvh_query_next_tiled
    bvh_query_ray
    bvh_query_ray_tiled
+   bvh_query_sphere
    closest_point_edge_edge
    hash_grid_point_id
    hash_grid_query
@@ -265,6 +266,7 @@ Geometry
    mesh_eval_position
    mesh_eval_velocity
    mesh_get
+   mesh_get_bvh
    mesh_get_group_root
    mesh_get_index
    mesh_get_point
@@ -282,6 +284,7 @@ Geometry
    mesh_query_ray
    mesh_query_ray_anyhit
    mesh_query_ray_count_intersections
+   mesh_query_sphere
 
 Volumes
 -------

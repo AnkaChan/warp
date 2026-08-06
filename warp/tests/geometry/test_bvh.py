@@ -116,7 +116,6 @@ def segment_aabb_overlap(p0, p1, radius, lower, upper):
     return 1
 
 
-
 def test_bvh(test, type, device, leaf_size, constructor=None):
     rng = np.random.default_rng(123)
 
