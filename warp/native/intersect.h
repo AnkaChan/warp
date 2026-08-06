@@ -204,9 +204,19 @@ intersect_sphere_aabb(const vec3& center, float radius_sq, const vec3& lower, co
     return dx * dx + dy * dy + dz * dz <= radius_sq;
 }
 
+// Returns true if the interval [min(p0,p1,p2), max(p0,p1,p2)] does NOT overlap [-r, r].
+CUDA_CALLABLE inline bool axis_separates(float p0, float p1, float p2, float r)
+{
+    float mn = min(p0, min(p1, p2));
+    float mx = max(p0, max(p1, p2));
+    return mn > r || mx < -r;
+}
+
 // Exact triangle vs axis-aligned box overlap (Akenine-Moller separating-axis test, 13 axes). Returns
 // true iff the triangle (v0,v1,v2) actually intersects the box [lower, upper] -- the narrow-phase test
-// behind a precise mesh_query_aabb.
+// behind mesh_query_aabb(exact_filter_triangles=True).
+// The nine edge-edge axes are fully unrolled so the compiler sees explicit cross-product components,
+// enabling CSE on the abs() terms and eliminating the degenerate-axis branch.
 CUDA_CALLABLE inline bool
 intersect_tri_aabb(const vec3& v0, const vec3& v1, const vec3& v2, const vec3& lower, const vec3& upper)
 {
@@ -219,12 +229,12 @@ intersect_tri_aabb(const vec3& v0, const vec3& v1, const vec3& v2, const vec3& l
     vec3 t2 = v2 - bc;
 
     // 1) three box face normals: the triangle's AABB must overlap the box
-    for (int i = 0; i < 3; ++i) {
-        float mn = min(t0[i], min(t1[i], t2[i]));
-        float mx = max(t0[i], max(t1[i], t2[i]));
-        if (mn > h[i] || mx < -h[i])
-            return false;
-    }
+    if (min(t0[0], min(t1[0], t2[0])) > h[0] || max(t0[0], max(t1[0], t2[0])) < -h[0])
+        return false;
+    if (min(t0[1], min(t1[1], t2[1])) > h[1] || max(t0[1], max(t1[1], t2[1])) < -h[1])
+        return false;
+    if (min(t0[2], min(t1[2], t2[2])) > h[2] || max(t0[2], max(t1[2], t2[2])) < -h[2])
+        return false;
 
     vec3 e0 = t1 - t0;
     vec3 e1 = t2 - t1;
@@ -238,24 +248,26 @@ intersect_tri_aabb(const vec3& v0, const vec3& v1, const vec3& v2, const vec3& l
     if ((pd < 0.0f ? -pd : pd) > pr)
         return false;
 
-    // 3) nine edge-edge axes: cross(box axis, triangle edge)
-    for (int ei = 0; ei < 3; ++ei) {
-        vec3 e = (ei == 0) ? e0 : (ei == 1) ? e1 : e2;
-        for (int k = 0; k < 3; ++k) {
-            vec3 ax = (k == 0) ? vec3(0.0f, -e[2], e[1]) : (k == 1) ? vec3(e[2], 0.0f, -e[0]) : vec3(-e[1], e[0], 0.0f);
-            if (dot(ax, ax) < 1.0e-12f)
-                continue;  // edge parallel to this box axis: degenerate, skip
-            float p0 = dot(ax, t0);
-            float p1 = dot(ax, t1);
-            float p2 = dot(ax, t2);
-            float mn = min(p0, min(p1, p2));
-            float mx = max(p0, max(p1, p2));
-            float rr = h[0] * (ax[0] < 0.0f ? -ax[0] : ax[0]) + h[1] * (ax[1] < 0.0f ? -ax[1] : ax[1])
-                + h[2] * (ax[2] < 0.0f ? -ax[2] : ax[2]);
-            if (mn > rr || mx < -rr)
-                return false;
-        }
-    }
+    // 3) nine edge-edge axes: cross(box_axis, triangle_edge), fully unrolled.
+    // For a zero cross product (degenerate edge), axis_separates returns false (no separation) — correct.
+    // axis X x e: (0, -ez, ey)  =>  proj = t[2]*ey - t[1]*ez,  r = h[1]*|ez| + h[2]*|ey|
+    // axis Y x e: (ez, 0, -ex)  =>  proj = t[0]*ez - t[2]*ex,  r = h[0]*|ez| + h[2]*|ex|
+    // axis Z x e: (-ey, ex, 0)  =>  proj = t[1]*ex - t[0]*ey,  r = h[0]*|ey| + h[1]*|ex|
+    float e0x = e0[0], e0y = e0[1], e0z = e0[2];
+    float e1x = e1[0], e1y = e1[1], e1z = e1[2];
+    float e2x = e2[0], e2y = e2[1], e2z = e2[2];
+    float hx = h[0], hy = h[1], hz = h[2];
+    // clang-format off
+    if (axis_separates(t0[2]*e0y-t0[1]*e0z, t1[2]*e0y-t1[1]*e0z, t2[2]*e0y-t2[1]*e0z, hy*(e0z<0?-e0z:e0z)+hz*(e0y<0?-e0y:e0y))) return false;
+    if (axis_separates(t0[0]*e0z-t0[2]*e0x, t1[0]*e0z-t1[2]*e0x, t2[0]*e0z-t2[2]*e0x, hx*(e0z<0?-e0z:e0z)+hz*(e0x<0?-e0x:e0x))) return false;
+    if (axis_separates(t0[1]*e0x-t0[0]*e0y, t1[1]*e0x-t1[0]*e0y, t2[1]*e0x-t2[0]*e0y, hx*(e0y<0?-e0y:e0y)+hy*(e0x<0?-e0x:e0x))) return false;
+    if (axis_separates(t0[2]*e1y-t0[1]*e1z, t1[2]*e1y-t1[1]*e1z, t2[2]*e1y-t2[1]*e1z, hy*(e1z<0?-e1z:e1z)+hz*(e1y<0?-e1y:e1y))) return false;
+    if (axis_separates(t0[0]*e1z-t0[2]*e1x, t1[0]*e1z-t1[2]*e1x, t2[0]*e1z-t2[2]*e1x, hx*(e1z<0?-e1z:e1z)+hz*(e1x<0?-e1x:e1x))) return false;
+    if (axis_separates(t0[1]*e1x-t0[0]*e1y, t1[1]*e1x-t1[0]*e1y, t2[1]*e1x-t2[0]*e1y, hx*(e1y<0?-e1y:e1y)+hy*(e1x<0?-e1x:e1x))) return false;
+    if (axis_separates(t0[2]*e2y-t0[1]*e2z, t1[2]*e2y-t1[1]*e2z, t2[2]*e2y-t2[1]*e2z, hy*(e2z<0?-e2z:e2z)+hz*(e2y<0?-e2y:e2y))) return false;
+    if (axis_separates(t0[0]*e2z-t0[2]*e2x, t1[0]*e2z-t1[2]*e2x, t2[0]*e2z-t2[2]*e2x, hx*(e2z<0?-e2z:e2z)+hz*(e2x<0?-e2x:e2x))) return false;
+    if (axis_separates(t0[1]*e2x-t0[0]*e2y, t1[1]*e2x-t1[0]*e2y, t2[1]*e2x-t2[0]*e2y, hx*(e2y<0?-e2y:e2y)+hy*(e2x<0?-e2x:e2x))) return false;
+    // clang-format on
 
     return true;
 }
