@@ -9285,9 +9285,6 @@ add_builtin(
     group="Geometry",
     doc="""Advance a mesh AABB or sphere query to the next matching triangle.
 
-    .. deprecated:: 1.17
-        Use :func:`mesh_query_next` instead.
-
     .. note:: This is an alias for :func:`mesh_query_next`.""",
     export=False,
     is_differentiable=False,

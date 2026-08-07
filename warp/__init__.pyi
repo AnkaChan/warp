@@ -5577,9 +5577,6 @@ def mesh_query_next(query: MeshQueryAABB, index: int32) -> bool:
 def mesh_query_aabb_next(query: MeshQueryAABB, index: int32) -> bool:
     """Advance a mesh AABB or sphere query to the next matching triangle.
 
-    .. deprecated:: 1.17
-        Use :func:`mesh_query_next` instead.
-
     .. note:: This is an alias for :func:`mesh_query_next`."""
     ...
 
