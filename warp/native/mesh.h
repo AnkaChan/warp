@@ -2552,9 +2552,37 @@ CUDA_CALLABLE inline bool mesh_query_prim_test(const mesh_query_aabb_t& query, c
     vec3 c = mesh.points[k];
 
     if (query.query_type == MESH_QUERY_SPHERE) {
-        vec2 uv = closest_point_to_triangle(a, b, c, query.input_lower);
-        vec3 cp = a * uv[0] + b * uv[1] + c * (1.0f - uv[0] - uv[1]);
-        vec3 d = cp - query.input_lower;
+        const vec3& center = query.input_lower;
+        vec3 cp;
+        // Guard against degenerate (zero-area) faces to avoid NaN from closest_point_to_triangle.
+        vec3 ab = b - a, ac = c - a;
+        if (dot(cross(ab, ac), cross(ab, ac)) == 0.0f) {
+            // Degenerate: collapse to segment or point. Find the longest edge.
+            vec3 bc = c - b;
+            float lab2 = dot(ab, ab), lac2 = dot(ac, ac), lbc2 = dot(bc, bc);
+            vec3 p, q;
+            float len2;
+            if (lab2 >= lac2 && lab2 >= lbc2) {
+                p = a;
+                q = b;
+                len2 = lab2;
+            } else if (lac2 >= lbc2) {
+                p = a;
+                q = c;
+                len2 = lac2;
+            } else {
+                p = b;
+                q = c;
+                len2 = lbc2;
+            }
+            vec3 pq = q - p;
+            float t = (len2 > 0.0f) ? clamp(dot(center - p, pq) / len2, 0.0f, 1.0f) : 0.0f;
+            cp = p + t * pq;
+        } else {
+            vec2 uv = closest_point_to_triangle(a, b, c, center);
+            cp = a * uv[0] + b * uv[1] + c * (1.0f - uv[0] - uv[1]);
+        }
+        vec3 d = cp - center;
         return dot(d, d) <= query.radius_sq;
     }
     // MESH_QUERY_AABB precise: exact triangle vs axis-aligned box
@@ -2594,7 +2622,11 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
 
             if (end - start == 1) {
                 int primitive_index = mesh.bvh.primitive_indices[start];
-                if (mesh_query_prim_test(query, mesh, primitive_index)) {
+                // Broad-phase AABB singleton fast path: leaf AABB == primitive AABB, so the node
+                // test above already guarantees this primitive overlaps -- no re-test needed.
+                // Sphere and precise-AABB queries still need the full per-primitive check.
+                if ((query.query_type == MESH_QUERY_AABB && !query.precise)
+                    || mesh_query_prim_test(query, mesh, primitive_index)) {
                     index = primitive_index;
                     query.face = primitive_index;
                     return true;

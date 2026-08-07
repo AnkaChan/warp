@@ -465,8 +465,11 @@ bvh_query_intersection_test(const bvh_query_t& query, const vec3& node_lower, co
         // ray with node bounds expanded by query.radius (axis-aligned box) => conservative capsule when
         // bounded by max_dist; over-approximates a true (spherical) capsule at the box corners.
         // radius == 0 reproduces the original ray test byte-for-byte.
-        return intersect_ray_aabb(
-            query.input_lower, query.input_upper, node_lower - vec3(query.radius), node_upper + vec3(query.radius), t
+        // Use the robust variant so axis-aligned rays (rcp_dir = ±inf) correctly handle tangent slabs.
+        return intersect_ray_aabb_robust(
+            query.input_lower,
+            vec3(1.0f / query.input_upper[0], 1.0f / query.input_upper[1], 1.0f / query.input_upper[2]),
+            query.input_upper, node_lower - vec3(query.radius), node_upper + vec3(query.radius), t
         );
     } else {
         return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
@@ -546,7 +549,7 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
             bool hit = bvh_query_intersection_test(
                 query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
             );
-            if (!hit || (query.query_type == BVH_QUERY_RAY && t >= max_dist)) {
+            if (!hit || (query.query_type == BVH_QUERY_RAY && t > max_dist)) {
                 continue;
             }
         }
@@ -580,7 +583,7 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
                 bool hit = bvh_query_intersection_test(
                     query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], t
                 );
-                if (!hit || (query.query_type == BVH_QUERY_RAY && t >= max_dist)) {
+                if (!hit || (query.query_type == BVH_QUERY_RAY && t > max_dist)) {
                     continue;
                 }
                 index = primitive_index;
