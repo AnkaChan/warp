@@ -4296,20 +4296,22 @@ def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32, radius: flo
     group root is obtained from :func:`bvh_get_group_root`). If ``root`` is -1 (default),
     traversal starts at the BVH's global root.
 
-    Setting ``radius`` > 0 expands each node's bounds by that radius before the ray test. With a
-    finite ``max_dist`` this is a *conservative* capsule-style query: because the bounds are expanded as an
-    axis-aligned box (not a sphere), it never misses a primitive within ``radius`` of the segment
-    but may return extra candidates near the box corners (a broad-phase superset). Combine it with ``max_dist``
-    in :func:`bvh_query_next` to bound the length: e.g. pass ``dir = p1 - p0`` (unnormalized) and
-    ``max_dist = 1.0`` to sweep from ``p0`` to ``p1``. ``radius = 0`` (default) reproduces the
-    original ray query exactly.
+    Setting ``radius > 0`` expands each node's bounds by that radius before the ray-slab test,
+    turning it into a *conservative* capsule-style broad-phase query. The inflated box is
+    axis-aligned (not a sphere), so it never misses a primitive within ``radius`` of the segment
+    but may return extra candidates near the box corners. To sweep a closed capsule from ``p0`` to
+    ``p1``, pass ``dir = p1 - p0`` (unnormalized) and ``max_dist = 1.0``; contact at both endpoints
+    is included. ``p0 == p1`` (zero-length segment) is not supported as a capsule — use
+    :func:`bvh_query_sphere` instead. A negative ``radius`` is clamped to zero.
+    ``radius = 0`` (default) reproduces the plain ray query exactly.
 
     Args:
         id: The BVH identifier
         start: The ray origin, in BVH space
-        dir: The ray direction, in BVH space (see above on normalization)
+        dir: The ray direction, in BVH space (normalize for ``max_dist`` to be a world-space distance)
         root: The node to begin the query from, or -1 (default) for the BVH's global root
-        radius: Radius to inflate node bounds by, sweeping the ray into a capsule; must be >= 0 (optional, default: 0.0)
+        radius: Inflates each node's bounds by this amount for a capsule-style sweep; negative values
+            are clamped to zero (optional, default: 0.0)
 
     Returns:
         A :class:`warp.BvhQuery`. It is opaque; pass it to :func:`bvh_query_next`, which writes
@@ -4317,6 +4319,8 @@ def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32, radius: flo
         to its ``index`` argument.
 
     Example:
+
+        Plain ray cast:
 
         .. testcode::
 
@@ -4338,22 +4342,70 @@ def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32, radius: flo
 
         .. testoutput::
 
-            [[0.5, 0.5, 0.5], [2.5, 0.5, 0.5], [4.5, 0.5, 0.5]]"""
+            [[0.5, 0.5, 0.5], [2.5, 0.5, 0.5], [4.5, 0.5, 0.5]]
+
+        Capsule sweep from ``p0`` to ``p1`` with radius 0.3:
+
+        .. testcode::
+
+            @wp.kernel
+            def capsule_sweep(bvh_id: wp.uint64, p0: wp.vec3, p1: wp.vec3, radius: float,
+                               count: wp.array[wp.int32]):
+                query = wp.bvh_query_ray(bvh_id, p0, p1 - p0, -1, radius)
+                item = int(0)
+                while wp.bvh_query_next(query, item, 1.0):
+                    wp.atomic_add(count, 0, 1)
+
+            lowers = wp.array([[1, -1, -1]], dtype=wp.vec3)
+            uppers = wp.array([[2,  1,  1]], dtype=wp.vec3)
+            bvh = wp.Bvh(lowers=lowers, uppers=uppers)
+            count = wp.zeros(1, dtype=wp.int32)
+            wp.launch(capsule_sweep, dim=1,
+                      inputs=[bvh.id, wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.5, 0.0, 0.0), 0.3, count])
+            print(count.numpy()[0])
+
+        .. testoutput::
+
+            1"""
     ...
 
 def bvh_query_sphere(id: uint64, center: vec3f, radius: float32, root: int32) -> BvhQuery:
     """Construct a sphere query against a BVH object.
 
-    This query iterates over all bounds whose closest point to ``center`` lies within ``radius`` (an
-    exact sphere-AABB overlap test). The sphere is inscribed in the radius-padded AABB, so this is a
-    tighter broad-phase query than padding a query AABB by the radius.
-    To start a query from a specific node, set ``root`` to the index of the node (see :func:`bvh_query_aabb`).
+    Iterates over all items whose bounding box overlaps the sphere (exact sphere-AABB squared-distance
+    test). Tangential contact (the nearest point on the AABB surface exactly on the sphere) is included.
+    A negative ``radius`` is clamped to zero. This is a tighter broad-phase than padding a query AABB
+    by the radius, since the sphere is inscribed in the padded box. Advance with :func:`bvh_query_next`.
 
     Args:
         id: The BVH identifier
         center: The center of the sphere in BVH space
-        radius: The radius of the sphere; must be >= 0
-        root: The root to begin the query from (optional, default: -1)"""
+        radius: The radius of the sphere; negative values are clamped to zero
+        root: The node to begin the query from, or -1 (default) for the BVH's global root
+
+    Example:
+
+        .. testcode::
+
+            @wp.kernel
+            def find_items_in_sphere(bvh_id: wp.uint64, center: wp.vec3, radius: float,
+                                     hits: wp.array[wp.int32]):
+                query = wp.bvh_query_sphere(bvh_id, center, radius)
+                item = int(0)
+                while wp.bvh_query_next(query, item):
+                    hits[item] = wp.int32(1)
+
+            lowers = wp.array([[0, 0, 0], [2, 0, 0]], dtype=wp.vec3)
+            uppers = wp.array([[1, 1, 1], [3, 1, 1]], dtype=wp.vec3)
+            bvh = wp.Bvh(lowers=lowers, uppers=uppers)
+            hits = wp.zeros(2, dtype=wp.int32)
+            wp.launch(find_items_in_sphere, dim=1,
+                      inputs=[bvh.id, wp.vec3(0.5, 0.5, 0.5), 0.6, hits])
+            print(hits.numpy().tolist())
+
+        .. testoutput::
+
+            [1, 0]"""
     ...
 
 def bvh_query_next(query: BvhQuery, index: int32, max_dist: float32) -> bool:
@@ -4362,7 +4414,7 @@ def bvh_query_next(query: BvhQuery, index: int32, max_dist: float32) -> bool:
     Writes the index of the current item to ``index`` and returns ``True``; returns ``False`` once
     the query is exhausted (``index`` is then left unchanged). The reported index is the item's
     index into the ``lowers``/``uppers`` arrays passed to :class:`warp.Bvh`. Used in a ``while``
-    loop together with :func:`bvh_query_aabb` or :func:`bvh_query_ray`.
+    loop together with :func:`bvh_query_aabb`, :func:`bvh_query_ray`, or :func:`bvh_query_sphere`.
 
     For plain ray queries, ``max_dist`` bounds how far along the ray to look for intersections,
     measured in multiples of ``dir``'s length (so it is a distance only if ``dir`` was normalized).
@@ -4375,10 +4427,10 @@ def bvh_query_next(query: BvhQuery, index: int32, max_dist: float32) -> bool:
     is therefore only safe to monotonically *reduce* ``max_dist`` during a query.
 
     Args:
-        query: The query to advance, from :func:`bvh_query_aabb` or :func:`bvh_query_ray`
+        query: The query to advance, from :func:`bvh_query_aabb`, :func:`bvh_query_ray`, or :func:`bvh_query_sphere`
         index: Output; receives the index of the current overlapping item
         max_dist: For ray queries, the maximum distance along the ray to check for intersections
-            (in multiples of ``dir``'s length). Has no effect on AABB queries.
+            (in multiples of ``dir``'s length). Has no effect on AABB or sphere queries.
 
     Returns:
         ``True`` if another overlapping item was found (its index written to ``index``), ``False``
@@ -5383,33 +5435,32 @@ def mesh_get_bvh(id: uint64) -> uint64:
 
     The returned id can be passed directly to the ``bvh_query_*`` builtins (:func:`bvh_query_aabb`,
     :func:`bvh_query_sphere`, :func:`bvh_query_ray`) to run broad-phase bounding-volume queries against
-    the mesh's triangle BVH; the bound indices they return are triangle (face) indices. Only valid for
-    meshes built with the default BVH backend, matching :func:`mesh_query_ray` and :func:`mesh_query_point`.
+    the mesh's triangle BVH; the bound indices they return are triangle (face) indices. Works for all
+    BVH backends (including ``"cubql"``), since cuBQL meshes are converted to Warp's native BVH layout.
 
     Args:
         id: The mesh identifier"""
     ...
 
-def mesh_query_aabb(id: uint64, low: vec3f, high: vec3f, exact_filter_triangles: bool) -> MeshQueryAABB:
+def mesh_query_aabb(id: uint64, low: vec3f, high: vec3f, precise: bool) -> MeshQueryAABB:
     """Construct an axis-aligned bounding box (AABB) query against a :class:`warp.Mesh`.
 
     Returns a query that iterates over every triangle (face) whose own axis-aligned bounding box
     overlaps the query box ``[low, high]``, given in the mesh's local space. By default
-    (``exact_filter_triangles=False``) this is a broad-phase-only query: a reported face's triangle
-    bounding box overlaps the box, but the triangle itself may not. Pass ``exact_filter_triangles=True``
-    to enable an exact triangle-vs-box SAT test that keeps only triangles that truly intersect the box.
-    Advance the query and read each result with :func:`mesh_query_aabb_next`.
+    (``precise=False``) this is a broad-phase-only query: a reported face's triangle bounding box
+    overlaps the box, but the triangle itself may not. Pass ``precise=True`` to enable an exact
+    triangle-vs-box SAT test that keeps only triangles that truly intersect the box.
+    Advance the query and read each result with :func:`mesh_query_next`.
 
     Args:
         id: The mesh identifier
         low: The lower bound of the query box, in the mesh's local space
         high: The upper bound of the query box, in the mesh's local space
-        exact_filter_triangles: If ``True``, keep only triangles that exactly intersect the box
-            (exact SAT test); if ``False``, return all triangles whose bounding box overlaps
-            (optional, default: ``False``)
+        precise: If ``True``, keep only triangles that exactly intersect the box (exact SAT test);
+            if ``False``, return all triangles whose bounding box overlaps (optional, default: ``False``)
 
     Returns:
-        A :class:`warp.MeshQueryAABB`. It is opaque; pass it to :func:`mesh_query_aabb_next`, which
+        A :class:`warp.MeshQueryAABB`. It is opaque; pass it to :func:`mesh_query_next`, which
         writes the index of each overlapping face to its ``index`` argument.
 
     Example:
@@ -5420,7 +5471,7 @@ def mesh_query_aabb(id: uint64, low: vec3f, high: vec3f, exact_filter_triangles:
             def count_faces(mesh_id: wp.uint64, lo: wp.vec3, hi: wp.vec3, out_count: wp.array[wp.int32]):
                 query = wp.mesh_query_aabb(mesh_id, lo, hi)
                 face = int(0)
-                while wp.mesh_query_aabb_next(query, face):
+                while wp.mesh_query_next(query, face):
                     wp.atomic_add(out_count, 0, 1)
 
             points = wp.array([[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]], dtype=wp.vec3)
@@ -5440,15 +5491,40 @@ def mesh_query_aabb(id: uint64, low: vec3f, high: vec3f, exact_filter_triangles:
 def mesh_query_sphere(id: uint64, center: vec3f, radius: float32) -> MeshQueryAABB:
     """Construct a sphere query against a :class:`warp.Mesh`.
 
-    This query iterates over the triangles of the mesh that intersect the sphere of the given ``radius``
-    about ``center``: a broad phase keeps triangles whose bounding box is within ``radius`` (an exact
-    sphere-AABB test), then a narrow phase keeps only those whose closest point is within ``radius``.
-    Advance it with the same :func:`mesh_query_aabb_next`.
+    Iterates over mesh triangles that intersect a sphere. A broad phase uses an exact sphere-AABB test
+    to find candidate triangles; a narrow phase keeps only those whose closest point on the triangle
+    is within ``radius`` of ``center``. Tangential contact (closest point exactly on the sphere surface)
+    is included. A negative ``radius`` is clamped to zero. Degenerate (zero-area) faces are handled by
+    falling back to a closest-point-on-longest-edge test. Advance the query with :func:`mesh_query_next`.
 
     Args:
         id: The mesh identifier
         center: The center of the sphere in mesh space
-        radius: The radius of the sphere; must be >= 0"""
+        radius: The radius of the sphere; negative values are clamped to zero
+
+    Example:
+
+        .. testcode::
+
+            @wp.kernel
+            def find_tris_in_sphere(mesh_id: wp.uint64, center: wp.vec3, radius: float,
+                                    hits: wp.array[wp.int32]):
+                query = wp.mesh_query_sphere(mesh_id, center, radius)
+                face = int(0)
+                while wp.mesh_query_next(query, face):
+                    hits[face] = wp.int32(1)
+
+            points = wp.array([[0,0,0],[1,0,0],[0,1,0]], dtype=wp.vec3)
+            indices = wp.array([0,1,2], dtype=wp.int32)
+            mesh = wp.Mesh(points=points, indices=indices)
+            hits = wp.zeros(1, dtype=wp.int32)
+            wp.launch(find_tris_in_sphere, dim=1,
+                      inputs=[mesh.id, wp.vec3(0.1, 0.1, 0.0), 0.5, hits])
+            print("hit:", hits.numpy()[0])
+
+        .. testoutput::
+
+            hit: 1"""
     ...
 
 def mesh_query_next(query: MeshQueryAABB, index: int32) -> bool:

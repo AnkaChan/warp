@@ -630,7 +630,7 @@ def tile_mesh_query_aabb_valid_kernel(
 
 
 @wp.kernel
-def mesh_query_sphere_hits(mesh_id: wp.uint64, center: wp.vec3, radius: float, hits: wp.array(dtype=int)):
+def mesh_query_sphere_hits(mesh_id: wp.uint64, center: wp.vec3, radius: float, hits: wp.array[int]):
     query = wp.mesh_query_sphere(mesh_id, center, radius)
     face = int(0)
     while wp.mesh_query_aabb_next(query, face):
@@ -638,15 +638,15 @@ def mesh_query_sphere_hits(mesh_id: wp.uint64, center: wp.vec3, radius: float, h
 
 
 @wp.kernel
-def mesh_query_aabb_precise_hits(mesh_id: wp.uint64, low: wp.vec3, high: wp.vec3, hits: wp.array(dtype=int)):
-    query = wp.mesh_query_aabb(mesh_id, low, high, exact_filter_triangles=True)
+def mesh_query_aabb_precise_hits(mesh_id: wp.uint64, low: wp.vec3, high: wp.vec3, hits: wp.array[int]):
+    query = wp.mesh_query_aabb(mesh_id, low, high, precise=True)
     face = int(0)
     while wp.mesh_query_aabb_next(query, face):
         hits[face] = 1
 
 
 @wp.kernel
-def mesh_bvh_sphere_hits(mesh_id: wp.uint64, center: wp.vec3, radius: float, hits: wp.array(dtype=int)):
+def mesh_bvh_sphere_hits(mesh_id: wp.uint64, center: wp.vec3, radius: float, hits: wp.array[int]):
     bvh = wp.mesh_get_bvh(mesh_id)
     query = wp.bvh_query_sphere(bvh, center, radius)
     bound = int(0)
@@ -747,8 +747,12 @@ def test_mesh_query_sphere(test, device):
         wp.launch(mesh_query_sphere_hits, dim=1, inputs=[m.id, wp.vec3(*center), radius, hits], device=device)
         got = hits.numpy().astype(bool)
         dist = np.sqrt(_point_tri_dist2(center.astype(np.float64), A, B, C))
-        assert np.all(got <= (dist <= radius + eps)), "sphere reported a triangle farther than radius"
-        assert np.all((dist <= radius - eps) <= got), "sphere missed a triangle within radius"
+        np.testing.assert_array_equal(
+            got & ~(dist <= radius + eps), False, err_msg="sphere reported a triangle farther than radius"
+        )
+        np.testing.assert_array_equal(
+            (dist <= radius - eps) & ~got, False, err_msg="sphere missed a triangle within radius"
+        )
 
 
 def test_mesh_query_aabb_precise(test, device):
@@ -770,12 +774,18 @@ def test_mesh_query_aabb_precise(test, device):
         )
         got = hits.numpy().astype(bool)
         lo, hi = low.astype(np.float64), high.astype(np.float64)
-        assert np.all(got <= _tri_aabb_overlap(A, B, C, lo - eps, hi + eps)), (
-            "precise reported a triangle outside the box"
+        np.testing.assert_array_equal(
+            got & ~_tri_aabb_overlap(A, B, C, lo - eps, hi + eps),
+            False,
+            err_msg="precise reported a triangle outside the box",
         )
-        assert np.all(_tri_aabb_overlap(A, B, C, lo + eps, hi - eps) <= got), "precise missed a triangle inside the box"
+        np.testing.assert_array_equal(
+            _tri_aabb_overlap(A, B, C, lo + eps, hi - eps) & ~got,
+            False,
+            err_msg="precise missed a triangle inside the box",
+        )
         broad = ~((lowers > high).any(1) | (uppers < low).any(1))
-        assert np.all(got <= broad), "precise hit outside the broad AABB set"
+        np.testing.assert_array_equal(got & ~broad, False, err_msg="precise hit outside the broad AABB set")
 
 
 def test_mesh_get_bvh(test, device):

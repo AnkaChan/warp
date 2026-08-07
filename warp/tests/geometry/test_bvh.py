@@ -116,6 +116,14 @@ def segment_aabb_overlap(p0, p1, radius, lower, upper):
     return 1
 
 
+@wp.kernel
+def count_sphere_hits(bvh_id: wp.uint64, center: wp.vec3, radius: float, hits: wp.array[int]):
+    q = wp.bvh_query_sphere(bvh_id, center, radius)
+    idx = int(0)
+    while wp.bvh_query_next(q, idx):
+        wp.atomic_add(hits, 0, 1)
+
+
 def test_bvh(test, type, device, leaf_size, constructor=None):
     rng = np.random.default_rng(123)
 
@@ -214,13 +222,6 @@ def test_bvh_query_sphere(test, device):
     bvh = wp.Bvh(lowers, uppers)
 
     hit_count = wp.zeros(1, dtype=int, device=device)
-
-    @wp.kernel
-    def count_sphere_hits(bvh_id: wp.uint64, center: wp.vec3, radius: float, hits: wp.array(dtype=int)):
-        q = wp.bvh_query_sphere(bvh_id, center, radius)
-        idx = int(0)
-        while wp.bvh_query_next(q, idx):
-            wp.atomic_add(hits, 0, 1)
 
     wp.launch(count_sphere_hits, dim=1, inputs=[bvh.id, wp.vec3(0.5, 0.5, 0.5), 0.0, hit_count], device=device)
     test.assertEqual(hit_count.numpy()[0], 1)
