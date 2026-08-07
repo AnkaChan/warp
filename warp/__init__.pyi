@@ -5451,21 +5451,26 @@ def mesh_query_sphere(id: uint64, center: vec3f, radius: float32) -> MeshQueryAA
         radius: The radius of the sphere; must be >= 0"""
     ...
 
-def mesh_query_aabb_next(query: MeshQueryAABB, index: int32) -> bool:
-    """Advance a mesh query to the next candidate triangle and report whether one was found.
+def mesh_query_next(query: MeshQueryAABB, index: int32) -> bool:
+    """Advance a mesh query to the next matching triangle and report whether one was found.
 
-    Writes the index of the current face to ``index`` and returns ``True``; returns ``False`` once
-    no more triangles remain (``index`` is then left unchanged). The reported index is a
-    face index (0-based, into the mesh's triangles), suitable for :func:`mesh_eval_position`,
-    :func:`mesh_eval_face_normal`, and the other face-indexed functions. Used in a ``while`` loop
-    together with :func:`mesh_query_aabb` or :func:`mesh_query_sphere`.
+    Writes the face index of the current result to ``index`` and returns ``True``; returns
+    ``False`` once no more results remain (``index`` is then left unchanged). The reported index
+    is a 0-based face index into the mesh's triangles, suitable for :func:`mesh_eval_position`,
+    :func:`mesh_eval_face_normal`, and the other face-indexed functions.
+
+    What counts as a *match* depends on the query type:
+
+    - :func:`mesh_query_aabb` with ``precise=False``: triangles whose bounding box overlaps the query box.
+    - :func:`mesh_query_aabb` with ``precise=True``: triangles that exactly intersect the query box (exact SAT test).
+    - :func:`mesh_query_sphere`: triangles whose closest point to the sphere center is within the radius.
 
     Args:
         query: The query to advance, from :func:`mesh_query_aabb` or :func:`mesh_query_sphere`
-        index: Output; receives the index of the current candidate face
+        index: Output; receives the face index of the current result
 
     Returns:
-        ``True`` if another overlapping triangle was found (its face index written to ``index``),
+        ``True`` if another matching triangle was found (its face index written to ``index``),
         ``False`` if the query is exhausted.
 
     Example:
@@ -5476,7 +5481,7 @@ def mesh_query_aabb_next(query: MeshQueryAABB, index: int32) -> bool:
             def count_faces(mesh_id: wp.uint64, lo: wp.vec3, hi: wp.vec3, out_count: wp.array[wp.int32]):
                 query = wp.mesh_query_aabb(mesh_id, lo, hi)
                 face = int(0)
-                while wp.mesh_query_aabb_next(query, face):
+                while wp.mesh_query_next(query, face):
                     wp.atomic_add(out_count, 0, 1)
 
             points = wp.array([[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]], dtype=wp.vec3)
@@ -5491,6 +5496,15 @@ def mesh_query_aabb_next(query: MeshQueryAABB, index: int32) -> bool:
         .. testoutput::
 
             overlapping faces: 12"""
+    ...
+
+def mesh_query_aabb_next(query: MeshQueryAABB, index: int32) -> bool:
+    """Advance a mesh AABB or sphere query to the next matching triangle.
+
+    .. deprecated:: 1.17
+        Use :func:`mesh_query_next` instead.
+
+    .. note:: This is an alias for :func:`mesh_query_next`."""
     ...
 
 def mesh_query_aabb_tiled(id: uint64, low: vec3f, high: vec3f) -> MeshQueryAABBTiled:
