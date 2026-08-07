@@ -38,49 +38,6 @@
   enabling it in backward passes ([GH-1378](https://github.com/NVIDIA/warp/issues/1378)).
 - Add `wp.Stream.is_blocking` to report whether a CUDA stream is blocking
   ([GH-1618](https://github.com/NVIDIA/warp/issues/1618)).
-- Add adjoint for the out-of-place `wp.tile_lower_solve()` for vector and matrix right-hand sides
-  ([GH-1378](https://github.com/NVIDIA/warp/issues/1378))
-- **Experimental:** Record `wp.utils.array_sum()` and `wp.utils.array_inner()` in APIC capture so saved and replayed
-  graphs recompute them from current inputs on CPU and CUDA ([GH-1663](https://github.com/NVIDIA/warp/issues/1663)).
-- Add CPU support for `wp.jax_kernel()` and `wp.jax_callable()` FFI calls, with automatic dispatch between CPU and
-  CUDA based on the device selected by JAX ([GH-1661](https://github.com/NVIDIA/warp/issues/1661)).
-- **Experimental:** Extend APIC graph capture and replay on CPU so that `wp.Bvh.refit()` and `wp.Bvh.rebuild()`
-  called during a capture are recorded and replayed against the current bounds, instead of running once at capture
-  time and leaving replay to query a stale BVH. Such captures are replay-only; `capture_save()` rejects them because
-  the BVH handle cannot be serialized ([GH-1665](https://github.com/NVIDIA/warp/issues/1665)).
-- Add an optional `block_dim` argument to `wp.jax_kernel()` for selecting the CUDA thread-block size, including for
-  tile kernels and their generated adjoint launches ([GH-1436](https://github.com/NVIDIA/warp/issues/1436)).
-- Add NumPy-style slicing for tiles, including strided and reversed slices (`t[2:6, :]`, `t[:, ::2]`, `t[::-1, :]`),
-  dimension-collapsing integer indices with negative-index support (`t[5, :]`, `t[-1, :]`), and slice assignment
-  (`t[0:4, :] = src`). Also add `wp.tile_slice_indexed()`, which gathers elements along a single axis using a
-  1D integer index tile (`t[indices, :]`) ([GH-1176](https://github.com/NVIDIA/warp/issues/1176)).
-- Expose CUDA graph capture mode via `ScopedCapture` / `capture_begin()`
-  ([GH-1410](https://github.com/NVIDIA/warp/issues/1410)).
-- Add pre-allocated functors for `warp.optim.linear` solvers. Passing `run=False` to `cg`, `cr`, `bicgstab`, or `gmres`
-  returns a state object that holds all temporary buffers and can be invoked repeatedly on compatible systems
-  (same shape, batch count, dtype, and device), avoiding per-call allocation overhead and allowing usage in CUDA subgraphs
-  ([GH-1391](https://github.com/NVIDIA/warp/issues/1391)).
-- Add batched-input support to `warp.optim.linear` solvers: a `LinearOperator` built with `batch_offsets`
-  partitions the DOF vector into independent subproblems that are all solved in a single launch sequence,
-  with per-batch convergence checks ([GH-1391](https://github.com/NVIDIA/warp/issues/1391)).
-- Add `--sanitize=<name>` build option to `build_lib.py`, enabling AddressSanitizer builds of
-  `warp.dll` and `warp-clang.dll` on Windows, Linux, and macOS
-  ([GH-1387](https://github.com/NVIDIA/warp/issues/1387)).
-- Add analytic backward passes for `wp.curlnoise()` (2D, 3D, 4D). Previously
-  the adjoints were stubbed as no-ops and `is_differentiable=False`, so
-  gradients silently dropped through curl-noise force fields in
-  differentiable simulations
-  ([GH-1012](https://github.com/NVIDIA/warp/issues/1012)).
-- Add cooperative GPU scalar fallbacks for `tile_cholesky`, `tile_cholesky_solve`,
-  `tile_lower_solve`, and `tile_upper_solve` (and their inplace variants) and for the
-  `tile_cholesky` adjoint, so they run on GPU when libmathdx is unavailable. Add the
-  `enable_mathdx_solver` config flag and module option (parity with `enable_mathdx_gemm`)
-  to route these ops through the fallback when libmathdx is available
-  ([GH-1402](https://github.com/NVIDIA/warp/issues/1402)).
-- Add `wp.copysign(x, y)`: returns a value with the magnitude of `x` and the
-  sign of `y`, matching C `copysign` ([GH-1444](https://github.com/NVIDIA/warp/issues/1444)).
-
-### Removed
 
 ### Deprecated
 
