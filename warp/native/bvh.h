@@ -551,7 +551,7 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
             bool hit = bvh_query_intersection_test(
                 query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
             );
-            if (!hit || (query.query_type == BVH_QUERY_RAY && (query.radius > 0.0f ? t > max_dist : t >= max_dist))) {
+            if (!hit || (query.query_type == BVH_QUERY_RAY && t >= max_dist)) {
                 continue;
             }
         }
