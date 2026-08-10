@@ -462,15 +462,17 @@ bvh_query_intersection_test(const bvh_query_t& query, const vec3& node_lower, co
         // exact sphere-AABB node test using pre-computed radius_sq
         return intersect_sphere_aabb(query.input_lower, query.radius_sq, node_lower, node_upper);
     } else if (query.query_type == BVH_QUERY_RAY) {
-        // ray with node bounds expanded by query.radius (axis-aligned box) => conservative capsule when
-        // bounded by max_dist; over-approximates a true (spherical) capsule at the box corners.
-        // radius == 0 reproduces the original ray test byte-for-byte.
-        // Use the robust variant so axis-aligned rays (rcp_dir = ±inf) correctly handle tangent slabs.
-        return intersect_ray_aabb_robust(
-            query.input_lower,
-            vec3(1.0f / query.input_upper[0], 1.0f / query.input_upper[1], 1.0f / query.input_upper[2]),
-            query.input_upper, node_lower - vec3(query.radius), node_upper + vec3(query.radius), t
-        );
+        if (query.radius > 0.0f) {
+            // Capsule: inflate bounds by radius and use the robust slab test so axis-aligned
+            // directions (rcp_dir = ±inf) correctly handle tangent slabs instead of 0*inf = NaN.
+            return intersect_ray_aabb_robust(
+                query.input_lower,
+                vec3(1.0f / query.input_upper[0], 1.0f / query.input_upper[1], 1.0f / query.input_upper[2]),
+                query.input_upper, node_lower - vec3(query.radius), node_upper + vec3(query.radius), t
+            );
+        }
+        // Plain ray (radius == 0): original slab test, identical to pre-PR behavior.
+        return intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
     } else {
         return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
     }
@@ -549,7 +551,7 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
             bool hit = bvh_query_intersection_test(
                 query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
             );
-            if (!hit || (query.query_type == BVH_QUERY_RAY && t > max_dist)) {
+            if (!hit || (query.query_type == BVH_QUERY_RAY && (query.radius > 0.0f ? t > max_dist : t >= max_dist))) {
                 continue;
             }
         }
@@ -583,7 +585,8 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
                 bool hit = bvh_query_intersection_test(
                     query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], t
                 );
-                if (!hit || (query.query_type == BVH_QUERY_RAY && t > max_dist)) {
+                if (!hit
+                    || (query.query_type == BVH_QUERY_RAY && (query.radius > 0.0f ? t > max_dist : t >= max_dist))) {
                     continue;
                 }
                 index = primitive_index;
