@@ -492,6 +492,141 @@ class BvhAABBQuery:
         wp.synchronize_device(self.device)
 
 
+CPU_NUM_QUERY_POINTS = 32768
+
+
+class BvhAABBQueryCPU:
+    """CPU coverage for the default broad-phase AABB query.
+
+    Mirrors ``BvhAABBQuery`` on a CPU-sized problem (one bunny, ~12k triangle
+    bounds, 32k query AABBs) so the default non-precise AABB path is protected
+    on CPU. The CUDA-only ``BvhAABBQuery`` matrix gave no signal when this
+    path regressed on CPU (GH-1741). The root-miss timings cover query AABBs
+    that terminate at the root node, isolating per-call iterator overhead.
+    """
+
+    params = [[0.002, 0.03], [0, 1, 8], ["cpu"], ["sah"]]
+    param_names = ["query_radius", "leaf_size", "device", "constructor"]
+
+    number = 5
+    timeout = 300
+
+    def setup(self, query_radius, leaf_size, device, bvh_constructor):
+        with wp.ScopedDevice(device):
+            from pxr import Usd, UsdGeom
+
+            global seed
+
+            rand_eng = default_rng(seed)
+            seed = seed + 1
+
+            wp.init()
+            self.device = wp.get_device(device)
+            wp.load_module(device=self.device)
+
+            asset_stage = Usd.Stage.Open(os.path.join(get_asset_directory(), "bunny.usd"))
+            mesh_geom = UsdGeom.Mesh(asset_stage.GetPrimAtPath("/root/bunny"))
+
+            points = np.array(mesh_geom.GetPointsAttr().Get())
+            indices = np.array(mesh_geom.GetFaceVertexIndicesAttr().Get())
+
+            bounding_box = np.array([points.min(axis=0), points.max(axis=0)])
+
+            self.points = wp.array(points, dtype=wp.vec3)
+            self.indices = wp.array(indices, dtype=int)
+
+            bb_min = bounding_box[0]
+            bb_max = bounding_box[1]
+
+            query_points_np = bb_min + (bb_max - bb_min) * rand_eng.random((CPU_NUM_QUERY_POINTS, 3), dtype=np.float32)
+            self.query_points = wp.array(query_points_np, dtype=wp.vec3)
+
+            # Query AABBs entirely outside the root bounds: traversal exits at the root.
+            root_miss_points_np = query_points_np + 4.0 * (bb_max - bb_min)
+            self.root_miss_points = wp.array(root_miss_points_np.astype(np.float32), dtype=wp.vec3)
+
+            num_faces = int(indices.shape[0] / 3)
+            self.lowers = wp.zeros(num_faces, dtype=wp.vec3)
+            self.uppers = wp.zeros(num_faces, dtype=wp.vec3)
+
+            wp.launch(
+                dim=num_faces,
+                kernel=compute_tri_aabbs,
+                inputs=[self.points, self.indices],
+                outputs=[self.lowers, self.uppers],
+            )
+
+            if leaf_size == 0:
+                self.bvh = wp.Bvh(self.lowers, self.uppers, constructor=bvh_constructor)
+                self.mesh = wp.Mesh(self.points, wp.array(indices, dtype=int), bvh_constructor=bvh_constructor)
+            else:
+                self.bvh = wp.Bvh(self.lowers, self.uppers, leaf_size=leaf_size, constructor=bvh_constructor)
+                self.mesh = wp.Mesh(
+                    self.points, wp.array(indices, dtype=int), bvh_leaf_size=leaf_size, bvh_constructor=bvh_constructor
+                )
+
+            buffer_size_per_vertex = 32
+            self.vertex_colliding_triangles_offsets = wp.array(
+                np.arange(0, buffer_size_per_vertex * (CPU_NUM_QUERY_POINTS + 1), buffer_size_per_vertex, dtype=int),
+                dtype=wp.int32,
+            )
+            self.vertex_colliding_triangles = wp.zeros(
+                2 * buffer_size_per_vertex * CPU_NUM_QUERY_POINTS, dtype=wp.int32
+            )
+            self.vertex_colliding_triangles_count = wp.zeros(CPU_NUM_QUERY_POINTS, dtype=wp.int32)
+
+            self.bvh_vertex_triangle_collision_detection_kernel = get_v_t_collision_kernel(True)
+            self.mesh_vertex_triangle_collision_detection_kernel = get_v_t_collision_kernel(False)
+
+            wp.load_module(device=device)
+
+            self.launches = {}
+            for is_bvh, geom_id in ((True, self.bvh.id), (False, self.mesh.id)):
+                kernel = (
+                    self.bvh_vertex_triangle_collision_detection_kernel
+                    if is_bvh
+                    else self.mesh_vertex_triangle_collision_detection_kernel
+                )
+                for miss, query_points in ((False, self.query_points), (True, self.root_miss_points)):
+                    self.launches[(is_bvh, miss)] = wp.launch(
+                        dim=CPU_NUM_QUERY_POINTS,
+                        kernel=kernel,
+                        inputs=[
+                            query_radius,
+                            geom_id,
+                            query_points,
+                            self.vertex_colliding_triangles_offsets,
+                        ],
+                        outputs=[self.vertex_colliding_triangles, self.vertex_colliding_triangles_count],
+                        record_cmd=True,
+                    )
+
+            # warm up run
+            for launch in self.launches.values():
+                launch.launch()
+            wp.synchronize_device(self.device)
+
+    @skip_benchmark_if(USD_AVAILABLE is False)
+    def time_bvh_aabb_vs_aabb_query(self, query_radius, leaf_size, device, bvh_constructor):
+        self.launches[(True, False)].launch()
+        wp.synchronize_device(self.device)
+
+    @skip_benchmark_if(USD_AVAILABLE is False)
+    def time_mesh_aabb_vs_aabb_query(self, query_radius, leaf_size, device, bvh_constructor):
+        self.launches[(False, False)].launch()
+        wp.synchronize_device(self.device)
+
+    @skip_benchmark_if(USD_AVAILABLE is False)
+    def time_bvh_aabb_root_miss(self, query_radius, leaf_size, device, bvh_constructor):
+        self.launches[(True, True)].launch()
+        wp.synchronize_device(self.device)
+
+    @skip_benchmark_if(USD_AVAILABLE is False)
+    def time_mesh_aabb_root_miss(self, query_radius, leaf_size, device, bvh_constructor):
+        self.launches[(False, True)].launch()
+        wp.synchronize_device(self.device)
+
+
 class BvhRayQuery:
     params = [[480, 1080], [0, 8], ["cuda"], ["lbvh", "cubql"]]
     param_names = ["resolution", "leaf_size", "device", "constructor"]
