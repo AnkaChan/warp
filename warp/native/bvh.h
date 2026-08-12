@@ -17,6 +17,16 @@
 #define USE_LOAD4
 #define BVH_QUERY_STACK_SIZE (32)
 
+// Keeps the cold generalized (sphere/ray/capsule/precise) query loops out of the hot
+// broad-AABB iterator that gets inlined into kernels. CPU-only: with the generalized
+// loop inlined alongside the AABB fast path, clang produces measurably slower kernel
+// loops (~5%). CUDA keeps default inlining (no regression measured on device).
+#if defined(__CUDACC__) || defined(__CUDA_ARCH__)
+#define WP_QUERY_NOINLINE
+#else
+#define WP_QUERY_NOINLINE __attribute__((noinline))
+#endif
+
 #define BVH_CONSTRUCTOR_SAH (0)
 #define BVH_CONSTRUCTOR_MEDIAN (1)
 #define BVH_CONSTRUCTOR_LBVH (2)
@@ -535,6 +545,77 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_sphere(uint64_t id, const vec3& cente
     return query;
 }
 
+// Generalized iterator for ray, capsule, and sphere queries. Kept out of line on CPU so
+// the broad-AABB fast path in bvh_query_next() stays small enough to inline cleanly.
+CUDA_CALLABLE WP_QUERY_NOINLINE inline bool
+bvh_query_next_generalized(bvh_query_t& query, int& index, const float& max_dist)
+{
+    BVH bvh = query.bvh;
+
+    // Navigate through the bvh, find the first overlapping leaf node.
+    while (query.count) {
+        const int node_index = query.stack[--query.count];
+
+        BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
+        BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+
+        if (query.primitive_counter == 0) {
+            float t = FLT_MAX;
+            bool hit = bvh_query_intersection_test(
+                query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
+            );
+            if (!hit || (query.query_type == BVH_QUERY_RAY && (query.radius > 0.0f ? t > max_dist : t >= max_dist))) {
+                continue;
+            }
+        }
+
+        const int left_index = node_lower.i;
+        const int right_index = node_upper.i;
+
+        if (node_lower.b) {
+            const int start = left_index;
+            const int end = right_index;
+
+            // Fast path when the actual leaf range contains exactly one primitive
+            if (end - start == 1) {
+                int primitive_index = bvh.primitive_indices[start];
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            } else {
+                int primitive_index = bvh.primitive_indices[start + (query.primitive_counter++)];
+
+                // if already visited the last primitive in the leaf node
+                // move to the next node and reset the primitive counter to 0
+                if (start + query.primitive_counter == end) {
+                    query.primitive_counter = 0;
+                }
+                // otherwise we need to keep this leaf node in stack for a future visit
+                else {
+                    query.stack[query.count++] = node_index;
+                }
+                float t = FLT_MAX;
+                bool hit = bvh_query_intersection_test(
+                    query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], t
+                );
+                if (!hit
+                    || (query.query_type == BVH_QUERY_RAY && (query.radius > 0.0f ? t > max_dist : t >= max_dist))) {
+                    continue;
+                }
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            }
+        } else {
+            // if it's not a leaf node we treat it as if we have visited the last primitive
+            query.primitive_counter = 0;
+            query.stack[query.count++] = left_index;
+            query.stack[query.count++] = right_index;
+        }
+    }
+    return false;
+}
+
 CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const float& max_dist)
 {
     BVH bvh = query.bvh;
@@ -602,68 +683,7 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
         return false;
     }
 
-    // Generalized path for ray, capsule, and sphere queries.
-    while (query.count) {
-        const int node_index = query.stack[--query.count];
-
-        BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
-        BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
-
-        if (query.primitive_counter == 0) {
-            float t = FLT_MAX;
-            bool hit = bvh_query_intersection_test(
-                query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
-            );
-            if (!hit || (query.query_type == BVH_QUERY_RAY && (query.radius > 0.0f ? t > max_dist : t >= max_dist))) {
-                continue;
-            }
-        }
-
-        const int left_index = node_lower.i;
-        const int right_index = node_upper.i;
-
-        if (node_lower.b) {
-            const int start = left_index;
-            const int end = right_index;
-
-            // Fast path when the actual leaf range contains exactly one primitive
-            if (end - start == 1) {
-                int primitive_index = bvh.primitive_indices[start];
-                index = primitive_index;
-                query.bounds_nr = primitive_index;
-                return true;
-            } else {
-                int primitive_index = bvh.primitive_indices[start + (query.primitive_counter++)];
-
-                // if already visited the last primitive in the leaf node
-                // move to the next node and reset the primitive counter to 0
-                if (start + query.primitive_counter == end) {
-                    query.primitive_counter = 0;
-                }
-                // otherwise we need to keep this leaf node in stack for a future visit
-                else {
-                    query.stack[query.count++] = node_index;
-                }
-                float t = FLT_MAX;
-                bool hit = bvh_query_intersection_test(
-                    query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], t
-                );
-                if (!hit
-                    || (query.query_type == BVH_QUERY_RAY && (query.radius > 0.0f ? t > max_dist : t >= max_dist))) {
-                    continue;
-                }
-                index = primitive_index;
-                query.bounds_nr = primitive_index;
-                return true;
-            }
-        } else {
-            // if it's not a leaf node we treat it as if we have visited the last primitive
-            query.primitive_counter = 0;
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
-        }
-    }
-    return false;
+    return bvh_query_next_generalized(query, index, max_dist);
 }
 
 CUDA_CALLABLE inline int iter_next(bvh_query_t& query) { return query.bounds_nr; }

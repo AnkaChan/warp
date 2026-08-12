@@ -2461,6 +2461,44 @@ mesh_query_node_test(const mesh_query_aabb_t& query, const vec3& node_lower, con
     }
 }
 
+// Generalized init descent for sphere queries and precise AABB queries: traverses to the
+// first overlapping leaf node and leaves it on the stack. Kept out of line on CPU so the
+// broad-AABB fast path in mesh_query() stays small enough to inline cleanly.
+CUDA_CALLABLE WP_QUERY_NOINLINE inline void mesh_query_descend_generalized(mesh_query_aabb_t& query)
+{
+    Mesh& mesh = query.mesh;
+
+    while (query.count) {
+        const int nodeIndex = query.stack[--query.count];
+        BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
+        BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
+
+        if (query.primitive_counter == 0) {
+            if (!mesh_query_node_test(
+                    query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper)
+                )) {
+                // Skip this box, it doesn't overlap with our query volume.
+                continue;
+            }
+        }
+
+        const int left_index = node_lower.i;
+        const int right_index = node_upper.i;
+
+        // Make bounds from this AABB
+        if (node_lower.b) {
+            // Reached a leaf node, point to its first primitive
+            // Back up one level and return
+            query.primitive_counter = 0;
+            query.stack[query.count++] = nodeIndex;
+            return;
+        } else {
+            query.stack[query.count++] = left_index;
+            query.stack[query.count++] = right_index;
+        }
+    }
+}
+
 CUDA_CALLABLE inline mesh_query_aabb_t
 mesh_query(uint64_t id, int query_type, const vec3& a, const vec3& b, float radius, bool precise)
 {
@@ -2525,37 +2563,7 @@ mesh_query(uint64_t id, int query_type, const vec3& a, const vec3& b, float radi
         return query;
     }
 
-    // Generalized descent for sphere queries and precise AABB queries.
-    while (query.count) {
-        const int nodeIndex = query.stack[--query.count];
-        BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
-        BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
-
-        if (query.primitive_counter == 0) {
-            if (!mesh_query_node_test(
-                    query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper)
-                )) {
-                // Skip this box, it doesn't overlap with our query volume.
-                continue;
-            }
-        }
-
-        const int left_index = node_lower.i;
-        const int right_index = node_upper.i;
-
-        // Make bounds from this AABB
-        if (node_lower.b) {
-            // Reached a leaf node, point to its first primitive
-            // Back up one level and return
-            query.primitive_counter = 0;
-            query.stack[query.count++] = nodeIndex;
-            return query;
-        } else {
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
-        }
-    }
-
+    mesh_query_descend_generalized(query);
     return query;
 }
 
@@ -2633,6 +2641,58 @@ adj_mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper, uint64_t,
 }
 
 
+// Generalized iterator for sphere queries and precise AABB queries. Kept out of line on
+// CPU so the broad-AABB fast path in mesh_query_aabb_next() stays small enough to inline
+// cleanly (see WP_QUERY_NOINLINE in bvh.h).
+CUDA_CALLABLE WP_QUERY_NOINLINE inline bool mesh_query_aabb_next_generalized(mesh_query_aabb_t& query, int& index)
+{
+    Mesh mesh = query.mesh;
+
+    while (query.count) {
+        const int node_index = query.stack[--query.count];
+        BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
+        BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
+
+        if (!mesh_query_node_test(query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper))) {
+            continue;
+        }
+
+        const int left_index = node_lower.i;
+        const int right_index = node_upper.i;
+
+        if (node_lower.b) {
+            const int start = left_index;
+            const int end = right_index;
+
+            if (end - start == 1) {
+                int primitive_index = mesh.bvh.primitive_indices[start];
+                if (mesh_query_prim_test(query, mesh, primitive_index)) {
+                    index = primitive_index;
+                    query.face = primitive_index;
+                    return true;
+                }
+            } else {
+                int primitive_index = mesh.bvh.primitive_indices[start + (query.primitive_counter++)];
+                if (start + query.primitive_counter == end) {
+                    query.primitive_counter = 0;
+                } else {
+                    query.count++;
+                }
+                if (mesh_query_prim_test(query, mesh, primitive_index)) {
+                    index = primitive_index;
+                    query.face = primitive_index;
+                    return true;
+                }
+            }
+        } else {
+            query.primitive_counter = 0;
+            query.stack[query.count++] = left_index;
+            query.stack[query.count++] = right_index;
+        }
+    }
+    return false;
+}
+
 CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& index)
 {
     Mesh mesh = query.mesh;
@@ -2689,50 +2749,7 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
         return false;
     }
 
-    // Generalized path for sphere queries and precise AABB queries.
-    while (query.count) {
-        const int node_index = query.stack[--query.count];
-        BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
-        BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
-
-        if (!mesh_query_node_test(query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper))) {
-            continue;
-        }
-
-        const int left_index = node_lower.i;
-        const int right_index = node_upper.i;
-
-        if (node_lower.b) {
-            const int start = left_index;
-            const int end = right_index;
-
-            if (end - start == 1) {
-                int primitive_index = mesh.bvh.primitive_indices[start];
-                if (mesh_query_prim_test(query, mesh, primitive_index)) {
-                    index = primitive_index;
-                    query.face = primitive_index;
-                    return true;
-                }
-            } else {
-                int primitive_index = mesh.bvh.primitive_indices[start + (query.primitive_counter++)];
-                if (start + query.primitive_counter == end) {
-                    query.primitive_counter = 0;
-                } else {
-                    query.count++;
-                }
-                if (mesh_query_prim_test(query, mesh, primitive_index)) {
-                    index = primitive_index;
-                    query.face = primitive_index;
-                    return true;
-                }
-            }
-        } else {
-            query.primitive_counter = 0;
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
-        }
-    }
-    return false;
+    return mesh_query_aabb_next_generalized(query, index);
 }
 
 
