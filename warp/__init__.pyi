@@ -4356,8 +4356,8 @@ def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32, radius: flo
                 while wp.bvh_query_next(query, item, 1.0):
                     wp.atomic_add(count, 0, 1)
 
-            lowers = wp.array([[1, -1, -1]], dtype=wp.vec3)
-            uppers = wp.array([[2,  1,  1]], dtype=wp.vec3)
+            lowers = wp.array([[0.75, -1, -1]], dtype=wp.vec3)
+            uppers = wp.array([[2.0,   1,  1]], dtype=wp.vec3)
             bvh = wp.Bvh(lowers=lowers, uppers=uppers)
             count = wp.zeros(1, dtype=wp.int32)
             wp.launch(capsule_sweep, dim=1,
