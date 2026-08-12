@@ -465,24 +465,33 @@ struct bvh_query_t {
     float radius_sq;  // pre-computed radius*radius for sphere/capsule node tests
 };
 
+// Node/primitive overlap test, specialized per query kind at compile time: `if constexpr`
+// discards the untaken branches, so each instantiation folds to a dispatch-free test.
+// The ray variants also apply the max_dist predicate (closed endpoint for capsules,
+// half-open for plain rays, matching the original behavior of each).
+template <int QUERY_TYPE, bool HAS_RADIUS>
 CUDA_CALLABLE inline bool
-bvh_query_intersection_test(const bvh_query_t& query, const vec3& node_lower, const vec3& node_upper, float& t)
+bvh_query_test(const bvh_query_t& query, const vec3& node_lower, const vec3& node_upper, const float& max_dist)
 {
-    if (query.query_type == BVH_QUERY_SPHERE) {
+    if constexpr (QUERY_TYPE == BVH_QUERY_SPHERE) {
         // exact sphere-AABB node test using pre-computed radius_sq
         return intersect_sphere_aabb(query.input_lower, query.radius_sq, node_lower, node_upper);
-    } else if (query.query_type == BVH_QUERY_RAY) {
-        if (query.radius > 0.0f) {
+    } else if constexpr (QUERY_TYPE == BVH_QUERY_RAY) {
+        float t = FLT_MAX;
+        if constexpr (HAS_RADIUS) {
             // Capsule: inflate bounds by radius and use the robust slab test so axis-aligned
             // directions (rcp_dir = ±inf) correctly handle tangent slabs instead of 0*inf = NaN.
-            return intersect_ray_aabb_robust(
+            bool hit = intersect_ray_aabb_robust(
                 query.input_lower,
                 vec3(1.0f / query.input_upper[0], 1.0f / query.input_upper[1], 1.0f / query.input_upper[2]),
                 query.input_upper, node_lower - vec3(query.radius), node_upper + vec3(query.radius), t
             );
+            return hit && !(t > max_dist);
+        } else {
+            // Plain ray (radius == 0): original slab test, identical to pre-PR behavior.
+            bool hit = intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
+            return hit && !(t >= max_dist);
         }
-        // Plain ray (radius == 0): original slab test, identical to pre-PR behavior.
-        return intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
     } else {
         return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
     }
@@ -545,10 +554,11 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_sphere(uint64_t id, const vec3& cente
     return query;
 }
 
-// Generalized iterator for ray, capsule, and sphere queries. Kept out of line on CPU so
-// the broad-AABB fast path in bvh_query_next() stays small enough to inline cleanly.
-CUDA_CALLABLE WP_QUERY_NOINLINE inline bool
-bvh_query_next_generalized(bvh_query_t& query, int& index, const float& max_dist)
+// Shared traversal skeleton for all bvh query kinds, written once and instantiated per
+// query type. Each instantiation compiles to a dispatch-free loop (bvh_query_test folds
+// the query-kind branches at compile time), matching the original per-kind behavior.
+template <int QUERY_TYPE, bool HAS_RADIUS>
+CUDA_CALLABLE inline bool bvh_query_next_impl(bvh_query_t& query, int& index, const float& max_dist)
 {
     BVH bvh = query.bvh;
 
@@ -560,11 +570,9 @@ bvh_query_next_generalized(bvh_query_t& query, int& index, const float& max_dist
         BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
 
         if (query.primitive_counter == 0) {
-            float t = FLT_MAX;
-            bool hit = bvh_query_intersection_test(
-                query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
-            );
-            if (!hit || (query.query_type == BVH_QUERY_RAY && (query.radius > 0.0f ? t > max_dist : t >= max_dist))) {
+            if (!bvh_query_test<QUERY_TYPE, HAS_RADIUS>(
+                    query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), max_dist
+                )) {
                 continue;
             }
         }
@@ -594,12 +602,9 @@ bvh_query_next_generalized(bvh_query_t& query, int& index, const float& max_dist
                 else {
                     query.stack[query.count++] = node_index;
                 }
-                float t = FLT_MAX;
-                bool hit = bvh_query_intersection_test(
-                    query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], t
-                );
-                if (!hit
-                    || (query.query_type == BVH_QUERY_RAY && (query.radius > 0.0f ? t > max_dist : t >= max_dist))) {
+                if (!bvh_query_test<QUERY_TYPE, HAS_RADIUS>(
+                        query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], max_dist
+                    )) {
                     continue;
                 }
                 index = primitive_index;
@@ -616,74 +621,39 @@ bvh_query_next_generalized(bvh_query_t& query, int& index, const float& max_dist
     return false;
 }
 
+// Cold query kinds: the WP_QUERY_NOINLINE wrapper is the out-of-line boundary on CPU
+// (the impl inlines into the wrapper), keeping the hot broad-AABB path in
+// bvh_query_next() small enough to inline into kernels. CUDA keeps default inlining.
+CUDA_CALLABLE WP_QUERY_NOINLINE inline bool bvh_query_next_sphere(bvh_query_t& query, int& index, const float& max_dist)
+{
+    return bvh_query_next_impl<BVH_QUERY_SPHERE, true>(query, index, max_dist);
+}
+
+CUDA_CALLABLE WP_QUERY_NOINLINE inline bool bvh_query_next_ray(bvh_query_t& query, int& index, const float& max_dist)
+{
+    return bvh_query_next_impl<BVH_QUERY_RAY, false>(query, index, max_dist);
+}
+
+CUDA_CALLABLE WP_QUERY_NOINLINE inline bool
+bvh_query_next_capsule(bvh_query_t& query, int& index, const float& max_dist)
+{
+    return bvh_query_next_impl<BVH_QUERY_RAY, true>(query, index, max_dist);
+}
+
 CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const float& max_dist)
 {
-    BVH bvh = query.bvh;
-
-    // Fast path for the default broad-phase AABB query: uses intersect_aabb_aabb directly
-    // with no query_type dispatch in the hot loop, identical to pre-PR behavior and performance.
+    // One predicted branch selects the specialized loop for this query's kind. The default
+    // broad-phase AABB instantiation inlines into the kernel (pre-PR behavior and
+    // performance); the other kinds run their own dispatch-free loops out of line on CPU.
     if (query.query_type == BVH_QUERY_AABB) {
-        while (query.count) {
-            const int node_index = query.stack[--query.count];
-
-            BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
-            BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
-
-            if (query.primitive_counter == 0) {
-                if (!intersect_aabb_aabb(
-                        query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
-                        reinterpret_cast<vec3&>(node_upper)
-                    )) {
-                    continue;
-                }
-            }
-
-            const int left_index = node_lower.i;
-            const int right_index = node_upper.i;
-
-            if (node_lower.b) {
-                const int start = left_index;
-                const int end = right_index;
-
-                // Fast path when the actual leaf range contains exactly one primitive
-                if (end - start == 1) {
-                    int primitive_index = bvh.primitive_indices[start];
-                    index = primitive_index;
-                    query.bounds_nr = primitive_index;
-                    return true;
-                } else {
-                    int primitive_index = bvh.primitive_indices[start + (query.primitive_counter++)];
-
-                    // if already visited the last primitive in the leaf node
-                    // move to the next node and reset the primitive counter to 0
-                    if (start + query.primitive_counter == end) {
-                        query.primitive_counter = 0;
-                    }
-                    // otherwise we need to keep this leaf node in stack for a future visit
-                    else {
-                        query.stack[query.count++] = node_index;
-                    }
-                    if (!intersect_aabb_aabb(
-                            query.input_lower, query.input_upper, bvh.item_lowers[primitive_index],
-                            bvh.item_uppers[primitive_index]
-                        )) {
-                        continue;
-                    }
-                    index = primitive_index;
-                    query.bounds_nr = primitive_index;
-                    return true;
-                }
-            } else {
-                // if it's not a leaf node we treat it as if we have visited the last primitive
-                query.primitive_counter = 0;
-                query.stack[query.count++] = left_index;
-                query.stack[query.count++] = right_index;
-            }
-        }
-        return false;
+        return bvh_query_next_impl<BVH_QUERY_AABB, false>(query, index, max_dist);
+    } else if (query.query_type == BVH_QUERY_SPHERE) {
+        return bvh_query_next_sphere(query, index, max_dist);
+    } else if (query.radius > 0.0f) {
+        return bvh_query_next_capsule(query, index, max_dist);
+    } else {
+        return bvh_query_next_ray(query, index, max_dist);
     }
-
-    return bvh_query_next_generalized(query, index, max_dist);
 }
 
 CUDA_CALLABLE inline int iter_next(bvh_query_t& query) { return query.bounds_nr; }
