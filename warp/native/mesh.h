@@ -2488,7 +2488,44 @@ mesh_query(uint64_t id, int query_type, const vec3& a, const vec3& b, float radi
     query.input_lower = a;
     query.input_upper = b;
 
-    // Navigate through the bvh, find the first overlapping leaf node.
+    // Fast path for the original broad-phase AABB query: uses intersect_aabb_aabb directly
+    // with no query_type or precise dispatch, identical to pre-PR behavior and performance.
+    if (query_type == MESH_QUERY_AABB && !precise) {
+        while (query.count) {
+            const int nodeIndex = query.stack[--query.count];
+            BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
+            BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
+
+            if (query.primitive_counter == 0) {
+                if (!intersect_aabb_aabb(
+                        query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
+                        reinterpret_cast<vec3&>(node_upper)
+                    )) {
+                    // Skip this box, it doesn't overlap with our target box.
+                    continue;
+                }
+            }
+
+            const int left_index = node_lower.i;
+            const int right_index = node_upper.i;
+
+            // Make bounds from this AABB
+            if (node_lower.b) {
+                // Reached a leaf node, point to its first primitive
+                // Back up one level and return
+                query.primitive_counter = 0;
+                query.stack[query.count++] = nodeIndex;
+                return query;
+            } else {
+                query.stack[query.count++] = left_index;
+                query.stack[query.count++] = right_index;
+            }
+        }
+
+        return query;
+    }
+
+    // Generalized descent for sphere queries and precise AABB queries.
     while (query.count) {
         const int nodeIndex = query.stack[--query.count];
         BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);

@@ -539,7 +539,70 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
 {
     BVH bvh = query.bvh;
 
-    // Navigate through the bvh, find the first overlapping leaf node.
+    // Fast path for the default broad-phase AABB query: uses intersect_aabb_aabb directly
+    // with no query_type dispatch in the hot loop, identical to pre-PR behavior and performance.
+    if (query.query_type == BVH_QUERY_AABB) {
+        while (query.count) {
+            const int node_index = query.stack[--query.count];
+
+            BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
+            BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+
+            if (query.primitive_counter == 0) {
+                if (!intersect_aabb_aabb(
+                        query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
+                        reinterpret_cast<vec3&>(node_upper)
+                    )) {
+                    continue;
+                }
+            }
+
+            const int left_index = node_lower.i;
+            const int right_index = node_upper.i;
+
+            if (node_lower.b) {
+                const int start = left_index;
+                const int end = right_index;
+
+                // Fast path when the actual leaf range contains exactly one primitive
+                if (end - start == 1) {
+                    int primitive_index = bvh.primitive_indices[start];
+                    index = primitive_index;
+                    query.bounds_nr = primitive_index;
+                    return true;
+                } else {
+                    int primitive_index = bvh.primitive_indices[start + (query.primitive_counter++)];
+
+                    // if already visited the last primitive in the leaf node
+                    // move to the next node and reset the primitive counter to 0
+                    if (start + query.primitive_counter == end) {
+                        query.primitive_counter = 0;
+                    }
+                    // otherwise we need to keep this leaf node in stack for a future visit
+                    else {
+                        query.stack[query.count++] = node_index;
+                    }
+                    if (!intersect_aabb_aabb(
+                            query.input_lower, query.input_upper, bvh.item_lowers[primitive_index],
+                            bvh.item_uppers[primitive_index]
+                        )) {
+                        continue;
+                    }
+                    index = primitive_index;
+                    query.bounds_nr = primitive_index;
+                    return true;
+                }
+            } else {
+                // if it's not a leaf node we treat it as if we have visited the last primitive
+                query.primitive_counter = 0;
+                query.stack[query.count++] = left_index;
+                query.stack[query.count++] = right_index;
+            }
+        }
+        return false;
+    }
+
+    // Generalized path for ray, capsule, and sphere queries.
     while (query.count) {
         const int node_index = query.stack[--query.count];
 
