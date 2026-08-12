@@ -2600,53 +2600,92 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
 {
     Mesh mesh = query.mesh;
 
-    // Navigate through the bvh, find the first overlapping leaf node.
+    // Fast path for the original broad-phase AABB query: uses intersect_aabb_aabb directly
+    // with no query_type or precise dispatch, identical to pre-PR behavior and performance.
+    if (query.query_type == MESH_QUERY_AABB && !query.precise) {
+        while (query.count) {
+            const int node_index = query.stack[--query.count];
+            BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
+            BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
+
+            if (!intersect_aabb_aabb(
+                    query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
+                    reinterpret_cast<vec3&>(node_upper)
+                )) {
+                continue;
+            }
+
+            const int left_index = node_lower.i;
+            const int right_index = node_upper.i;
+
+            if (node_lower.b) {
+                const int start = left_index;
+                const int end = right_index;
+
+                if (end - start == 1) {
+                    int primitive_index = mesh.bvh.primitive_indices[start];
+                    index = primitive_index;
+                    query.face = primitive_index;
+                    return true;
+                } else {
+                    int primitive_index = mesh.bvh.primitive_indices[start + (query.primitive_counter++)];
+                    if (start + query.primitive_counter == end) {
+                        query.primitive_counter = 0;
+                    } else {
+                        query.count++;
+                    }
+                    if (intersect_aabb_aabb(
+                            query.input_lower, query.input_upper, mesh.lowers[primitive_index],
+                            mesh.uppers[primitive_index]
+                        )) {
+                        index = primitive_index;
+                        query.face = primitive_index;
+                        return true;
+                    }
+                }
+            } else {
+                query.primitive_counter = 0;
+                query.stack[query.count++] = left_index;
+                query.stack[query.count++] = right_index;
+            }
+        }
+        return false;
+    }
+
+    // Generalized path for sphere queries and precise AABB queries.
     while (query.count) {
         const int node_index = query.stack[--query.count];
         BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
         BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
 
         if (!mesh_query_node_test(query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper))) {
-            // Skip this box, it doesn't overlap with our query volume.
             continue;
         }
 
         const int left_index = node_lower.i;
         const int right_index = node_upper.i;
 
-        // Make bounds from this AABB
         if (node_lower.b) {
-            // found leaf, loop through its content primitives
             const int start = left_index;
             const int end = right_index;
 
             if (end - start == 1) {
                 int primitive_index = mesh.bvh.primitive_indices[start];
-                // Broad-phase AABB singleton fast path: leaf AABB == primitive AABB, so the node
-                // test above already guarantees this primitive overlaps -- no re-test needed.
-                // Sphere and precise-AABB queries still need the full per-primitive check.
-                if ((query.query_type == MESH_QUERY_AABB && !query.precise)
-                    || mesh_query_prim_test(query, mesh, primitive_index)) {
+                if (mesh_query_prim_test(query, mesh, primitive_index)) {
                     index = primitive_index;
                     query.face = primitive_index;
                     return true;
                 }
             } else {
                 int primitive_index = mesh.bvh.primitive_indices[start + (query.primitive_counter++)];
-                // if already visited the last primitive in the leaf node
-                // move to the next node and reset the primitive counter to 0
                 if (start + query.primitive_counter == end) {
                     query.primitive_counter = 0;
-                }
-                // otherwise we need to keep this leaf node in stack for a future visit
-                else {
+                } else {
                     query.count++;
                 }
-
                 if (mesh_query_prim_test(query, mesh, primitive_index)) {
                     index = primitive_index;
                     query.face = primitive_index;
-
                     return true;
                 }
             }
