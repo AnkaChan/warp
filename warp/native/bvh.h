@@ -619,8 +619,6 @@ CUDA_CALLABLE inline bool bvh_query_next_aabb(bvh_query_t& query, int& index)
             // stack entries already passed their AABB test; the AABB part of
             // this load is unused and no re-test is needed
             query.cur_node = bvh_query_node_load(bvh, query.stack[--query.count]);
-            query.have_node = true;
-            continue;
         }
 
         const uint64_t node = query.cur_node;

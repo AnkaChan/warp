@@ -2015,8 +2015,6 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
             // stack entries already passed their AABB test; the AABB part of
             // this load is unused and no re-test is needed
             query.cur_node = bvh_query_node_load(mesh.bvh, query.stack[--query.count]);
-            query.have_node = true;
-            continue;
         }
 
         const uint64_t node = query.cur_node;
