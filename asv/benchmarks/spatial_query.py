@@ -496,13 +496,12 @@ CPU_NUM_QUERY_POINTS = 32768
 
 
 class BvhAABBQueryCPU:
-    """CPU coverage for the default broad-phase AABB query.
+    """Broad-phase AABB query timing on CPU for both ``wp.Bvh`` and ``wp.Mesh``.
 
-    Mirrors ``BvhAABBQuery`` on a CPU-sized problem (one bunny, ~12k triangle
-    bounds, 32k query AABBs) so the default non-precise AABB path is protected
-    on CPU. The CUDA-only ``BvhAABBQuery`` matrix gave no signal when this
-    path regressed on CPU (GH-1741). The root-miss timings cover query AABBs
-    that terminate at the root node, isolating per-call iterator overhead.
+    Uses a bunny mesh (~12k triangle bounds) with 32k query AABBs at two radii
+    (sparse: 0.002, dense: 0.03) and three leaf sizes (default/1/8).
+    In-bounds timings query AABBs that traverse the tree; root-miss timings use
+    AABBs that are rejected at the root node, isolating per-call iterator overhead.
     """
 
     params = [[0.002, 0.03], [0, 1, 8], ["cpu"], ["sah"]]
@@ -609,22 +608,18 @@ class BvhAABBQueryCPU:
     @skip_benchmark_if(USD_AVAILABLE is False)
     def time_bvh_aabb_vs_aabb_query(self, query_radius, leaf_size, device, bvh_constructor):
         self.launches[(True, False)].launch()
-        wp.synchronize_device(self.device)
 
     @skip_benchmark_if(USD_AVAILABLE is False)
     def time_mesh_aabb_vs_aabb_query(self, query_radius, leaf_size, device, bvh_constructor):
         self.launches[(False, False)].launch()
-        wp.synchronize_device(self.device)
 
     @skip_benchmark_if(USD_AVAILABLE is False)
     def time_bvh_aabb_root_miss(self, query_radius, leaf_size, device, bvh_constructor):
         self.launches[(True, True)].launch()
-        wp.synchronize_device(self.device)
 
     @skip_benchmark_if(USD_AVAILABLE is False)
     def time_mesh_aabb_root_miss(self, query_radius, leaf_size, device, bvh_constructor):
         self.launches[(False, True)].launch()
-        wp.synchronize_device(self.device)
 
 
 class BvhRayQuery:
