@@ -409,7 +409,8 @@ struct bvh_query_t {
         , input_lower()
         , input_upper()
         , bounds_nr(0)
-        , primitive_counter(-1)
+        , prim_cur(0)
+        , prim_end(0)
         , last_query_valid(true)
     {
     }
@@ -419,7 +420,10 @@ struct bvh_query_t {
 
     BVH bvh;
 
-    // BVH traversal stack:
+    // BVH traversal stack of node indices; every entry passed its AABB/ray
+    // test before being pushed.
+    // On CUDA the stack lives in shared memory: keeping an array out of this
+    // struct lets the compiler keep the remaining members in registers.
 #if BVH_SHARED_STACK
     bvh_stack_t stack;
 #else
@@ -428,8 +432,11 @@ struct bvh_query_t {
 
     int count;
 
-    // >= 0 if currently in a packed leaf node
-    int primitive_counter;
+    // primitive range of the packed leaf currently being enumerated;
+    // when prim_cur < prim_end the query resumes mid-leaf on the next
+    // bvh_query_next() call
+    int prim_cur;
+    int prim_end;
 
     // inputs
     wp::vec3 input_lower;  // start for ray
@@ -456,9 +463,6 @@ bvh_query_intersection_test(const bvh_query_t& query, const vec3& node_lower, co
 
 CUDA_CALLABLE inline bvh_query_t bvh_query(uint64_t id, bool is_ray, const vec3& lower, const vec3& upper, int root)
 {
-    // This routine traverses the BVH tree until it finds
-    // the first overlapping bound.
-
     // initialize empty
     bvh_query_t query;
 
@@ -473,14 +477,11 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(uint64_t id, bool is_ray, const vec3&
 
     query.bvh = bvh;
     query.is_ray = is_ray;
-
-    // optimization: make the latest
-    query.stack[0] = root == -1 ? *bvh.root : root;
-    query.count = 1;
-    // ensure node-level AABB tests run on first iteration
-    query.primitive_counter = 0;
     query.input_lower = lower;
     query.input_upper = upper;
+
+    query.stack[0] = root == -1 ? *bvh.root : root;
+    query.count = 1;
 
     return query;
 }
@@ -499,21 +500,39 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
 {
     BVH bvh = query.bvh;
 
-    // Navigate through the bvh, find the first overlapping leaf node.
-    while (query.count) {
+    // a single flat loop; every iteration either emits one primitive from the
+    // packed leaf currently being enumerated, or pops and processes one node.
+    // Keeping the loop flat minimizes divergence between the threads of a warp.
+    for (;;) {
+        if (query.prim_cur < query.prim_end) {
+            const int primitive_index = bvh.primitive_indices[query.prim_cur++];
+
+            float t = FLT_MAX;
+            const bool hit = bvh_query_intersection_test(
+                query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], t
+            );
+            if (hit && !(query.is_ray && t >= max_dist)) {
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            }
+            continue;
+        }
+
+        if (!query.count)
+            return false;
+
         const int node_index = query.stack[--query.count];
 
         BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
         BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
 
-        if (query.primitive_counter == 0) {
-            float t = FLT_MAX;
-            bool hit = bvh_query_intersection_test(
-                query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
-            );
-            if (!hit || (query.is_ray && t >= max_dist)) {
-                continue;
-            }
+        float t = FLT_MAX;
+        const bool hit = bvh_query_intersection_test(
+            query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
+        );
+        if (!hit || (query.is_ray && t >= max_dist)) {
+            continue;
         }
 
         const int left_index = node_lower.i;
@@ -523,43 +542,24 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
             const int start = left_index;
             const int end = right_index;
 
-            // Fast path when the actual leaf range contains exactly one primitive
+            // fast path when the leaf contains exactly one primitive: its
+            // AABB is the leaf node's AABB, which just passed the test above
             if (end - start == 1) {
-                int primitive_index = bvh.primitive_indices[start];
-                index = primitive_index;
-                query.bounds_nr = primitive_index;
-                return true;
-            } else {
-                int primitive_index = bvh.primitive_indices[start + (query.primitive_counter++)];
-
-                // if already visited the last primitive in the leaf node
-                // move to the next node and reset the primitive counter to 0
-                if (start + query.primitive_counter == end) {
-                    query.primitive_counter = 0;
-                }
-                // otherwise we need to keep this leaf node in stack for a future visit
-                else {
-                    query.stack[query.count++] = node_index;
-                }
-                float t = FLT_MAX;
-                bool hit = bvh_query_intersection_test(
-                    query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], t
-                );
-                if (!hit || (query.is_ray && t >= max_dist)) {
-                    continue;
-                }
+                const int primitive_index = bvh.primitive_indices[start];
                 index = primitive_index;
                 query.bounds_nr = primitive_index;
                 return true;
             }
+
+            // packed leaf: enumerate its primitives one per loop iteration,
+            // without re-loading the leaf node
+            query.prim_cur = start;
+            query.prim_end = end;
         } else {
-            // if it's not a leaf node we treat it as if we have visited the last primitive
-            query.primitive_counter = 0;
             query.stack[query.count++] = left_index;
             query.stack[query.count++] = right_index;
         }
     }
-    return false;
 }
 
 CUDA_CALLABLE inline int iter_next(bvh_query_t& query) { return query.bounds_nr; }
