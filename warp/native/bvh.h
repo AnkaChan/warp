@@ -23,6 +23,8 @@
 // loops (~5%). CUDA keeps default inlining (no regression measured on device).
 #if defined(__CUDACC__) || defined(__CUDA_ARCH__)
 #define WP_QUERY_NOINLINE
+#elif defined(_MSC_VER)
+#define WP_QUERY_NOINLINE __declspec(noinline)
 #else
 #define WP_QUERY_NOINLINE __attribute__((noinline))
 #endif
