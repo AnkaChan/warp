@@ -2012,9 +2012,15 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
             if (!query.count)
                 return false;
 
-            // stack entries already passed their AABB test; the AABB part of
-            // this load is unused and no re-test is needed
-            query.cur_node = bvh_query_node_load(mesh.bvh, query.stack[--query.count]);
+            const unsigned top = unsigned(query.stack[--query.count]);
+            if (top & 0x80000000u) {
+                // payload pair: the node is reconstructed without any memory access
+                query.cur_node = bvh_query_stack_unpack(unsigned(query.stack[--query.count]), top);
+            } else {
+                // index entry: it already passed its AABB test, so the AABB
+                // part of this load is unused and no re-test is needed
+                query.cur_node = bvh_query_node_load(mesh.bvh, int(top));
+            }
         }
 
         const uint64_t node = query.cur_node;
@@ -2060,10 +2066,16 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
         if (hit_left) {
             query.cur_node = bvh_query_node_pack(left_lower, left_upper);
             query.have_node = true;
-            // if the stack is full the right child is dropped; the previous
-            // fixed-size-stack traversal overflowed instead
-            if (hit_right && query.count < BVH_QUERY_STACK_SIZE)
-                query.stack[query.count++] = right_index;
+            if (hit_right) {
+                // when the stack is completely full the right child is dropped,
+                // matching the depth limit of the previous fixed-size-stack traversal
+                if (query.count + 1 < BVH_QUERY_STACK_SIZE) {
+                    query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
+                    query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
+                } else if (query.count < BVH_QUERY_STACK_SIZE) {
+                    query.stack[query.count++] = right_index;
+                }
+            }
         } else if (hit_right) {
             query.cur_node = bvh_query_node_pack(right_lower, right_upper);
             query.have_node = true;

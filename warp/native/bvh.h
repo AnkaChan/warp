@@ -345,6 +345,24 @@ CUDA_CALLABLE inline int bvh_query_node_lower_payload(uint64_t node) { return in
 
 CUDA_CALLABLE inline int bvh_query_node_upper_payload(uint64_t node) { return int((node >> 31) & 0x7fffffffu); }
 
+// Far children pushed onto the 32-bit traversal stack are stored as a tagged
+// pair of slots holding the node's packed payload, so popping them needs no
+// memory access: the top slot has bit 31 set and holds the upper payload, the
+// slot below it holds the lower payload and the leaf flag. When fewer than
+// two slots are free the node index is pushed instead (bit 31 clear, indices
+// are 31-bit) and the payload is re-loaded on pop.
+CUDA_CALLABLE inline int bvh_query_stack_slot_lo(const BVHPackedNodeHalf& lower)
+{
+    return int(lower.i | (unsigned(lower.b) << 31));
+}
+
+CUDA_CALLABLE inline int bvh_query_stack_slot_hi(const BVHPackedNodeHalf& upper) { return int(upper.i | 0x80000000u); }
+
+CUDA_CALLABLE inline uint64_t bvh_query_stack_unpack(unsigned slot_lo, unsigned slot_hi)
+{
+    return (uint64_t(slot_lo >> 31) << 62) | (uint64_t(slot_hi & 0x7fffffffu) << 31) | uint64_t(slot_lo & 0x7fffffffu);
+}
+
 CUDA_CALLABLE inline int lca(int node_a, int node_b, const int* parent)
 {
     int da = 0, db = 0;
@@ -616,9 +634,15 @@ CUDA_CALLABLE inline bool bvh_query_next_aabb(bvh_query_t& query, int& index)
             if (!query.count)
                 return false;
 
-            // stack entries already passed their AABB test; the AABB part of
-            // this load is unused and no re-test is needed
-            query.cur_node = bvh_query_node_load(bvh, query.stack[--query.count]);
+            const unsigned top = unsigned(query.stack[--query.count]);
+            if (top & 0x80000000u) {
+                // payload pair: the node is reconstructed without any memory access
+                query.cur_node = bvh_query_stack_unpack(unsigned(query.stack[--query.count]), top);
+            } else {
+                // index entry: it already passed its AABB test, so the AABB
+                // part of this load is unused and no re-test is needed
+                query.cur_node = bvh_query_node_load(bvh, int(top));
+            }
         }
 
         const uint64_t node = query.cur_node;
@@ -664,10 +688,16 @@ CUDA_CALLABLE inline bool bvh_query_next_aabb(bvh_query_t& query, int& index)
         if (hit_left) {
             query.cur_node = bvh_query_node_pack(left_lower, left_upper);
             query.have_node = true;
-            // if the stack is full the right child is dropped; the previous
-            // fixed-size-stack traversal overflowed instead
-            if (hit_right && query.count < BVH_QUERY_STACK_SIZE)
-                query.stack[query.count++] = right_index;
+            if (hit_right) {
+                // when the stack is completely full the right child is dropped,
+                // matching the depth limit of the previous fixed-size-stack traversal
+                if (query.count + 1 < BVH_QUERY_STACK_SIZE) {
+                    query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
+                    query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
+                } else if (query.count < BVH_QUERY_STACK_SIZE) {
+                    query.stack[query.count++] = right_index;
+                }
+            }
         } else if (hit_right) {
             query.cur_node = bvh_query_node_pack(right_lower, right_upper);
             query.have_node = true;
