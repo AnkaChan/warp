@@ -2154,6 +2154,14 @@ class MeshQueryAABB:
     _wp_native_name_ = "mesh_query_aabb_t"
 
 
+class MeshQuerySphere(MeshQueryAABB):
+    """Query object returned by :func:`warp.mesh_query_sphere`. Advance with :func:`warp.mesh_query_next`."""
+
+
+class MeshQueryAABBPrecise(MeshQueryAABB):
+    """Query object returned by ``mesh_query_aabb(..., precise=True)``. Advance with :func:`warp.mesh_query_next`."""
+
+
 class MeshQueryAABBTiled:
     """Object used to track state during thread-block parallel mesh traversal."""
 

@@ -633,7 +633,7 @@ def tile_mesh_query_aabb_valid_kernel(
 def mesh_query_sphere_hits(mesh_id: wp.uint64, center: wp.vec3, radius: float, hits: wp.array[int]):
     query = wp.mesh_query_sphere(mesh_id, center, radius)
     face = int(0)
-    while wp.mesh_query_aabb_next(query, face):
+    while wp.mesh_query_next(query, face):
         hits[face] = 1
 
 
@@ -641,7 +641,7 @@ def mesh_query_sphere_hits(mesh_id: wp.uint64, center: wp.vec3, radius: float, h
 def mesh_query_aabb_precise_hits(mesh_id: wp.uint64, low: wp.vec3, high: wp.vec3, hits: wp.array[int]):
     query = wp.mesh_query_aabb(mesh_id, low, high, precise=True)
     face = int(0)
-    while wp.mesh_query_aabb_next(query, face):
+    while wp.mesh_query_next(query, face):
         hits[face] = 1
 
 

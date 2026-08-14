@@ -9126,11 +9126,25 @@ add_builtin(
     is_differentiable=False,
 )
 
+
+def _mesh_query_aabb_value_func(arg_types, arg_values):
+    """Return MeshQueryAABBPrecise when precise=True (literal), MeshQueryAABB otherwise.
+
+    get_arg_value() unwraps Var constants to raw Python values, so arg_values["precise"]
+    is the Python bool True/False for literals and a Var for runtime variables.
+    """
+    if arg_types is None:
+        return MeshQueryAABB
+    if arg_values.get("precise") is True:
+        return MeshQueryAABBPrecise
+    return MeshQueryAABB
+
+
 add_builtin(
     "mesh_query_aabb",
     input_types={"id": uint64, "low": vec3, "high": vec3, "precise": builtins.bool},
     defaults={"precise": False},
-    value_type=MeshQueryAABB,
+    value_func=_mesh_query_aabb_value_func,
     group="Geometry",
     doc="""Construct an axis-aligned bounding box (AABB) query against a :class:`warp.Mesh`.
 
@@ -9182,7 +9196,7 @@ add_builtin(
 add_builtin(
     "mesh_query_sphere",
     input_types={"id": uint64, "center": vec3, "radius": float},
-    value_type=MeshQueryAABB,
+    value_type=MeshQuerySphere,
     group="Geometry",
     doc="""Construct a sphere query against a :class:`warp.Mesh`.
 
@@ -9274,6 +9288,32 @@ add_builtin(
 
             overlapping faces: 12""",
     native_func="mesh_query_aabb_next",
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "mesh_query_next",
+    input_types={"query": MeshQuerySphere, "index": int},
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Advance a sphere mesh query to the next matching triangle.
+
+    Overload for queries created by :func:`mesh_query_sphere`.""",
+    native_func="mesh_query_sphere_next",
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "mesh_query_next",
+    input_types={"query": MeshQueryAABBPrecise, "index": int},
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Advance a precise AABB mesh query to the next matching triangle.
+
+    Overload for queries created by ``mesh_query_aabb(..., precise=True)``.""",
+    native_func="mesh_query_aabb_precise_next",
     export=False,
     is_differentiable=False,
 )

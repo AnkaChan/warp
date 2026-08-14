@@ -74,7 +74,9 @@ from warp._src.types import BvhQuery as BvhQuery
 from warp._src.types import BvhQueryTiled as BvhQueryTiled
 from warp._src.types import HashGridQuery as HashGridQuery
 from warp._src.types import MeshQueryAABB as MeshQueryAABB
+from warp._src.types import MeshQueryAABBPrecise as MeshQueryAABBPrecise
 from warp._src.types import MeshQueryAABBTiled as MeshQueryAABBTiled
+from warp._src.types import MeshQuerySphere as MeshQuerySphere
 from warp._src.types import MeshQueryPoint as MeshQueryPoint
 from warp._src.types import MeshQueryRay as MeshQueryRay
 from warp._src.texture import Texture as Texture
@@ -5488,7 +5490,7 @@ def mesh_query_aabb(id: uint64, low: vec3f, high: vec3f, precise: bool) -> MeshQ
             overlapping faces: 12"""
     ...
 
-def mesh_query_sphere(id: uint64, center: vec3f, radius: float32) -> MeshQueryAABB:
+def mesh_query_sphere(id: uint64, center: vec3f, radius: float32) -> MeshQuerySphere:
     """Construct a sphere query against a :class:`warp.Mesh`.
 
     Iterates over mesh triangles that intersect a sphere. A broad phase uses an exact sphere-AABB test
@@ -5527,7 +5529,7 @@ def mesh_query_sphere(id: uint64, center: vec3f, radius: float32) -> MeshQueryAA
             hit: 1"""
     ...
 
-def mesh_query_next(query: MeshQueryAABB, index: int32) -> bool:
+def mesh_query_next(query: MeshQueryAABB | MeshQuerySphere | MeshQueryAABBPrecise, index: int32) -> bool:
     """Advance a mesh query to the next matching triangle and report whether one was found.
 
     Writes the face index of the current result to ``index`` and returns ``True``; returns

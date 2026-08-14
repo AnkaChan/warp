@@ -2624,64 +2624,93 @@ adj_mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper, uint64_t,
 }
 
 
-// Shared traversal skeleton for all mesh query kinds, written once and instantiated per
-// (query kind, precise) pair. Each instantiation compiles to a dispatch-free loop: the
-// node and primitive tests fold at compile time, and the non-precise AABB instantiation
-// reproduces the original broad-phase loop exactly (including the singleton-leaf return
-// without a redundant primitive re-test).
-template <int QUERY_TYPE, bool PRECISE>
-CUDA_CALLABLE inline bool mesh_query_aabb_next_impl(mesh_query_aabb_t& query, int& index)
+// ---------------------------------------------------------------------------
+// Mesh query traversal skeleton and per-kind iterators
+//
+// The skeleton is written once as a function template parameterized by a
+// NodeTest and a PrimitiveTest functor.  Each public iterator instantiates
+// it with the matching pair, producing a dispatch-free loop.  Because each
+// public function is called only from the Python type that represents its
+// query kind, NVCC compiles exactly one loop per kernel -- no dead-branch
+// code bloat and no runtime/literal performance difference.
+// ---------------------------------------------------------------------------
+
+struct AabbNodeTest {
+    CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const vec3& lo, const vec3& hi) const
+    {
+        return intersect_aabb_aabb(q.input_lower, q.input_upper, lo, hi);
+    }
+};
+
+struct SphereNodeTest {
+    CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const vec3& lo, const vec3& hi) const
+    {
+        return intersect_sphere_aabb(q.input_lower, q.radius_sq, lo, hi);
+    }
+};
+
+// Broad-phase AABB primitive test: check the triangle's cached AABB only.
+struct AabbPrimitiveTest {
+    CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const Mesh& m, int pi) const
+    {
+        return intersect_aabb_aabb(q.input_lower, q.input_upper, m.lowers[pi], m.uppers[pi]);
+    }
+};
+
+// Precise AABB primitive test: AABB reject then exact triangle-vs-box SAT.
+struct AabbPrecisePrimitiveTest {
+    CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const Mesh& m, int pi) const
+    {
+        if (!intersect_aabb_aabb(q.input_lower, q.input_upper, m.lowers[pi], m.uppers[pi]))
+            return false;
+        const int i = m.indices[pi * 3 + 0], j = m.indices[pi * 3 + 1], k = m.indices[pi * 3 + 2];
+        return intersect_tri_aabb(m.points[i], m.points[j], m.points[k], q.input_lower, q.input_upper);
+    }
+};
+
+// Sphere primitive test: delegates to mesh_query_prim_test which handles
+// the degenerate-face guard and the closest-point narrow phase.
+struct SpherePrimitiveTest {
+    CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const Mesh& m, int pi) const
+    {
+        return mesh_query_prim_test<MESH_QUERY_SPHERE, true>(q, m, pi);
+    }
+};
+
+template <typename NodeTest, typename PrimitiveTest>
+CUDA_CALLABLE inline bool mesh_query_next_impl(mesh_query_aabb_t& query, int& index)
 {
     Mesh mesh = query.mesh;
-
-    // Navigate through the bvh, find the first overlapping leaf node.
     while (query.count) {
         const int node_index = query.stack[--query.count];
         BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
         BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
 
-        if (!mesh_query_node_test<QUERY_TYPE>(
-                query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper)
-            )) {
-            // Skip this box, it doesn't overlap with our query volume.
+        if (!NodeTest {}(query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper)))
             continue;
-        }
 
         const int left_index = node_lower.i;
         const int right_index = node_upper.i;
 
         if (node_lower.b) {
-            // found leaf, loop through its content primitives
             const int start = left_index;
             const int end = right_index;
 
             if (end - start == 1) {
                 int primitive_index = mesh.bvh.primitive_indices[start];
-                if constexpr (QUERY_TYPE == MESH_QUERY_AABB && !PRECISE) {
-                    // Singleton leaf: leaf AABB == primitive AABB, so the node test above
-                    // already guarantees this primitive overlaps -- no re-test needed.
+                if (PrimitiveTest {}(query, mesh, primitive_index)) {
                     index = primitive_index;
                     query.face = primitive_index;
                     return true;
-                } else {
-                    if (mesh_query_prim_test<QUERY_TYPE, PRECISE>(query, mesh, primitive_index)) {
-                        index = primitive_index;
-                        query.face = primitive_index;
-                        return true;
-                    }
                 }
             } else {
                 int primitive_index = mesh.bvh.primitive_indices[start + (query.primitive_counter++)];
-                // if already visited the last primitive in the leaf node
-                // move to the next node and reset the primitive counter to 0
                 if (start + query.primitive_counter == end) {
                     query.primitive_counter = 0;
-                }
-                // otherwise we need to keep this leaf node in stack for a future visit
-                else {
+                } else {
                     query.count++;
                 }
-                if (mesh_query_prim_test<QUERY_TYPE, PRECISE>(query, mesh, primitive_index)) {
+                if (PrimitiveTest {}(query, mesh, primitive_index)) {
                     index = primitive_index;
                     query.face = primitive_index;
                     return true;
@@ -2696,31 +2725,25 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next_impl(mesh_query_aabb_t& query, in
     return false;
 }
 
-// Cold query kinds: the WP_QUERY_NOINLINE wrapper is the out-of-line boundary on CPU
-// (the impl inlines into the wrapper), keeping the hot broad-AABB path in
-// mesh_query_aabb_next() small enough to inline into kernels. CUDA keeps default inlining.
-CUDA_CALLABLE WP_QUERY_NOINLINE inline bool mesh_query_aabb_next_sphere(mesh_query_aabb_t& query, int& index)
-{
-    return mesh_query_aabb_next_impl<MESH_QUERY_SPHERE, true>(query, index);
-}
-
-CUDA_CALLABLE WP_QUERY_NOINLINE inline bool mesh_query_aabb_next_precise_aabb(mesh_query_aabb_t& query, int& index)
-{
-    return mesh_query_aabb_next_impl<MESH_QUERY_AABB, true>(query, index);
-}
-
+// Backward-compatible broad-phase AABB iterator. Called by mesh_query_aabb_next
+// (the alias) and by mesh_query_next when the query object is MeshQueryAABB.
+// AabbPrimitiveTest always passes after AabbNodeTest on singleton leaves
+// (leaf AABB == primitive AABB), so the compiler folds it to a single test.
 CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& index)
 {
-    // One predicted branch selects the specialized loop for this query's kind. The default
-    // broad-phase AABB instantiation inlines into the kernel (pre-PR behavior and
-    // performance); sphere and precise-AABB run their own loops out of line on CPU.
-    if (query.query_type == MESH_QUERY_AABB && !query.precise) {
-        return mesh_query_aabb_next_impl<MESH_QUERY_AABB, false>(query, index);
-    } else if (query.query_type == MESH_QUERY_SPHERE) {
-        return mesh_query_aabb_next_sphere(query, index);
-    } else {
-        return mesh_query_aabb_next_precise_aabb(query, index);
-    }
+    return mesh_query_next_impl<AabbNodeTest, AabbPrimitiveTest>(query, index);
+}
+
+// Sphere iterator -- called from mesh_query_next when the query object is MeshQuerySphere.
+CUDA_CALLABLE inline bool mesh_query_sphere_next(mesh_query_aabb_t& query, int& index)
+{
+    return mesh_query_next_impl<SphereNodeTest, SpherePrimitiveTest>(query, index);
+}
+
+// Precise AABB iterator -- called from mesh_query_next when the query object is MeshQueryAABBPrecise.
+CUDA_CALLABLE inline bool mesh_query_aabb_precise_next(mesh_query_aabb_t& query, int& index)
+{
+    return mesh_query_next_impl<AabbNodeTest, AabbPrecisePrimitiveTest>(query, index);
 }
 
 
