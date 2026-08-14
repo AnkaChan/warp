@@ -170,14 +170,14 @@ CUDA_CALLABLE inline float mesh_query_point_core(
             const int end = bvh_query_node_upper_payload(node);
             // loops through primitives in the leaf
             for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
-                int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                int i = mesh.indices[primitive_index * 3 + 0];
-                int j = mesh.indices[primitive_index * 3 + 1];
-                int k = mesh.indices[primitive_index * 3 + 2];
+                int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
+                int i = bvh_load_int(mesh.indices, primitive_index * 3 + 0);
+                int j = bvh_load_int(mesh.indices, primitive_index * 3 + 1);
+                int k = bvh_load_int(mesh.indices, primitive_index * 3 + 2);
 
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
+                vec3 p = bvh_load_vec3(mesh.points, i);
+                vec3 q = bvh_load_vec3(mesh.points, j);
+                vec3 r = bvh_load_vec3(mesh.points, k);
 
                 vec3 e0 = q - p;
                 vec3 e1 = r - p;
@@ -382,14 +382,14 @@ mesh_query_furthest_point_no_sign(uint64_t id, const vec3& point, float min_dist
             const int end = right_index;
             // loops through primitives in the leaf
             for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
-                int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                int i = mesh.indices[primitive_index * 3 + 0];
-                int j = mesh.indices[primitive_index * 3 + 1];
-                int k = mesh.indices[primitive_index * 3 + 2];
+                int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
+                int i = bvh_load_int(mesh.indices, primitive_index * 3 + 0);
+                int j = bvh_load_int(mesh.indices, primitive_index * 3 + 1);
+                int k = bvh_load_int(mesh.indices, primitive_index * 3 + 2);
 
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
+                vec3 p = bvh_load_vec3(mesh.points, i);
+                vec3 q = bvh_load_vec3(mesh.points, j);
+                vec3 r = bvh_load_vec3(mesh.points, k);
 
                 vec3 e0 = q - p;
                 vec3 e1 = r - p;
@@ -568,14 +568,14 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_normal(
             const int end = right_index;
             // loops through primitives in the leaf
             for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
-                int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                int i = mesh.indices[primitive_index * 3 + 0];
-                int j = mesh.indices[primitive_index * 3 + 1];
-                int k = mesh.indices[primitive_index * 3 + 2];
+                int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
+                int i = bvh_load_int(mesh.indices, primitive_index * 3 + 0);
+                int j = bvh_load_int(mesh.indices, primitive_index * 3 + 1);
+                int k = bvh_load_int(mesh.indices, primitive_index * 3 + 2);
 
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
+                vec3 p = bvh_load_vec3(mesh.points, i);
+                vec3 q = bvh_load_vec3(mesh.points, j);
+                vec3 r = bvh_load_vec3(mesh.points, k);
 
                 vec3 e0 = q - p;
                 vec3 e1 = r - p;
@@ -1996,11 +1996,14 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
     // Keeping the loop flat minimizes divergence between the threads of a warp.
     for (;;) {
         if (query.prim_cur < query.prim_end) {
-            const int primitive_index = mesh.bvh.primitive_indices[query.prim_cur++];
+            const int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, query.prim_cur++);
 
-            if (intersect_aabb_aabb(
-                    query.input_lower, query.input_upper, mesh.lowers[primitive_index], mesh.uppers[primitive_index]
-                )) {
+            // load the face bounds eagerly so the test below compiles to one
+            // predicate chain instead of a branch per component
+            const vec3 face_lower = bvh_load_vec3(mesh.lowers, primitive_index);
+            const vec3 face_upper = bvh_load_vec3(mesh.uppers, primitive_index);
+
+            if (intersect_aabb_aabb(query.input_lower, query.input_upper, face_lower, face_upper)) {
                 index = primitive_index;
                 query.face = primitive_index;
                 return true;
@@ -2033,7 +2036,7 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
             // fast path when the leaf contains exactly one primitive: its
             // AABB is the leaf node's AABB, which already passed its test
             if (end - start == 1) {
-                const int primitive_index = mesh.bvh.primitive_indices[start];
+                const int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, start);
                 index = primitive_index;
                 query.face = primitive_index;
                 return true;

@@ -239,8 +239,24 @@ __device__ inline wp::BVHPackedNodeHalf bvh_load_node(const wp::BVHPackedNodeHal
     return nodes[index];
 #endif  // USE_LOAD4
 }
+
+// read-only loads for the remaining BVH/mesh query inputs (primitive indices,
+// item bounds, mesh vertices); plain pointer dereferences compile to generic
+// loads because the arrays are reached through a descriptor pointer, whereas
+// __ldg uses the read-only data path
+__device__ inline int bvh_load_int(const int* data, int index) { return __ldg(data + index); }
+
+__device__ inline vec3 bvh_load_vec3(const vec3* data, int index)
+{
+    const float* p = reinterpret_cast<const float*>(data + index);
+    return vec3(__ldg(p + 0), __ldg(p + 1), __ldg(p + 2));
+}
 #else
 inline wp::BVHPackedNodeHalf bvh_load_node(const wp::BVHPackedNodeHalf* nodes, int index) { return nodes[index]; }
+
+inline int bvh_load_int(const int* data, int index) { return data[index]; }
+
+inline vec3 bvh_load_vec3(const vec3* data, int index) { return data[index]; }
 #endif  // __CUDACC__
 
 CUDA_CALLABLE inline int clz(int x)
@@ -547,14 +563,15 @@ CUDA_CALLABLE inline bool bvh_query_next_ray(bvh_query_t& query, int& index, con
 
     for (;;) {
         if (query.prim_cur < query.prim_end) {
-            const int primitive_index = bvh.primitive_indices[query.prim_cur++];
+            const int primitive_index = bvh_load_int(bvh.primitive_indices, query.prim_cur++);
+
+            // load the item bounds eagerly so the tests below compile to one
+            // predicate chain instead of a branch per component
+            const vec3 item_lower = bvh_load_vec3(bvh.item_lowers, primitive_index);
+            const vec3 item_upper = bvh_load_vec3(bvh.item_uppers, primitive_index);
 
             float t = FLT_MAX;
-            if (intersect_ray_aabb(
-                    query.input_lower, query.input_upper, bvh.item_lowers[primitive_index],
-                    bvh.item_uppers[primitive_index], t
-                )
-                && t < max_dist) {
+            if (intersect_ray_aabb(query.input_lower, query.input_upper, item_lower, item_upper, t) && t < max_dist) {
                 index = primitive_index;
                 query.bounds_nr = primitive_index;
                 return true;
@@ -589,7 +606,7 @@ CUDA_CALLABLE inline bool bvh_query_next_ray(bvh_query_t& query, int& index, con
             // fast path when the leaf contains exactly one primitive: its
             // AABB is the leaf node's AABB, which just passed the test above
             if (end - start == 1) {
-                const int primitive_index = bvh.primitive_indices[start];
+                const int primitive_index = bvh_load_int(bvh.primitive_indices, start);
                 index = primitive_index;
                 query.bounds_nr = primitive_index;
                 return true;
@@ -617,12 +634,14 @@ CUDA_CALLABLE inline bool bvh_query_next_aabb(bvh_query_t& query, int& index)
 
     for (;;) {
         if (query.prim_cur < query.prim_end) {
-            const int primitive_index = bvh.primitive_indices[query.prim_cur++];
+            const int primitive_index = bvh_load_int(bvh.primitive_indices, query.prim_cur++);
 
-            if (intersect_aabb_aabb(
-                    query.input_lower, query.input_upper, bvh.item_lowers[primitive_index],
-                    bvh.item_uppers[primitive_index]
-                )) {
+            // load the item bounds eagerly so the test below compiles to one
+            // predicate chain instead of a branch per component
+            const vec3 item_lower = bvh_load_vec3(bvh.item_lowers, primitive_index);
+            const vec3 item_upper = bvh_load_vec3(bvh.item_uppers, primitive_index);
+
+            if (intersect_aabb_aabb(query.input_lower, query.input_upper, item_lower, item_upper)) {
                 index = primitive_index;
                 query.bounds_nr = primitive_index;
                 return true;
@@ -655,7 +674,7 @@ CUDA_CALLABLE inline bool bvh_query_next_aabb(bvh_query_t& query, int& index)
             // fast path when the leaf contains exactly one primitive: its
             // AABB is the leaf node's AABB, which already passed its test
             if (end - start == 1) {
-                const int primitive_index = bvh.primitive_indices[start];
+                const int primitive_index = bvh_load_int(bvh.primitive_indices, start);
                 index = primitive_index;
                 query.bounds_nr = primitive_index;
                 return true;
