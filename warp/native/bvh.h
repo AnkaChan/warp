@@ -411,6 +411,8 @@ struct bvh_query_t {
         , bounds_nr(0)
         , prim_cur(0)
         , prim_end(0)
+        , cur_node(0)
+        , have_node(false)
         , last_query_valid(true)
     {
     }
@@ -437,6 +439,11 @@ struct bvh_query_t {
     // bvh_query_next() call
     int prim_cur;
     int prim_end;
+
+    // packed payload (see bvh_query_node_pack()) of the node to process next,
+    // valid when have_node is set; it already passed its intersection test
+    uint64_t cur_node;
+    bool have_node;
 
     // inputs
     wp::vec3 input_lower;  // start for ray
@@ -480,8 +487,25 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(uint64_t id, bool is_ray, const vec3&
     query.input_lower = lower;
     query.input_upper = upper;
 
-    query.stack[0] = root == -1 ? *bvh.root : root;
-    query.count = 1;
+    const int root_index = (root == -1) ? *bvh.root : root;
+
+    if (is_ray) {
+        // ray queries traverse with a test-on-pop loop; stack entries are untested
+        query.stack[0] = root_index;
+        query.count = 1;
+    } else {
+        // AABB queries traverse with pre-tested stack entries and a
+        // register-carried current node, so test the root here
+        const BVHPackedNodeHalf root_lower = bvh_load_node(bvh.node_lowers, root_index);
+        const BVHPackedNodeHalf root_upper = bvh_load_node(bvh.node_uppers, root_index);
+
+        if (intersect_aabb_aabb(
+                lower, upper, reinterpret_cast<const vec3&>(root_lower), reinterpret_cast<const vec3&>(root_upper)
+            )) {
+            query.cur_node = bvh_query_node_pack(root_lower, root_upper);
+            query.have_node = true;
+        }
+    }
 
     return query;
 }
@@ -496,22 +520,23 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, c
     return bvh_query(id, true, start, 1.0f / dir, root);
 }
 
-CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const float& max_dist)
+// ray traversal: a single flat test-on-pop loop. Rays commonly overlap both
+// children of a node, so routing every node through the stack is cheaper than
+// the register-carried descent used for AABB queries below.
+CUDA_CALLABLE inline bool bvh_query_next_ray(bvh_query_t& query, int& index, const float& max_dist)
 {
     BVH bvh = query.bvh;
 
-    // a single flat loop; every iteration either emits one primitive from the
-    // packed leaf currently being enumerated, or pops and processes one node.
-    // Keeping the loop flat minimizes divergence between the threads of a warp.
     for (;;) {
         if (query.prim_cur < query.prim_end) {
             const int primitive_index = bvh.primitive_indices[query.prim_cur++];
 
             float t = FLT_MAX;
-            const bool hit = bvh_query_intersection_test(
-                query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], t
-            );
-            if (hit && !(query.is_ray && t >= max_dist)) {
+            if (intersect_ray_aabb(
+                    query.input_lower, query.input_upper, bvh.item_lowers[primitive_index],
+                    bvh.item_uppers[primitive_index], t
+                )
+                && t < max_dist) {
                 index = primitive_index;
                 query.bounds_nr = primitive_index;
                 return true;
@@ -528,10 +553,11 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
         BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
 
         float t = FLT_MAX;
-        const bool hit = bvh_query_intersection_test(
-            query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), t
-        );
-        if (!hit || (query.is_ray && t >= max_dist)) {
+        if (!intersect_ray_aabb(
+                query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
+                reinterpret_cast<vec3&>(node_upper), t
+            )
+            || t >= max_dist) {
             continue;
         }
 
@@ -560,6 +586,105 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
             query.stack[query.count++] = right_index;
         }
     }
+}
+
+// AABB traversal: a single flat loop; every iteration either emits one
+// primitive from the packed leaf currently being enumerated, processes the
+// node carried over in registers (a child that already passed its AABB test),
+// or pops one pre-tested node index. Keeping the loop flat minimizes
+// divergence between the threads of a warp.
+CUDA_CALLABLE inline bool bvh_query_next_aabb(bvh_query_t& query, int& index)
+{
+    BVH bvh = query.bvh;
+
+    for (;;) {
+        if (query.prim_cur < query.prim_end) {
+            const int primitive_index = bvh.primitive_indices[query.prim_cur++];
+
+            if (intersect_aabb_aabb(
+                    query.input_lower, query.input_upper, bvh.item_lowers[primitive_index],
+                    bvh.item_uppers[primitive_index]
+                )) {
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            }
+            continue;
+        }
+
+        if (!query.have_node) {
+            if (!query.count)
+                return false;
+
+            // stack entries already passed their AABB test; the AABB part of
+            // this load is unused and no re-test is needed
+            query.cur_node = bvh_query_node_load(bvh, query.stack[--query.count]);
+            query.have_node = true;
+            continue;
+        }
+
+        const uint64_t node = query.cur_node;
+        query.have_node = false;
+
+        if (bvh_query_node_is_leaf(node)) {
+            const int start = bvh_query_node_lower_payload(node);
+            const int end = bvh_query_node_upper_payload(node);
+
+            // fast path when the leaf contains exactly one primitive: its
+            // AABB is the leaf node's AABB, which already passed its test
+            if (end - start == 1) {
+                const int primitive_index = bvh.primitive_indices[start];
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            }
+
+            // packed leaf: enumerate its primitives one per loop iteration,
+            // without re-loading the leaf node
+            query.prim_cur = start;
+            query.prim_end = end;
+            continue;
+        }
+
+        const int left_index = bvh_query_node_lower_payload(node);
+        const int right_index = bvh_query_node_upper_payload(node);
+
+        const BVHPackedNodeHalf left_lower = bvh_load_node(bvh.node_lowers, left_index);
+        const BVHPackedNodeHalf left_upper = bvh_load_node(bvh.node_uppers, left_index);
+        const BVHPackedNodeHalf right_lower = bvh_load_node(bvh.node_lowers, right_index);
+        const BVHPackedNodeHalf right_upper = bvh_load_node(bvh.node_uppers, right_index);
+
+        const bool hit_left = intersect_aabb_aabb(
+            query.input_lower, query.input_upper, reinterpret_cast<const vec3&>(left_lower),
+            reinterpret_cast<const vec3&>(left_upper)
+        );
+        const bool hit_right = intersect_aabb_aabb(
+            query.input_lower, query.input_upper, reinterpret_cast<const vec3&>(right_lower),
+            reinterpret_cast<const vec3&>(right_upper)
+        );
+
+        if (hit_left) {
+            query.cur_node = bvh_query_node_pack(left_lower, left_upper);
+            query.have_node = true;
+            // if the stack is full the right child is dropped; the previous
+            // fixed-size-stack traversal overflowed instead
+            if (hit_right && query.count < BVH_QUERY_STACK_SIZE)
+                query.stack[query.count++] = right_index;
+        } else if (hit_right) {
+            query.cur_node = bvh_query_node_pack(right_lower, right_upper);
+            query.have_node = true;
+        }
+    }
+}
+
+CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const float& max_dist)
+{
+    // is_ray is fixed per query, so this branch is uniform and hoists the
+    // ray/AABB distinction out of the per-node loops
+    if (query.is_ray)
+        return bvh_query_next_ray(query, index, max_dist);
+    else
+        return bvh_query_next_aabb(query, index);
 }
 
 CUDA_CALLABLE inline int iter_next(bvh_query_t& query) { return query.bounds_nr; }

@@ -1905,6 +1905,8 @@ struct mesh_query_aabb_t {
         , face(0)
         , prim_cur(0)
         , prim_end(0)
+        , cur_node(0)
+        , have_node(false)
         , last_query_valid(true)
     {
     }
@@ -1937,6 +1939,11 @@ struct mesh_query_aabb_t {
     int prim_cur;
     int prim_end;
 
+    // packed payload (see bvh_query_node_pack()) of the node to process next,
+    // valid when have_node is set; it already passed its AABB test
+    uint64_t cur_node;
+    bool have_node;
+
     // Face
     int face;
 
@@ -1964,8 +1971,18 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& 
     query.input_lower = lower;
     query.input_upper = upper;
 
-    query.stack[0] = *mesh.bvh.root;
-    query.count = 1;
+    // both stack entries and cur_node must have passed their AABB test
+    // already, so test the root here
+    const int root_index = *mesh.bvh.root;
+    const BVHPackedNodeHalf root_lower = bvh_load_node(mesh.bvh.node_lowers, root_index);
+    const BVHPackedNodeHalf root_upper = bvh_load_node(mesh.bvh.node_uppers, root_index);
+
+    if (intersect_aabb_aabb(
+            lower, upper, reinterpret_cast<const vec3&>(root_lower), reinterpret_cast<const vec3&>(root_upper)
+        )) {
+        query.cur_node = bvh_query_node_pack(root_lower, root_upper);
+        query.have_node = true;
+    }
 
     return query;
 }
@@ -1991,31 +2008,26 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
             continue;
         }
 
-        if (!query.count)
-            return false;
+        if (!query.have_node) {
+            if (!query.count)
+                return false;
 
-        const int node_index = query.stack[--query.count];
-
-        BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
-        BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
-
-        if (!intersect_aabb_aabb(
-                query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
-                reinterpret_cast<vec3&>(node_upper)
-            )) {
-            // Skip this box, it doesn't overlap with our target box.
+            // stack entries already passed their AABB test; the AABB part of
+            // this load is unused and no re-test is needed
+            query.cur_node = bvh_query_node_load(mesh.bvh, query.stack[--query.count]);
+            query.have_node = true;
             continue;
         }
 
-        const int left_index = node_lower.i;
-        const int right_index = node_upper.i;
+        const uint64_t node = query.cur_node;
+        query.have_node = false;
 
-        if (node_lower.b) {
-            const int start = left_index;
-            const int end = right_index;
+        if (bvh_query_node_is_leaf(node)) {
+            const int start = bvh_query_node_lower_payload(node);
+            const int end = bvh_query_node_upper_payload(node);
 
             // fast path when the leaf contains exactly one primitive: its
-            // AABB is the leaf node's AABB, which just passed the test above
+            // AABB is the leaf node's AABB, which already passed its test
             if (end - start == 1) {
                 const int primitive_index = mesh.bvh.primitive_indices[start];
                 index = primitive_index;
@@ -2027,9 +2039,36 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
             // without re-loading the leaf node
             query.prim_cur = start;
             query.prim_end = end;
-        } else {
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
+            continue;
+        }
+
+        const int left_index = bvh_query_node_lower_payload(node);
+        const int right_index = bvh_query_node_upper_payload(node);
+
+        const BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
+        const BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
+        const BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
+        const BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
+
+        const bool hit_left = intersect_aabb_aabb(
+            query.input_lower, query.input_upper, reinterpret_cast<const vec3&>(left_lower),
+            reinterpret_cast<const vec3&>(left_upper)
+        );
+        const bool hit_right = intersect_aabb_aabb(
+            query.input_lower, query.input_upper, reinterpret_cast<const vec3&>(right_lower),
+            reinterpret_cast<const vec3&>(right_upper)
+        );
+
+        if (hit_left) {
+            query.cur_node = bvh_query_node_pack(left_lower, left_upper);
+            query.have_node = true;
+            // if the stack is full the right child is dropped; the previous
+            // fixed-size-stack traversal overflowed instead
+            if (hit_right && query.count < BVH_QUERY_STACK_SIZE)
+                query.stack[query.count++] = right_index;
+        } else if (hit_right) {
+            query.cur_node = bvh_query_node_pack(right_lower, right_upper);
+            query.have_node = true;
         }
     }
 }
