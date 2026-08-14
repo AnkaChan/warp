@@ -1907,6 +1907,7 @@ struct mesh_query_aabb_t {
         , prim_end(0)
         , cur_node(0)
         , have_node(false)
+        , pair_limit(-1)
         , last_query_valid(true)
     {
     }
@@ -1944,6 +1945,10 @@ struct mesh_query_aabb_t {
     uint64_t cur_node;
     bool have_node;
 
+    // stack occupancy up to which far children may be pushed as two-slot
+    // payload pairs (see bvh_query_pair_limit())
+    int pair_limit;
+
     // Face
     int face;
 
@@ -1970,6 +1975,8 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& 
 
     query.input_lower = lower;
     query.input_upper = upper;
+
+    query.pair_limit = bvh_query_pair_limit(mesh.bvh);
 
     // both stack entries and cur_node must have passed their AABB test
     // already, so test the root here
@@ -2070,9 +2077,10 @@ CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& in
             query.cur_node = bvh_query_node_pack(left_lower, left_upper);
             query.have_node = true;
             if (hit_right) {
-                // when the stack is completely full the right child is dropped,
-                // matching the depth limit of the previous fixed-size-stack traversal
-                if (query.count + 1 < BVH_QUERY_STACK_SIZE) {
+                // pair pushes stop at pair_limit so that slot usage can never
+                // exceed the stack for constructor-produced trees; the final
+                // guard only matters for depths beyond the construction bound
+                if (query.count <= query.pair_limit) {
                     query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
                     query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
                 } else if (query.count < BVH_QUERY_STACK_SIZE) {

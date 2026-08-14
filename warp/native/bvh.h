@@ -182,6 +182,7 @@ struct BVH {
     // reordered primitive indices corresponds to the ordering of leaf nodes
     int* primitive_indices;
 
+    // maximum node depth counting the root as depth 1 (see also max_depth_ptr)
     int max_depth;
     int max_nodes;
     int num_nodes;
@@ -192,6 +193,12 @@ struct BVH {
     // representing the root of the tree, this is not always the first node
     // for bottom-up builders
     int* root;
+
+    // maximum node depth of the tree counting the root as depth 1, stored
+    // behind a device pointer so that in-place (graph-captured) rebuilds can
+    // update it; null for host-resident trees, whose max_depth field is
+    // authoritative. Consumed by bvh_query_pair_limit().
+    int* max_depth_ptr;
 
     // item bounds are not owned by the BVH but by the caller
     vec3* item_lowers;
@@ -379,6 +386,31 @@ CUDA_CALLABLE inline uint64_t bvh_query_stack_unpack(unsigned slot_lo, unsigned 
     return (uint64_t(slot_lo >> 31) << 62) | (uint64_t(slot_hi & 0x7fffffffu) << 31) | uint64_t(slot_lo & 0x7fffffffu);
 }
 
+// Largest stack occupancy at which a far child may still be pushed as a
+// two-slot payload pair. A traversal never has more pending stack entries
+// than internal nodes on a root-leaf path (max_depth - 1), and stopping pair
+// pushes above this limit bounds live pairs so that total slot usage stays
+// within BVH_QUERY_STACK_SIZE for every tree the constructors can produce
+// (they hard-terminate at the stack depth). An unknown or out-of-range depth
+// yields a negative limit, which disables pairs entirely and falls back to
+// the exactly-safe one-slot-per-entry index encoding.
+CUDA_CALLABLE inline int bvh_query_pair_limit(const BVH& bvh)
+{
+    int max_depth = bvh.max_depth;
+#ifdef __CUDA_ARCH__
+    if (bvh.max_depth_ptr)
+        max_depth = __ldg(bvh.max_depth_ptr);
+#else
+    if (bvh.max_depth_ptr)
+        max_depth = *bvh.max_depth_ptr;
+#endif
+    // grouped host builds restart the depth counter per group, so their
+    // recorded depth is not a root-leaf bound
+    if (max_depth < 1 || max_depth > BVH_QUERY_STACK_SIZE + 1 || bvh.item_groups)
+        max_depth = BVH_QUERY_STACK_SIZE + 1;
+    return std_min(64 - 2 * max_depth, BVH_QUERY_STACK_SIZE - 2);
+}
+
 CUDA_CALLABLE inline int lca(int node_a, int node_b, const int* parent)
 {
     int da = 0, db = 0;
@@ -447,6 +479,7 @@ struct bvh_query_t {
         , prim_end(0)
         , cur_node(0)
         , have_node(false)
+        , pair_limit(-1)
         , last_query_valid(true)
     {
     }
@@ -478,6 +511,10 @@ struct bvh_query_t {
     // valid when have_node is set; it already passed its intersection test
     uint64_t cur_node;
     bool have_node;
+
+    // stack occupancy up to which far children may be pushed as two-slot
+    // payload pairs (see bvh_query_pair_limit())
+    int pair_limit;
 
     // inputs
     wp::vec3 input_lower;  // start for ray
@@ -532,6 +569,8 @@ CUDA_CALLABLE inline bvh_query_t bvh_query(uint64_t id, bool is_ray, const vec3&
         // register-carried current node, so test the root here
         const BVHPackedNodeHalf root_lower = bvh_load_node(bvh.node_lowers, root_index);
         const BVHPackedNodeHalf root_upper = bvh_load_node(bvh.node_uppers, root_index);
+
+        query.pair_limit = bvh_query_pair_limit(bvh);
 
         if (intersect_aabb_aabb(
                 lower, upper, reinterpret_cast<const vec3&>(root_lower), reinterpret_cast<const vec3&>(root_upper)
@@ -708,9 +747,10 @@ CUDA_CALLABLE inline bool bvh_query_next_aabb(bvh_query_t& query, int& index)
             query.cur_node = bvh_query_node_pack(left_lower, left_upper);
             query.have_node = true;
             if (hit_right) {
-                // when the stack is completely full the right child is dropped,
-                // matching the depth limit of the previous fixed-size-stack traversal
-                if (query.count + 1 < BVH_QUERY_STACK_SIZE) {
+                // pair pushes stop at pair_limit so that slot usage can never
+                // exceed the stack for constructor-produced trees; the final
+                // guard only matters for depths beyond the construction bound
+                if (query.count <= query.pair_limit) {
                     query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
                     query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
                 } else if (query.count < BVH_QUERY_STACK_SIZE) {

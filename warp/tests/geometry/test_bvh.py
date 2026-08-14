@@ -795,6 +795,48 @@ def tile_bvh_query_valid_ray_kernel(
             wp.atomic_add(bounds_intersected, result_idx, 1)
 
 
+@wp.kernel
+def bvh_query_aabb_mark_all(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3, hit: wp.array(dtype=int)):
+    query = wp.bvh_query_aabb(bvh_id, lower, upper)
+    bounds_nr = int(0)
+
+    while wp.bvh_query_next(query, bounds_nr):
+        hit[bounds_nr] = 1
+
+
+def test_bvh_degenerate_deep_tree(test, device):
+    # Diagonally exponentially spaced boxes give the morton codes a long
+    # shared-prefix chain, and the duplicate cluster at the tail pushes the
+    # tree to the construction depth bound, maximizing traversal stack
+    # pressure. A query covering everything must still enumerate every box.
+    num_bounds = 256
+    vals = np.power(0.5, np.arange(num_bounds) * 29.0 / num_bounds).astype(np.float32)
+    lowers = np.stack([vals, vals, vals], axis=1)
+    lowers[num_bounds - 64 :] = lowers[num_bounds - 64]
+    uppers = lowers + 1e-7
+
+    for constructor in ["sah", "median", "lbvh"]:
+        for leaf_size in [1, 4]:
+            bvh = wp.Bvh(
+                wp.array(lowers, dtype=wp.vec3, device=device),
+                wp.array(uppers, dtype=wp.vec3, device=device),
+                constructor=constructor,
+                leaf_size=leaf_size,
+            )
+            hit = wp.zeros(num_bounds, dtype=int, device=device)
+            wp.launch(
+                bvh_query_aabb_mark_all,
+                dim=1,
+                inputs=[bvh.id, wp.vec3(-1.0, -1.0, -1.0), wp.vec3(2.0, 2.0, 2.0), hit],
+                device=device,
+            )
+            test.assertEqual(
+                int(hit.numpy().sum()),
+                num_bounds,
+                f"missing query results for constructor={constructor} leaf_size={leaf_size}",
+            )
+
+
 devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
 cuda_devices_with_mempool = get_cuda_test_devices_with_mempool()
@@ -836,6 +878,7 @@ class TestBvh(unittest.TestCase):
 
 
 add_function_test(TestBvh, "test_bvh_aabb", test_bvh_query_aabb, devices=devices)
+add_function_test(TestBvh, "test_bvh_degenerate_deep_tree", test_bvh_degenerate_deep_tree, devices=devices)
 add_function_test(TestBvh, "test_bvh_ray", test_bvh_query_ray, devices=devices)
 add_function_test(TestBvh, "test_bvh_cubql_constructor", test_bvh_cubql_constructor, devices=devices)
 add_function_test(
