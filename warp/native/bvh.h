@@ -17,17 +17,6 @@
 #define USE_LOAD4
 #define BVH_QUERY_STACK_SIZE (32)
 
-// Keeps the cold generalized (sphere/ray/capsule/precise) query loops out of the hot
-// broad-AABB iterator that gets inlined into kernels. CPU-only: with the generalized
-// loop inlined alongside the AABB fast path, clang produces measurably slower kernel
-// loops (~5%). CUDA keeps default inlining (no regression measured on device).
-#if defined(__CUDACC__) || defined(__CUDA_ARCH__)
-#define WP_QUERY_NOINLINE
-#elif defined(_MSC_VER)
-#define WP_QUERY_NOINLINE __declspec(noinline)
-#else
-#define WP_QUERY_NOINLINE __attribute__((noinline))
-#endif
 
 #define BVH_CONSTRUCTOR_SAH (0)
 #define BVH_CONSTRUCTOR_MEDIAN (1)
@@ -537,8 +526,13 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_aabb(uint64_t id, const vec3& lower, 
     return bvh_query(id, BVH_QUERY_AABB, lower, upper, root);
 }
 
+CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir, int root)
+{
+    return bvh_query(id, BVH_QUERY_RAY, start, 1.0f / dir, root);
+}
+
 CUDA_CALLABLE inline bvh_query_t
-bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir, int root, float radius = 0.0f)
+bvh_query_capsule(uint64_t id, const vec3& start, const vec3& dir, float radius, int root)
 {
     bvh_query_t query = bvh_query(id, BVH_QUERY_RAY, start, 1.0f / dir, root);
     query.radius = max(radius, 0.0f);
@@ -623,39 +617,32 @@ CUDA_CALLABLE inline bool bvh_query_next_impl(bvh_query_t& query, int& index, co
     return false;
 }
 
-// Cold query kinds: the WP_QUERY_NOINLINE wrapper is the out-of-line boundary on CPU
-// (the impl inlines into the wrapper), keeping the hot broad-AABB path in
-// bvh_query_next() small enough to inline into kernels. CUDA keeps default inlining.
-CUDA_CALLABLE WP_QUERY_NOINLINE inline bool bvh_query_next_sphere(bvh_query_t& query, int& index, const float& max_dist)
+// Per-kind public iterators. Each is a thin wrapper around the shared template skeleton;
+// the caller's Python type determines which one gets emitted, so NVCC sees only one
+// traversal loop per kernel — no runtime dispatch, no code bloat.
+
+// AABB query iterator (backward-compatible; BvhQuery type, existing callers unchanged)
+CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const float& max_dist)
 {
-    return bvh_query_next_impl<BVH_QUERY_SPHERE, true>(query, index, max_dist);
+    return bvh_query_next_impl<BVH_QUERY_AABB, false>(query, index, max_dist);
 }
 
-CUDA_CALLABLE WP_QUERY_NOINLINE inline bool bvh_query_next_ray(bvh_query_t& query, int& index, const float& max_dist)
+// Plain ray iterator (BvhQueryRay type)
+CUDA_CALLABLE inline bool bvh_query_ray_next(bvh_query_t& query, int& index, const float& max_dist)
 {
     return bvh_query_next_impl<BVH_QUERY_RAY, false>(query, index, max_dist);
 }
 
-CUDA_CALLABLE WP_QUERY_NOINLINE inline bool
-bvh_query_next_capsule(bvh_query_t& query, int& index, const float& max_dist)
+// Capsule iterator (BvhQueryCapsule type)
+CUDA_CALLABLE inline bool bvh_query_capsule_next(bvh_query_t& query, int& index, const float& max_dist)
 {
     return bvh_query_next_impl<BVH_QUERY_RAY, true>(query, index, max_dist);
 }
 
-CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const float& max_dist)
+// Sphere iterator (BvhQuerySphere type)
+CUDA_CALLABLE inline bool bvh_query_sphere_next(bvh_query_t& query, int& index, const float& max_dist)
 {
-    // One predicted branch selects the specialized loop for this query's kind. The default
-    // broad-phase AABB instantiation inlines into the kernel (pre-PR behavior and
-    // performance); the other kinds run their own dispatch-free loops out of line on CPU.
-    if (query.query_type == BVH_QUERY_AABB) {
-        return bvh_query_next_impl<BVH_QUERY_AABB, false>(query, index, max_dist);
-    } else if (query.query_type == BVH_QUERY_SPHERE) {
-        return bvh_query_next_sphere(query, index, max_dist);
-    } else if (query.radius > 0.0f) {
-        return bvh_query_next_capsule(query, index, max_dist);
-    } else {
-        return bvh_query_next_ray(query, index, max_dist);
-    }
+    return bvh_query_next_impl<BVH_QUERY_SPHERE, false>(query, index, max_dist);
 }
 
 CUDA_CALLABLE inline int iter_next(bvh_query_t& query) { return query.bounds_nr; }

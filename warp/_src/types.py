@@ -2141,6 +2141,18 @@ class BvhQuery:
     _wp_native_name_ = "bvh_query_t"
 
 
+class BvhQueryRay(BvhQuery):
+    """Query object returned by :func:`warp.bvh_query_ray`. Advance with :func:`warp.bvh_query_next`."""
+
+
+class BvhQueryCapsule(BvhQuery):
+    """Query object returned by :func:`warp.bvh_query_capsule`. Advance with :func:`warp.bvh_query_next`."""
+
+
+class BvhQuerySphere(BvhQuery):
+    """Query object returned by :func:`warp.bvh_query_sphere`. Advance with :func:`warp.bvh_query_next`."""
+
+
 class BvhQueryTiled:
     """Object used to track state during thread-block parallel BVH traversal."""
 

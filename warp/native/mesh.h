@@ -2501,9 +2501,7 @@ template <int QUERY_TYPE> CUDA_CALLABLE inline void mesh_query_descend_impl(mesh
     }
 }
 
-// Cold sphere descent: WP_QUERY_NOINLINE is the out-of-line boundary on CPU, keeping the
-// hot AABB descent in mesh_query() small enough to inline cleanly (see bvh.h).
-CUDA_CALLABLE WP_QUERY_NOINLINE inline void mesh_query_descend_sphere(mesh_query_aabb_t& query)
+CUDA_CALLABLE inline void mesh_query_descend_sphere(mesh_query_aabb_t& query)
 {
     mesh_query_descend_impl<MESH_QUERY_SPHERE>(query);
 }

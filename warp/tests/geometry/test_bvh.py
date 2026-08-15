@@ -37,9 +37,9 @@ def bvh_query_sphere(bvh_id: wp.uint64, center: wp.vec3, radius: float, bounds_i
 
 
 @wp.kernel
-def bvh_query_capsule(bvh_id: wp.uint64, p0: wp.vec3, p1: wp.vec3, radius: float, bounds_intersected: wp.array[int]):
+def bvh_capsule_query(bvh_id: wp.uint64, p0: wp.vec3, p1: wp.vec3, radius: float, bounds_intersected: wp.array[int]):
     # capsule = ray (p0 -> p1) inflated by radius, bounded to the segment by max_dist = 1.0
-    query = wp.bvh_query_ray(bvh_id, p0, p1 - p0, -1, radius)
+    query = wp.bvh_query_capsule(bvh_id, p0, p1 - p0, radius)
     bounds_nr = int(0)
 
     while wp.bvh_query_next(query, bounds_nr, 1.0):
@@ -167,7 +167,7 @@ def test_bvh(test, type, device, leaf_size, constructor=None):
             )
         else:  # capsule
             wp.launch(
-                bvh_query_capsule,
+                bvh_capsule_query,
                 dim=1,
                 inputs=[bvh.id, query_p0, query_p1, capsule_radius, bounds_intersected],
                 device=device,
