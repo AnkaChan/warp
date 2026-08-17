@@ -4284,16 +4284,20 @@ def bvh_query_aabb(id: uint64, low: vec3f, high: vec3f, root: int32) -> BvhQuery
             [[0.5, 0.5, 0.5], [2.5, 0.5, 0.5], [0.0, 0.0, 0.0]]"""
     ...
 
-def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32) -> BvhQueryRay:
-    """Construct a ray query against a BVH.
+def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32, radius: float32) -> BvhQueryRay:
+    """Construct a ray or capsule sweep query against a BVH.
 
-    Returns a query that iterates over every item in the BVH whose stored bounding box is
-    intersected by the ray. Advance the query and read each result with :func:`bvh_query_next`.
-    ``start`` and ``dir`` are given in BVH space, i.e. the same coordinate space as
-    the ``lowers``/``uppers`` arrays passed to :class:`warp.Bvh`. ``dir`` need not be normalized,
-    but the ``max_dist`` cutoff of :func:`bvh_query_next` is measured in multiples of its length,
-    so normalize it for ``max_dist`` to be a distance in BVH-space units. For capsule sweeps
-    use :func:`bvh_query_capsule` instead.
+    With ``radius = 0`` (default) this is a plain ray query: iterates over every item whose
+    bounding box is intersected by the ray. With ``radius > 0`` it becomes a conservative
+    capsule sweep: each node's bounds are inflated by ``radius`` before the ray-slab test,
+    so the query never misses a primitive within ``radius`` of the segment but may return extra
+    candidates near box corners (axis-aligned inflation, not a true sphere cap).
+
+    ``start`` and ``dir`` are given in BVH space. For a plain ray, normalize ``dir`` so that
+    ``max_dist`` in :func:`bvh_query_next` is a world-space distance. For a capsule sweep from
+    ``p0`` to ``p1``, pass ``dir = p1 - p0`` (unnormalized) and ``max_dist = 1.0``; contact at
+    both endpoints is included. A zero-length sweep (``p0 == p1``) is not supported — use
+    :func:`bvh_query_sphere` instead. A negative ``radius`` is clamped to zero.
 
     To restrict traversal to a subtree, set ``root`` to that node's index (for a grouped BVH the
     group root is obtained from :func:`bvh_get_group_root`). If ``root`` is -1 (default),
@@ -4301,9 +4305,11 @@ def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32) -> BvhQuery
 
     Args:
         id: The BVH identifier
-        start: The ray origin, in BVH space
-        dir: The ray direction, in BVH space (normalize for ``max_dist`` to be a world-space distance)
+        start: The ray origin or segment start (``p0``), in BVH space
+        dir: The ray direction or segment direction (``p1 - p0``), in BVH space
         root: The node to begin the query from, or -1 (default) for the BVH's global root
+        radius: Capsule radius; ``0`` (default) gives a plain ray, positive values give a
+            capsule sweep; negative values are clamped to zero
 
     Returns:
         A :class:`warp.BvhQueryRay`. It is opaque; pass it to :func:`bvh_query_next`, which writes
@@ -4311,6 +4317,8 @@ def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32) -> BvhQuery
         to its ``index`` argument.
 
     Example:
+
+        Plain ray cast:
 
         .. testcode::
 
@@ -4332,40 +4340,16 @@ def bvh_query_ray(id: uint64, start: vec3f, dir: vec3f, root: int32) -> BvhQuery
 
         .. testoutput::
 
-            [[0.5, 0.5, 0.5], [2.5, 0.5, 0.5], [4.5, 0.5, 0.5]]"""
-    ...
+            [[0.5, 0.5, 0.5], [2.5, 0.5, 0.5], [4.5, 0.5, 0.5]]
 
-def bvh_query_capsule(id: uint64, start: vec3f, dir: vec3f, radius: float32, root: int32) -> BvhQueryCapsule:
-    """Construct a conservative capsule sweep query against a BVH.
-
-    Iterates over every BVH item whose stored bounding box overlaps the swept capsule. Each node's
-    bounds are inflated by ``radius`` before the ray-slab test (an axis-aligned box inflation, not
-    a true sphere cap), so the query never misses a primitive within ``radius`` of the segment but
-    may return extra candidates near box corners.
-
-    To sweep a closed capsule from ``p0`` to ``p1``, pass ``dir = p1 - p0`` (unnormalized) and
-    ``max_dist = 1.0`` in :func:`bvh_query_next`; contact at both endpoints is included.
-    A zero-length segment (``p0 == p1``) is not supported — use :func:`bvh_query_sphere` instead.
-    A negative ``radius`` is clamped to zero. Advance results with :func:`bvh_query_next`.
-
-    Args:
-        id: The BVH identifier
-        start: The segment start point (``p0``), in BVH space
-        dir: The segment direction (``p1 - p0``), in BVH space
-        radius: The capsule radius; negative values are clamped to zero
-        root: The node to begin the query from, or -1 (default) for the BVH's global root
-
-    Returns:
-        A :class:`warp.BvhQueryCapsule`. It is opaque; pass it to :func:`bvh_query_next`.
-
-    Example:
+        Capsule sweep from ``p0`` to ``p1`` with radius 0.3:
 
         .. testcode::
 
             @wp.kernel
             def capsule_sweep(bvh_id: wp.uint64, p0: wp.vec3, p1: wp.vec3, radius: float,
                                count: wp.array[wp.int32]):
-                query = wp.bvh_query_capsule(bvh_id, p0, p1 - p0, radius)
+                query = wp.bvh_query_ray(bvh_id, p0, p1 - p0, -1, radius)
                 item = int(0)
                 while wp.bvh_query_next(query, item, 1.0):
                     wp.atomic_add(count, 0, 1)
@@ -4422,11 +4406,7 @@ def bvh_query_sphere(id: uint64, center: vec3f, radius: float32, root: int32) ->
             [1, 0]"""
     ...
 
-def bvh_query_next(
-    query: BvhQuery | BvhQueryRay | BvhQueryCapsule | BvhQuerySphere,
-    index: int32,
-    max_dist: float32,
-) -> bool:
+def bvh_query_next(query: BvhQuery | BvhQueryRay | BvhQuerySphere, index: int32, max_dist: float32) -> bool:
     """Advance a BVH query to the next overlapping item and report whether one was found.
 
     Writes the index of the current item to ``index`` and returns ``True``; returns ``False`` once
