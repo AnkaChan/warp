@@ -2403,8 +2403,6 @@ struct mesh_query_aabb_t {
         , face(0)
         , primitive_counter(-1)
         , last_query_valid(true)
-        , query_type(0)
-        , precise(false)
         , radius(0.0f)
         , radius_sq(0.0f)
     {
@@ -2438,25 +2436,18 @@ struct mesh_query_aabb_t {
     // call produced a valid face index. Seeded to true so an initial tile_query_valid()
     // check (before any next() call) reports valid.
     bool last_query_valid;
-    // Minkowski-offset query extension (sphere): bool-sized discriminant.
-    uint8_t query_type;  // MESH_QUERY_AABB | MESH_QUERY_SPHERE
-    bool precise;  // narrow phase: keep only triangles that exactly intersect the query volume
     float radius;  // sphere radius (0 for plain aabb)
     float radius_sq;  // pre-computed radius*radius for sphere node/prim tests
 };
 
 
-// mesh_query_aabb_t::query_type values
-#define MESH_QUERY_AABB 0
-#define MESH_QUERY_SPHERE 1
-
-// Node-overlap test for a mesh query, specialized per query kind at compile time.
-// The AABB instantiation folds to the original intersect_aabb_aabb test.
-template <int QUERY_TYPE>
+// Node-overlap test for a mesh query. IsSphere=true uses exact sphere-AABB test;
+// IsSphere=false folds to the original intersect_aabb_aabb test.
+template <bool IsSphere>
 CUDA_CALLABLE inline bool
 mesh_query_node_test(const mesh_query_aabb_t& query, const vec3& node_lower, const vec3& node_upper)
 {
-    if constexpr (QUERY_TYPE == MESH_QUERY_SPHERE) {
+    if constexpr (IsSphere) {
         return intersect_sphere_aabb(query.input_lower, query.radius_sq, node_lower, node_upper);
     } else {
         return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
@@ -2464,9 +2455,9 @@ mesh_query_node_test(const mesh_query_aabb_t& query, const vec3& node_lower, con
 }
 
 // Init-time descent to the first overlapping leaf node, which is left on the stack for
-// the iterator. Specialized per query kind; `precise` does not affect the node test, so
-// both AABB flavors share the MESH_QUERY_AABB instantiation.
-template <int QUERY_TYPE> CUDA_CALLABLE inline void mesh_query_descend_impl(mesh_query_aabb_t& query)
+// the iterator. IsSphere=false is shared by both AABB flavors (precise does not
+// affect the node test).
+template <bool IsSphere> CUDA_CALLABLE inline void mesh_query_descend_impl(mesh_query_aabb_t& query)
 {
     Mesh& mesh = query.mesh;
 
@@ -2476,7 +2467,7 @@ template <int QUERY_TYPE> CUDA_CALLABLE inline void mesh_query_descend_impl(mesh
         BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
 
         if (query.primitive_counter == 0) {
-            if (!mesh_query_node_test<QUERY_TYPE>(
+            if (!mesh_query_node_test<IsSphere>(
                     query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper)
                 )) {
                 // Skip this box, it doesn't overlap with our query volume.
@@ -2501,22 +2492,16 @@ template <int QUERY_TYPE> CUDA_CALLABLE inline void mesh_query_descend_impl(mesh
     }
 }
 
-CUDA_CALLABLE inline void mesh_query_descend_sphere(mesh_query_aabb_t& query)
-{
-    mesh_query_descend_impl<MESH_QUERY_SPHERE>(query);
-}
+CUDA_CALLABLE inline void mesh_query_descend_sphere(mesh_query_aabb_t& query) { mesh_query_descend_impl<true>(query); }
 
-CUDA_CALLABLE inline mesh_query_aabb_t
-mesh_query(uint64_t id, int query_type, const vec3& a, const vec3& b, float radius, bool precise)
+// Shared factory for all mesh query kinds. IsSphere selects the init-time descent
+// strategy; the iterator function is selected at Warp codegen time via the Python
+// return type, so neither query_type nor precise need to be stored in the struct.
+template <bool IsSphere>
+CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_impl(uint64_t id, const vec3& a, const vec3& b, float radius)
 {
-    // This routine traverses the BVH tree until it finds
-    // the first triangle with an overlapping bound.
-
-    // initialize empty
     mesh_query_aabb_t query;
     query.face = -1;
-    query.query_type = query_type;
-    query.precise = precise;
     query.radius = max(radius, 0.0f);
     query.radius_sq = query.radius * query.radius;
 
@@ -2530,23 +2515,26 @@ mesh_query(uint64_t id, int query_type, const vec3& a, const vec3& b, float radi
 
     query.stack[0] = *mesh.bvh.root;
     query.count = 1;
+    query.primitive_counter = 0;
     query.input_lower = a;
     query.input_upper = b;
 
-    // The AABB descent (shared by precise and non-precise AABB queries, whose node test
-    // is identical) inlines here, matching pre-PR behavior and performance; the sphere
-    // descent runs its own specialized loop out of line on CPU.
-    if (query_type == MESH_QUERY_SPHERE) {
+    // The AABB descent inlines here (CPU and CUDA); the sphere descent runs
+    // its own specialized loop out of line on CPU.
+    if constexpr (IsSphere) {
         mesh_query_descend_sphere(query);
     } else {
-        mesh_query_descend_impl<MESH_QUERY_AABB>(query);
+        mesh_query_descend_impl<false>(query);
     }
     return query;
 }
 
-CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper, bool precise)
+CUDA_CALLABLE inline mesh_query_aabb_t
+mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper, bool /*precise*/)
 {
-    return mesh_query(id, MESH_QUERY_AABB, lower, upper, 0.0f, precise);
+    // `precise` selects the Python return type (MeshQueryAABB vs MeshQueryAABBPrecise),
+    // which routes to the correct iterator at codegen time. No runtime flag needed here.
+    return mesh_query_impl<false>(id, lower, upper, 0.0f);
 }
 
 // Sphere query: iterate triangles that intersect the sphere. The broad phase keeps triangles whose AABB is
@@ -2554,20 +2542,18 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& 
 // point to `center` is within `radius`.
 CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_sphere(uint64_t id, const vec3& center, float radius)
 {
-    return mesh_query(id, MESH_QUERY_SPHERE, center, center, radius, true);
+    return mesh_query_impl<true>(id, center, center, radius);
 }
 
-// Per-primitive candidate test: broad phase (primitive AABB vs the query volume) plus, when query.precise
-// is set, an exact triangle test (triangle-vs-box for AABB queries, closest-point for sphere queries).
-// Primitive test, specialized per query kind at compile time. Non-precise AABB reduces
-// to the box test on the cached triangle AABBs; sphere and precise AABB run exact
-// triangle tests after the box reject.
-template <int QUERY_TYPE, bool PRECISE>
+// Per-primitive candidate test. Specialized at compile time: non-precise AABB reduces to
+// a box test on the cached triangle AABBs; sphere and precise AABB run exact triangle
+// tests after the box reject.
+template <bool IsSphere, bool Precise>
 CUDA_CALLABLE inline bool mesh_query_prim_test(const mesh_query_aabb_t& query, const Mesh& mesh, int primitive_index)
 {
-    if (!mesh_query_node_test<QUERY_TYPE>(query, mesh.lowers[primitive_index], mesh.uppers[primitive_index]))
+    if (!mesh_query_node_test<IsSphere>(query, mesh.lowers[primitive_index], mesh.uppers[primitive_index]))
         return false;
-    if constexpr (!PRECISE)
+    if constexpr (!Precise)
         return true;
 
     int i = mesh.indices[primitive_index * 3 + 0];
@@ -2577,7 +2563,7 @@ CUDA_CALLABLE inline bool mesh_query_prim_test(const mesh_query_aabb_t& query, c
     vec3 b = mesh.points[j];
     vec3 c = mesh.points[k];
 
-    if constexpr (QUERY_TYPE == MESH_QUERY_SPHERE) {
+    if constexpr (IsSphere) {
         const vec3& center = query.input_lower;
         vec3 cp;
         // Guard against degenerate (zero-area) faces to avoid NaN from closest_point_to_triangle.
@@ -2611,7 +2597,7 @@ CUDA_CALLABLE inline bool mesh_query_prim_test(const mesh_query_aabb_t& query, c
         vec3 d = cp - center;
         return dot(d, d) <= query.radius_sq;
     }
-    // MESH_QUERY_AABB precise: exact triangle vs axis-aligned box
+    // Precise AABB: exact triangle vs axis-aligned box
     return intersect_tri_aabb(a, b, c, query.input_lower, query.input_upper);
 }
 
@@ -2671,7 +2657,7 @@ struct AabbPrecisePrimitiveTest {
 struct SpherePrimitiveTest {
     CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const Mesh& m, int pi) const
     {
-        return mesh_query_prim_test<MESH_QUERY_SPHERE, true>(q, m, pi);
+        return mesh_query_prim_test<true, true>(q, m, pi);
     }
 };
 
