@@ -95,6 +95,19 @@ struct CubqlNativeBuild {
     int max_depth = 0;
 };
 
+__global__ void cubql_compute_node_escapes(
+    int n,
+    const BVHPackedNodeHalf* __restrict__ lowers,
+    const BVHPackedNodeHalf* __restrict__ uppers,
+    const int* __restrict__ parents,
+    int* __restrict__ escapes
+)
+{
+    const int node_index = blockDim.x * blockIdx.x + threadIdx.x;
+    if (node_index < n)
+        escapes[node_index] = bvh_compute_node_escape(lowers, uppers, parents, node_index, n);
+}
+
 static uint16_t cubql_leaf_count(uint64_t admin) { return uint16_t(admin >> 48); }
 
 static uint64_t cubql_admin_offset(uint64_t admin) { return admin & 0x0000FFFFFFFFFFFFull; }
@@ -486,6 +499,13 @@ static inline bool cubql_copy_native_order_device(BVH& bvh, const cuBQL::bvh3f& 
         WP_CURRENT_CONTEXT, cubql_copy_nodes_to_native, native.numNodes,
         (reinterpret_cast<const CubqlNode*>(native.nodes), int(native.numNodes), bvh.node_lowers, bvh.node_uppers,
          bvh.node_parents)
+    );
+
+    // compute skip links for the stackless traversal
+    bvh.node_escapes = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * native.numNodes, "(native:bvh)");
+    wp_launch_device(
+        WP_CURRENT_CONTEXT, cubql_compute_node_escapes, int(native.numNodes),
+        (int(native.numNodes), bvh.node_lowers, bvh.node_uppers, bvh.node_parents, bvh.node_escapes)
     );
     return true;
 }

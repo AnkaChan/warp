@@ -65,6 +65,7 @@ void TopDownBVHBuilder::initialize_empty(BVH& bvh)
 {
     bvh.max_depth = 0;
     bvh.max_depth_ptr = nullptr;
+    bvh.node_escapes = nullptr;
     bvh.max_nodes = 0;
     bvh.node_lowers = nullptr;
     bvh.node_uppers = nullptr;
@@ -758,6 +759,7 @@ void bvh_rebuild_host(BVH& bvh, int constructor_type)
 
     TopDownBVHBuilder builder;
     builder.rebuild(bvh, constructor_type);
+    bvh_compute_escapes_host(bvh);
     bvh.constructor_type = constructor_type;
 }
 
@@ -817,8 +819,21 @@ void bvh_create_host(
 
     TopDownBVHBuilder builder;
     builder.build(bvh, lowers, uppers, num_items, constructor_type, groups);
+    bvh_compute_escapes_host(bvh);
 }
 
+
+void bvh_compute_escapes_host(BVH& bvh)
+{
+    if (bvh.max_nodes <= 0)
+        return;
+    if (!bvh.node_escapes)
+        bvh.node_escapes = static_cast<int*>(wp_alloc_host(sizeof(int) * bvh.max_nodes, "(native:bvh)"));
+    // only num_nodes entries are initialized by the top-down builders
+    const int n = (bvh.num_nodes > 0) ? bvh.num_nodes : bvh.max_nodes;
+    for (int i = 0; i < n; ++i)
+        bvh.node_escapes[i] = bvh_compute_node_escape(bvh.node_lowers, bvh.node_uppers, bvh.node_parents, i, n);
+}
 
 void bvh_destroy_host(BVH& bvh)
 {
@@ -827,6 +842,8 @@ void bvh_destroy_host(BVH& bvh)
     wp_free_host(bvh.node_parents);
     wp_free_host(bvh.primitive_indices);
     wp_free_host(bvh.root);
+    wp_free_host(bvh.node_escapes);
+    bvh.node_escapes = nullptr;
 
     bvh.node_lowers = nullptr;
     bvh.node_uppers = nullptr;
