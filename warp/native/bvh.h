@@ -515,8 +515,13 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_aabb(uint64_t id, const vec3& lower, 
     return bvh_query(id, lower, upper, root);
 }
 
+CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir, int root)
+{
+    return bvh_query(id, start, 1.0f / dir, root);
+}
+
 CUDA_CALLABLE inline bvh_query_t
-bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir, int root, float radius = 0.0f)
+bvh_query_capsule(uint64_t id, const vec3& start, const vec3& dir, float radius, int root)
 {
     bvh_query_t query = bvh_query(id, start, 1.0f / dir, root);
     query.radius = max(radius, 0.0f);
@@ -611,86 +616,16 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
     return bvh_query_next_impl<BvhQueryKind::AABB, false>(query, index, max_dist);
 }
 
-// Ray/capsule iterator (BvhQueryRay type). One traversal loop; the radius > 0 branch is
-// inside the node test so NVCC never sees two complete loops in one kernel.
-// With a compile-time literal radius, the compiler folds the dead branch away.
+// Plain ray iterator (BvhQueryRay type)
 CUDA_CALLABLE inline bool bvh_query_ray_next(bvh_query_t& query, int& index, const float& max_dist)
 {
-    BVH bvh = query.bvh;
-    while (query.count) {
-        const int node_index = query.stack[--query.count];
-        BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
-        BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+    return bvh_query_next_impl<BvhQueryKind::RAY, false>(query, index, max_dist);
+}
 
-        if (query.primitive_counter == 0) {
-            float t = FLT_MAX;
-            bool hit;
-            if (query.radius > 0.0f) {
-                hit = intersect_ray_aabb_robust(
-                    query.input_lower,
-                    vec3(1.0f / query.input_upper[0], 1.0f / query.input_upper[1], 1.0f / query.input_upper[2]),
-                    query.input_upper, reinterpret_cast<const vec3&>(node_lower) - vec3(query.radius),
-                    reinterpret_cast<const vec3&>(node_upper) + vec3(query.radius), t
-                );
-                if (!hit || t > max_dist)
-                    continue;
-            } else {
-                hit = intersect_ray_aabb(
-                    query.input_lower, query.input_upper, reinterpret_cast<const vec3&>(node_lower),
-                    reinterpret_cast<const vec3&>(node_upper), t
-                );
-                if (!hit || t >= max_dist)
-                    continue;
-            }
-        }
-
-        const int left_index = node_lower.i;
-        const int right_index = node_upper.i;
-
-        if (node_lower.b) {
-            const int start = left_index;
-            const int end = right_index;
-            if (end - start == 1) {
-                index = bvh.primitive_indices[start];
-                query.bounds_nr = index;
-                return true;
-            } else {
-                int primitive_index = bvh.primitive_indices[start + (query.primitive_counter++)];
-                if (start + query.primitive_counter == end)
-                    query.primitive_counter = 0;
-                else
-                    query.stack[query.count++] = node_index;
-
-                float t = FLT_MAX;
-                bool hit;
-                if (query.radius > 0.0f) {
-                    hit = intersect_ray_aabb_robust(
-                        query.input_lower,
-                        vec3(1.0f / query.input_upper[0], 1.0f / query.input_upper[1], 1.0f / query.input_upper[2]),
-                        query.input_upper, bvh.item_lowers[primitive_index] - vec3(query.radius),
-                        bvh.item_uppers[primitive_index] + vec3(query.radius), t
-                    );
-                    if (!hit || t > max_dist)
-                        continue;
-                } else {
-                    hit = intersect_ray_aabb(
-                        query.input_lower, query.input_upper, bvh.item_lowers[primitive_index],
-                        bvh.item_uppers[primitive_index], t
-                    );
-                    if (!hit || t >= max_dist)
-                        continue;
-                }
-                index = primitive_index;
-                query.bounds_nr = primitive_index;
-                return true;
-            }
-        } else {
-            query.primitive_counter = 0;
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
-        }
-    }
-    return false;
+// Capsule iterator (BvhQueryCapsule type)
+CUDA_CALLABLE inline bool bvh_query_capsule_next(bvh_query_t& query, int& index, const float& max_dist)
+{
+    return bvh_query_next_impl<BvhQueryKind::RAY, true>(query, index, max_dist);
 }
 
 // Sphere iterator (BvhQuerySphere type)

@@ -2145,6 +2145,10 @@ class BvhQueryRay(BvhQuery):
     """Query object returned by :func:`warp.bvh_query_ray`. Advance with :func:`warp.bvh_query_next`."""
 
 
+class BvhQueryCapsule(BvhQuery):
+    """Query object returned by :func:`warp.bvh_query_capsule`. Advance with :func:`warp.bvh_query_next`."""
+
+
 class BvhQuerySphere(BvhQuery):
     """Query object returned by :func:`warp.bvh_query_sphere`. Advance with :func:`warp.bvh_query_next`."""
 
