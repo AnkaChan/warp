@@ -2675,7 +2675,13 @@ struct SpherePrimitiveTest {
     }
 };
 
-template <typename NodeTest, typename PrimitiveTest>
+// TEST_SINGLETON: whether PrimitiveTest must run on singleton leaves. For the plain
+// (broad-phase) AABB iterator the singleton leaf's bounds equal the cached primitive
+// bounds, so the node test already decided the answer; re-running the primitive test
+// costs two extra dependent global loads per visited singleton leaf (measured +9-21%
+// on singleton-leaf trees, e.g. the cuBQL mesh default). Sphere and precise-AABB
+// iterators keep the test - it is their narrow phase.
+template <typename NodeTest, typename PrimitiveTest, bool TEST_SINGLETON = true>
 CUDA_CALLABLE inline bool mesh_query_next_impl(mesh_query_aabb_t& query, int& index)
 {
     Mesh mesh = query.mesh;
@@ -2696,7 +2702,10 @@ CUDA_CALLABLE inline bool mesh_query_next_impl(mesh_query_aabb_t& query, int& in
 
             if (end - start == 1) {
                 int primitive_index = mesh.bvh.primitive_indices[start];
-                if (PrimitiveTest {}(query, mesh, primitive_index)) {
+                bool singleton_hit = true;
+                if constexpr (TEST_SINGLETON)
+                    singleton_hit = PrimitiveTest {}(query, mesh, primitive_index);
+                if (singleton_hit) {
                     index = primitive_index;
                     query.face = primitive_index;
                     return true;
@@ -2729,7 +2738,7 @@ CUDA_CALLABLE inline bool mesh_query_next_impl(mesh_query_aabb_t& query, int& in
 // (leaf AABB == primitive AABB), so the compiler folds it to a single test.
 CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& index)
 {
-    return mesh_query_next_impl<AabbNodeTest, AabbPrimitiveTest>(query, index);
+    return mesh_query_next_impl<AabbNodeTest, AabbPrimitiveTest, false>(query, index);
 }
 
 // Sphere iterator -- called from mesh_query_next when the query object is MeshQuerySphere.
