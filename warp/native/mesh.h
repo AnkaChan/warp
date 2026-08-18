@@ -2416,6 +2416,439 @@ CUDA_CALLABLE inline bool mesh_query_ray(
     }
 }
 
+// Internal closest-hit state shared by the seeded and Exclusive BVH ray
+// experiments below. Keeping the unnormalized normal matches mesh_query_ray()
+// until the final result is written.
+struct mesh_query_ray_hit_state_t {
+    CUDA_CALLABLE explicit mesh_query_ray_hit_state_t(float max_t)
+        : min_t(max_t)
+        , min_u(0.0f)
+        , min_v(0.0f)
+        , min_sign(1.0f)
+        , min_normal()
+        , min_face(-1)
+        , hit(false)
+        , ambiguous_tie(false)
+    {
+    }
+
+    float min_t;
+    float min_u;
+    float min_v;
+    float min_sign;
+    vec3 min_normal;
+    int min_face;
+    bool hit;
+    bool ambiguous_tie;
+};
+
+CUDA_CALLABLE inline void mesh_query_ray_update_primitive(
+    const Mesh& mesh,
+    int primitive_index,
+    const vec3& start,
+    const vec3& dir,
+    float interval_min,
+    mesh_query_ray_hit_state_t& state
+)
+{
+    const int i = bvh_load_int(mesh.indices, primitive_index * 3 + 0);
+    const int j = bvh_load_int(mesh.indices, primitive_index * 3 + 1);
+    const int k = bvh_load_int(mesh.indices, primitive_index * 3 + 2);
+
+    const vec3 p = bvh_load_vec3(mesh.points, i);
+    const vec3 q = bvh_load_vec3(mesh.points, j);
+    const vec3 r = bvh_load_vec3(mesh.points, k);
+
+    float tri_t, tri_u, tri_v, tri_sign;
+    vec3 n;
+    if (!intersect_ray_tri_woop(start, dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &n) || tri_t < interval_min) {
+        return;
+    }
+
+    if (tri_t < state.min_t) {
+        state.min_t = tri_t;
+        state.min_face = primitive_index;
+        state.min_u = tri_u;
+        state.min_v = tri_v;
+        state.min_sign = tri_sign;
+        state.min_normal = n;
+        state.hit = true;
+        state.ambiguous_tie = false;
+    } else if (state.hit && tri_t == state.min_t && primitive_index != state.min_face) {
+        // A seeded traversal can visit equal-distance faces in a different
+        // order from the stock root traversal. The caller reruns the stock
+        // query when this is observed so face/sign/normal tie behavior stays
+        // identical, not merely the hit distance.
+        state.ambiguous_tie = true;
+    }
+}
+
+CUDA_CALLABLE inline float mesh_query_ray_next_float_down(float value)
+{
+    union FloatBits {
+        float f;
+        uint32_t u;
+    } bits;
+    bits.f = value;
+    if (value == 0.0f) {
+        bits.u = 0x80000001u;
+    } else if (value > 0.0f) {
+        --bits.u;
+    } else {
+        ++bits.u;
+    }
+    return bits.f;
+}
+
+CUDA_CALLABLE inline float mesh_query_ray_next_float_up(float value)
+{
+    union FloatBits {
+        float f;
+        uint32_t u;
+    } bits;
+    bits.f = value;
+    if (value == 0.0f) {
+        bits.u = 0x00000001u;
+    } else if (value > 0.0f) {
+        ++bits.u;
+    } else {
+        --bits.u;
+    }
+    return bits.f;
+}
+
+CUDA_CALLABLE inline void mesh_query_ray_update_leaf(
+    const Mesh& mesh,
+    int primitive_begin,
+    int primitive_end,
+    const vec3& start,
+    const vec3& dir,
+    float interval_min,
+    mesh_query_ray_hit_state_t& state
+)
+{
+    for (int pc = primitive_begin; pc < primitive_end; ++pc) {
+        const int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, pc);
+        mesh_query_ray_update_primitive(mesh, primitive_index, start, dir, interval_min, state);
+    }
+}
+
+CUDA_CALLABLE inline bool mesh_query_ray_node_before_limit(float node_t, const mesh_query_ray_hit_state_t& state)
+{
+    // Stock traversal uses a strict limit. Once a seeded hit exists, retain
+    // an equal-entry node long enough to detect exact-distance ties and fall
+    // back to stock ordering.
+    return node_t < state.min_t || (state.hit && node_t == state.min_t);
+}
+
+// Traverse one subtree with stock near/far ordering while optionally omitting
+// an already evaluated packed seed leaf. TestStartNode is used for arbitrary
+// cached roots; child bounds are tested exactly as in mesh_query_ray().
+template <bool TestStartNode, bool SkipLeaf>
+CUDA_CALLABLE inline void mesh_query_ray_traverse_seeded(
+    const Mesh& mesh,
+    int start_node,
+    int skip_leaf,
+    const vec3& start,
+    const vec3& dir,
+    float interval_min,
+    mesh_query_ray_hit_state_t& state
+)
+{
+    if (start_node < 0 || start_node >= mesh.bvh.num_nodes || (SkipLeaf && start_node == skip_leaf))
+        return;
+
+    const vec3 ray_dir = mesh_query_ray_safe_dir(dir);
+    const vec3 rcp_dir(1.0f / ray_dir[0], 1.0f / ray_dir[1], 1.0f / ray_dir[2]);
+    const bool fast_aabb = mesh_query_ray_use_fast_aabb(dir);
+
+    const BVHPackedNodeHalf start_lower = bvh_load_node(mesh.bvh.node_lowers, start_node);
+    const BVHPackedNodeHalf start_upper = bvh_load_node(mesh.bvh.node_uppers, start_node);
+    if (TestStartNode) {
+        float start_t = FLT_MAX;
+        if (!mesh_query_ray_intersect_aabb(
+                start, dir, rcp_dir, fast_aabb, reinterpret_cast<const vec3&>(start_lower),
+                reinterpret_cast<const vec3&>(start_upper), start_t
+            )
+            || !mesh_query_ray_node_before_limit(start_t, state)) {
+            return;
+        }
+    }
+
+    uint64_t stack[BVH_QUERY_STACK_SIZE];
+    int stack_size = 0;
+    uint64_t cur_node = bvh_query_node_pack(start_lower, start_upper);
+
+    while (true) {
+        if (bvh_query_node_is_leaf(cur_node)) {
+            mesh_query_ray_update_leaf(
+                mesh, bvh_query_node_lower_payload(cur_node), bvh_query_node_upper_payload(cur_node), start, dir,
+                interval_min, state
+            );
+            if (stack_size == 0)
+                break;
+            cur_node = stack[--stack_size];
+            continue;
+        }
+
+        const int left_index = bvh_query_node_lower_payload(cur_node);
+        const int right_index = bvh_query_node_upper_payload(cur_node);
+        const BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
+        const BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
+        const BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
+        const BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
+
+        float left_t = FLT_MAX;
+        float right_t = FLT_MAX;
+        const bool hit_left = (!SkipLeaf || left_index != skip_leaf)
+            && mesh_query_ray_intersect_aabb(
+                                  start, dir, rcp_dir, fast_aabb, reinterpret_cast<const vec3&>(left_lower),
+                                  reinterpret_cast<const vec3&>(left_upper), left_t
+            )
+            && mesh_query_ray_node_before_limit(left_t, state);
+        const bool hit_right = (!SkipLeaf || right_index != skip_leaf)
+            && mesh_query_ray_intersect_aabb(
+                                   start, dir, rcp_dir, fast_aabb, reinterpret_cast<const vec3&>(right_lower),
+                                   reinterpret_cast<const vec3&>(right_upper), right_t
+            )
+            && mesh_query_ray_node_before_limit(right_t, state);
+
+        if (hit_left && hit_right) {
+            const bool near_left = left_t < right_t;
+            if (stack_size >= BVH_QUERY_STACK_SIZE) {
+                state.ambiguous_tie = true;
+                break;
+            }
+            const uint64_t left_node = bvh_query_node_pack(left_lower, left_upper);
+            const uint64_t right_node = bvh_query_node_pack(right_lower, right_upper);
+            stack[stack_size++] = near_left ? right_node : left_node;
+            cur_node = near_left ? left_node : right_node;
+        } else if (hit_left) {
+            cur_node = bvh_query_node_pack(left_lower, left_upper);
+        } else if (hit_right) {
+            cur_node = bvh_query_node_pack(right_lower, right_upper);
+        } else {
+            if (stack_size == 0)
+                break;
+            cur_node = stack[--stack_size];
+        }
+    }
+}
+
+CUDA_CALLABLE inline int mesh_query_ray_initialize_seed_leaf(
+    const Mesh& mesh, int seed_face, const vec3& start, const vec3& dir, mesh_query_ray_hit_state_t& state
+)
+{
+    if (seed_face < 0 || seed_face >= mesh.num_tris || !bvh_has_exclusive(mesh.bvh))
+        return -1;
+
+    const int seed_leaf = bvh_get_primitive_leaf(mesh.bvh, seed_face);
+    if (seed_leaf < 0 || seed_leaf >= mesh.bvh.num_nodes)
+        return -1;
+
+    const BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, seed_leaf);
+    if (!lower.b)
+        return -1;
+    const BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, seed_leaf);
+    mesh_query_ray_update_leaf(mesh, int(lower.i), int(upper.i), start, dir, 0.0f, state);
+    return seed_leaf;
+}
+
+// Build an outward-rounded AABB for the active finite ray segment. The active
+// endpoint is the exact seed-leaf hit when available, otherwise the caller's
+// max_t endpoint. Stepping both bounds outward makes strict E-box containment
+// fail closed near a clipping plane on both CPU and CUDA.
+CUDA_CALLABLE inline bool mesh_query_ray_active_segment_bounds(
+    const vec3& start,
+    const vec3& dir,
+    float max_t,
+    const mesh_query_ray_hit_state_t& state,
+    vec3& segment_lower,
+    vec3& segment_upper
+)
+{
+    const float segment_t = state.hit ? state.min_t : max_t;
+    if (!isfinite(start) || !isfinite(dir) || !isfinite(segment_t) || segment_t < 0.0f)
+        return false;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        const float endpoint = fmaf(dir[axis], segment_t, start[axis]);
+        if (!isfinite(endpoint))
+            return false;
+        const float lower = min(start[axis], endpoint);
+        const float upper = max(start[axis], endpoint);
+        segment_lower[axis] = mesh_query_ray_next_float_down(lower);
+        segment_upper[axis] = mesh_query_ray_next_float_up(upper);
+    }
+    return true;
+}
+
+CUDA_CALLABLE inline int mesh_query_ray_find_exclusive_segment(
+    const Mesh& mesh, const vec3& segment_lower, const vec3& segment_upper, int candidate_node
+)
+{
+    const int root = *mesh.bvh.root;
+    if (!bvh_has_exclusive(mesh.bvh) || candidate_node < 0 || candidate_node >= mesh.bvh.num_nodes)
+        return root;
+
+    int node_index = candidate_node;
+    while (node_index >= 0 && node_index < mesh.bvh.num_nodes) {
+        const BVHExclusiveNode exclusive_node = bvh_get_exclusive_node(mesh.bvh, node_index);
+        if (bvh_exclusive_node_depth(exclusive_node) >= 0
+            && bvh_exclusive_contains_strict(exclusive_node, segment_lower, segment_upper)) {
+            return node_index;
+        }
+
+        const int parent = bvh_exclusive_node_parent(exclusive_node);
+        if (parent == -1)
+            break;
+        if (parent < 0 || parent >= mesh.bvh.num_nodes)
+            return root;
+        node_index = parent;
+    }
+    return root;
+}
+
+CUDA_CALLABLE inline bool mesh_query_ray_finish_seeded(
+    uint64_t id,
+    const vec3& start,
+    const vec3& dir,
+    float max_t,
+    const mesh_query_ray_hit_state_t& state,
+    float& t,
+    float& u,
+    float& v,
+    float& sign,
+    vec3& normal,
+    int& face
+)
+{
+    if (state.ambiguous_tie)
+        return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+    if (!state.hit)
+        return false;
+
+    t = state.min_t;
+    u = state.min_u;
+    v = state.min_v;
+    sign = state.min_sign;
+    normal = normalize(state.min_normal);
+    face = state.min_face;
+    return true;
+}
+
+CUDA_CALLABLE inline bool mesh_query_ray_seeded(
+    uint64_t id,
+    const vec3& start,
+    const vec3& dir,
+    float max_t,
+    int seed_face,
+    float& t,
+    float& u,
+    float& v,
+    float& sign,
+    vec3& normal,
+    int& face
+)
+{
+    const Mesh mesh = mesh_get(id);
+    mesh_query_ray_hit_state_t state(max_t);
+    const int seed_leaf = mesh_query_ray_initialize_seed_leaf(mesh, seed_face, start, dir, state);
+    if (seed_leaf == -1)
+        return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+
+    mesh_query_ray_traverse_seeded<false, true>(mesh, *mesh.bvh.root, seed_leaf, start, dir, 0.0f, state);
+    return mesh_query_ray_finish_seeded(id, start, dir, max_t, state, t, u, v, sign, normal, face);
+}
+
+CUDA_CALLABLE inline int
+mesh_query_ray_exclusive_node(uint64_t id, const vec3& start, const vec3& dir, float max_t, int seed_face)
+{
+    const Mesh mesh = mesh_get(id);
+    const int root = *mesh.bvh.root;
+    mesh_query_ray_hit_state_t state(max_t);
+    const int seed_leaf = mesh_query_ray_initialize_seed_leaf(mesh, seed_face, start, dir, state);
+    if (seed_leaf == -1)
+        return root;
+
+    vec3 segment_lower;
+    vec3 segment_upper;
+    if (!mesh_query_ray_active_segment_bounds(start, dir, max_t, state, segment_lower, segment_upper))
+        return root;
+    return mesh_query_ray_find_exclusive_segment(mesh, segment_lower, segment_upper, seed_leaf);
+}
+
+CUDA_CALLABLE inline int mesh_query_ray_exclusive_node_depth(uint64_t id, int node)
+{
+    const Mesh mesh = mesh_get(id);
+    if (!bvh_has_exclusive(mesh.bvh) || node < 0 || node >= mesh.bvh.num_nodes)
+        return -1;
+    return bvh_exclusive_node_depth(bvh_get_exclusive_node(mesh.bvh, node));
+}
+
+CUDA_CALLABLE inline bool mesh_query_ray_exclusive(
+    uint64_t id,
+    const vec3& start,
+    const vec3& dir,
+    float max_t,
+    int seed_face,
+    float& t,
+    float& u,
+    float& v,
+    float& sign,
+    vec3& normal,
+    int& face
+)
+{
+    const Mesh mesh = mesh_get(id);
+    mesh_query_ray_hit_state_t state(max_t);
+    const int seed_leaf = mesh_query_ray_initialize_seed_leaf(mesh, seed_face, start, dir, state);
+    if (seed_leaf == -1)
+        return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+
+    vec3 segment_lower;
+    vec3 segment_upper;
+    int start_node = *mesh.bvh.root;
+    if (mesh_query_ray_active_segment_bounds(start, dir, max_t, state, segment_lower, segment_upper)) {
+        start_node = mesh_query_ray_find_exclusive_segment(mesh, segment_lower, segment_upper, seed_leaf);
+    }
+
+    mesh_query_ray_traverse_seeded<false, true>(mesh, start_node, seed_leaf, start, dir, 0.0f, state);
+    return mesh_query_ray_finish_seeded(id, start, dir, max_t, state, t, u, v, sign, normal, face);
+}
+
+CUDA_CALLABLE inline bool mesh_query_ray_exclusive_cached(
+    uint64_t id,
+    const vec3& start,
+    const vec3& dir,
+    float max_t,
+    int seed_face,
+    int cached_node,
+    float& t,
+    float& u,
+    float& v,
+    float& sign,
+    vec3& normal,
+    int& face
+)
+{
+    const Mesh mesh = mesh_get(id);
+    mesh_query_ray_hit_state_t state(max_t);
+    const int seed_leaf = mesh_query_ray_initialize_seed_leaf(mesh, seed_face, start, dir, state);
+    if (seed_leaf == -1)
+        return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+
+    vec3 segment_lower;
+    vec3 segment_upper;
+    int start_node = *mesh.bvh.root;
+    if (mesh_query_ray_active_segment_bounds(start, dir, max_t, state, segment_lower, segment_upper)) {
+        start_node = mesh_query_ray_find_exclusive_segment(mesh, segment_lower, segment_upper, cached_node);
+    }
+
+    mesh_query_ray_traverse_seeded<false, true>(mesh, start_node, seed_leaf, start, dir, 0.0f, state);
+    return mesh_query_ray_finish_seeded(id, start, dir, max_t, state, t, u, v, sign, normal, face);
+}
+
 CUDA_CALLABLE inline bool
 mesh_query_ray_anyhit(uint64_t id, const vec3& start, const vec3& dir, float max_t, int root = -1)
 {
@@ -2779,6 +3212,37 @@ mesh_query_ray(uint64_t id, const vec3& start, const vec3& dir, float max_t, int
     mesh_query_ray_t query;
     query.result
         = mesh_query_ray(id, start, dir, max_t, query.t, query.u, query.v, query.sign, query.normal, query.face, root);
+    return query;
+}
+
+CUDA_CALLABLE inline mesh_query_ray_t
+mesh_query_ray_seeded(uint64_t id, const vec3& start, const vec3& dir, float max_t, int seed_face)
+{
+    mesh_query_ray_t query;
+    query.result = mesh_query_ray_seeded(
+        id, start, dir, max_t, seed_face, query.t, query.u, query.v, query.sign, query.normal, query.face
+    );
+    return query;
+}
+
+CUDA_CALLABLE inline mesh_query_ray_t
+mesh_query_ray_exclusive(uint64_t id, const vec3& start, const vec3& dir, float max_t, int seed_face)
+{
+    mesh_query_ray_t query;
+    query.result = mesh_query_ray_exclusive(
+        id, start, dir, max_t, seed_face, query.t, query.u, query.v, query.sign, query.normal, query.face
+    );
+    return query;
+}
+
+CUDA_CALLABLE inline mesh_query_ray_t mesh_query_ray_exclusive_cached(
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, int seed_face, int cached_node
+)
+{
+    mesh_query_ray_t query;
+    query.result = mesh_query_ray_exclusive_cached(
+        id, start, dir, max_t, seed_face, cached_node, query.t, query.u, query.v, query.sign, query.normal, query.face
+    );
     return query;
 }
 
