@@ -105,6 +105,88 @@ def bvh_capsule_query_guarded(
             wp.atomic_add(guarded_hits, bounds_nr + 1, 1)
 
 
+@wp.kernel
+def bvh_aabb_query_guarded(
+    bvh_id: wp.uint64,
+    lower: wp.vec3,
+    upper: wp.vec3,
+    group_id: int,
+    num_bounds: int,
+    guarded_hits: wp.array[int],
+):
+    root = int(-1)
+    if group_id >= 0:
+        root = wp.bvh_get_group_root(bvh_id, group_id)
+    query = wp.bvh_query_aabb(bvh_id, lower, upper, root)
+    bounds_nr = int(0)
+
+    while wp.bvh_query_next(query, bounds_nr):
+        if bounds_nr < 0 or bounds_nr >= num_bounds:
+            guarded_hits[num_bounds + 1] = 0
+        else:
+            wp.atomic_add(guarded_hits, bounds_nr + 1, 1)
+
+
+@wp.kernel
+def bvh_sphere_query_guarded(
+    bvh_id: wp.uint64,
+    center: wp.vec3,
+    radius: float,
+    group_id: int,
+    num_bounds: int,
+    guarded_hits: wp.array[int],
+):
+    root = int(-1)
+    if group_id >= 0:
+        root = wp.bvh_get_group_root(bvh_id, group_id)
+    query = wp.bvh_query_sphere(bvh_id, center, radius, root)
+    bounds_nr = int(0)
+
+    while wp.bvh_query_next(query, bounds_nr):
+        if bounds_nr < 0 or bounds_nr >= num_bounds:
+            guarded_hits[num_bounds + 1] = 0
+        else:
+            wp.atomic_add(guarded_hits, bounds_nr + 1, 1)
+
+
+@wp.kernel
+def bvh_mixed_queries_guarded(
+    bvh_id: wp.uint64,
+    group_id: int,
+    num_bounds: int,
+    guarded_hits: wp.array[int],
+):
+    root = wp.bvh_get_group_root(bvh_id, group_id)
+    bounds_nr = int(0)
+
+    aabb_query = wp.bvh_query_aabb(bvh_id, wp.vec3(-8192.0, -1.0, -1.0), wp.vec3(8192.0, 1.0, 1.0), root)
+    while wp.bvh_query_next(aabb_query, bounds_nr):
+        if bounds_nr < 0 or bounds_nr >= num_bounds:
+            guarded_hits[3 * num_bounds + 1] = 0
+        else:
+            wp.atomic_add(guarded_hits, bounds_nr + 1, 1)
+
+    sphere_query = wp.bvh_query_sphere(bvh_id, wp.vec3(0.0, 0.0, 0.0), 8192.0, root)
+    while wp.bvh_query_next(sphere_query, bounds_nr):
+        if bounds_nr < 0 or bounds_nr >= num_bounds:
+            guarded_hits[3 * num_bounds + 1] = 0
+        else:
+            wp.atomic_add(guarded_hits, num_bounds + bounds_nr + 1, 1)
+
+    capsule_query = wp.bvh_query_capsule(
+        bvh_id,
+        wp.vec3(-8192.0, 0.0, 0.0),
+        wp.vec3(16384.0, 0.0, 0.0),
+        0.0,
+        root,
+    )
+    while wp.bvh_query_next(capsule_query, bounds_nr, 1.0):
+        if bounds_nr < 0 or bounds_nr >= num_bounds:
+            guarded_hits[3 * num_bounds + 1] = 0
+        else:
+            wp.atomic_add(guarded_hits, 2 * num_bounds + bounds_nr + 1, 1)
+
+
 def aabb_overlap(a_lower, a_upper, b_lower, b_upper):
     if (
         a_lower[0] > b_upper[0]
@@ -443,6 +525,59 @@ def assert_bvh_capsule_query_guarded(
     np.testing.assert_array_equal(guarded_hits.numpy(), expected)
 
 
+def assert_bvh_volume_query_guarded(
+    device,
+    lowers,
+    uppers,
+    query_kind,
+    *,
+    groups,
+    group_id,
+    leaf_size,
+    block_dim=None,
+    query_extent=8192.0,
+):
+    """Assert that a rooted volume query returns its group once without touching guards."""
+    num_bounds = len(lowers)
+    device_lowers = wp.array(lowers, dtype=wp.vec3, device=device)
+    device_uppers = wp.array(uppers, dtype=wp.vec3, device=device)
+    device_groups = wp.array(groups, dtype=int, device=device)
+    bvh = wp.Bvh(
+        device_lowers,
+        device_uppers,
+        constructor="sah",
+        groups=device_groups,
+        leaf_size=leaf_size,
+    )
+
+    left_canary = np.int32(0x13579BDF)
+    right_canary = np.int32(0x2468ACE)
+    initial = np.zeros(num_bounds + 2, dtype=np.int32)
+    initial[0] = left_canary
+    initial[-1] = right_canary
+    expected = initial.copy()
+    expected[1:-1] = 1 if group_id < 0 else np.asarray(groups) == group_id
+    guarded_hits = wp.array(initial, dtype=int, device=device)
+
+    if query_kind == "aabb":
+        kernel = bvh_aabb_query_guarded
+        query_inputs = [wp.vec3(-query_extent, -1.0, -1.0), wp.vec3(query_extent, 1.0, 1.0)]
+    else:
+        kernel = bvh_sphere_query_guarded
+        query_inputs = [wp.vec3(0.0, 0.0, 0.0), query_extent]
+
+    launch_options = {} if block_dim is None else {"block_dim": block_dim}
+    wp.launch(
+        kernel,
+        dim=1,
+        inputs=[bvh.id, *query_inputs, group_id, num_bounds, guarded_hits],
+        device=device,
+        **launch_options,
+    )
+
+    np.testing.assert_array_equal(guarded_hits.numpy(), expected)
+
+
 def test_bvh_query_capsule_max_depth(test, device):
     """Preserve capsule results and distance updates at maximum BVH depth."""
     num_bounds = 33
@@ -454,7 +589,7 @@ def test_bvh_query_capsule_max_depth(test, device):
     # Power-of-two spacing makes SAH repeatedly split off the lowest item. The
     # right-first capsule traversal therefore reaches the fixed-stack limit
     # while all deferred siblings remain live.
-    block_dims = (8, 256) if device.is_cuda else (None,)
+    block_dims = (8, 128, 256, 512, 1024) if device.is_cuda else (None,)
     for block_dim in block_dims:
         with test.subTest(block_dim=block_dim):
             assert_bvh_capsule_query_guarded(
@@ -468,9 +603,9 @@ def test_bvh_query_capsule_max_depth(test, device):
                 block_dim=block_dim,
             )
 
-    # At block size 256 the first hit is returned from the overflow subtree.
+    # At high block sizes the first hit is returned from the overflow subtree.
     # Tightening the distance before resuming must apply to both its skip-link
-    # walk and the siblings still pending on the fixed stack.
+    # walk and the siblings still pending on the compact shared stack.
     device_lowers = wp.array(lowers, dtype=wp.vec3, device=device)
     device_uppers = wp.array(uppers, dtype=wp.vec3, device=device)
     bvh = wp.Bvh(device_lowers, device_uppers, constructor="sah")
@@ -537,17 +672,19 @@ def test_bvh_query_capsule_grouped_max_depth(test, device):
             lbvh_num_bounds = len(lbvh_group_bits)
             lbvh_lowers = np.tile(np.array([[-0.5, -0.1, -0.1]], dtype=np.float32), (lbvh_num_bounds, 1))
             lbvh_uppers = np.tile(np.array([[0.5, 0.1, 0.1]], dtype=np.float32), (lbvh_num_bounds, 1))
-            assert_bvh_capsule_query_guarded(
-                device,
-                lbvh_lowers,
-                lbvh_uppers,
-                (-1.0, 0.0, 0.0),
-                (1.0, 0.0, 0.0),
-                2.0,
-                constructor="lbvh",
-                groups=lbvh_group_bits.view(np.int32),
-                leaf_size=leaf_size,
-            )
+            for block_dim in (128, 256, 512, 1024):
+                assert_bvh_capsule_query_guarded(
+                    device,
+                    lbvh_lowers,
+                    lbvh_uppers,
+                    (-1.0, 0.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                    2.0,
+                    constructor="lbvh",
+                    groups=lbvh_group_bits.view(np.int32),
+                    leaf_size=leaf_size,
+                    block_dim=block_dim,
+                )
 
             if packed_leaf:
                 # The first fallback leaf is a singleton and the second hit
@@ -565,24 +702,112 @@ def test_bvh_query_capsule_grouped_max_depth(test, device):
                 )
                 initial_hit_count = wp.zeros(1, dtype=int, device=device)
                 later_hits = wp.zeros(lbvh_num_bounds, dtype=int, device=device)
-                wp.launch(
-                    bvh_capsule_query_decreasing_max_dist,
-                    dim=1,
-                    inputs=[
-                        bvh.id,
-                        wp.vec3(-1.0, 0.0, 0.0),
-                        wp.vec3(1.0, 0.0, 0.0),
-                        2.0,
-                        0.0,
-                        2,
-                        initial_hit_count,
-                        later_hits,
-                    ],
-                    device=device,
-                    block_dim=256,
-                )
-                test.assertEqual(initial_hit_count.numpy()[0], 2)
-                test.assertEqual(later_hits.numpy().sum(), 0)
+                for block_dim in (128, 256, 512, 1024):
+                    initial_hit_count.zero_()
+                    later_hits.zero_()
+                    wp.launch(
+                        bvh_capsule_query_decreasing_max_dist,
+                        dim=1,
+                        inputs=[
+                            bvh.id,
+                            wp.vec3(-1.0, 0.0, 0.0),
+                            wp.vec3(1.0, 0.0, 0.0),
+                            2.0,
+                            0.0,
+                            2,
+                            initial_hit_count,
+                            later_hits,
+                        ],
+                        device=device,
+                        block_dim=block_dim,
+                    )
+                    test.assertEqual(initial_hit_count.numpy()[0], 2)
+                    test.assertEqual(later_hits.numpy().sum(), 0)
+
+
+def test_bvh_query_volume_high_block(test, device):
+    """Preserve rooted volume results with compact high-block traversal stacks."""
+    num_deep_bounds = 22
+    exponents = 4 * np.arange(num_deep_bounds - 1, -1, -1, dtype=np.float32) - 72
+    x = np.concatenate((np.array([0.0], dtype=np.float32), np.exp2(exponents)))
+    num_bounds = len(x)
+    lowers = np.column_stack((x, np.full(num_bounds, -0.1), np.full(num_bounds, -0.1))).astype(np.float32)
+    uppers = np.column_stack((x, np.full(num_bounds, 0.1), np.full(num_bounds, 0.1))).astype(np.float32)
+    groups = np.concatenate((np.zeros(1, dtype=np.int32), np.ones(num_deep_bounds, dtype=np.int32)))
+
+    # Positive power-of-two spacing leaves the deep subtree on the left, so
+    # volume traversal fills its far-child stack. Group 0 is deliberately
+    # inside both query volumes and must be excluded by the explicit root.
+    for query_kind in ("aabb", "sphere"):
+        for leaf_size in (1, 4):
+            for block_dim in (128, 256, 512, 1024):
+                with test.subTest(query_kind=query_kind, leaf_size=leaf_size, block_dim=block_dim):
+                    assert_bvh_volume_query_guarded(
+                        device,
+                        lowers,
+                        uppers,
+                        query_kind,
+                        groups=groups,
+                        group_id=1,
+                        leaf_size=leaf_size,
+                        block_dim=block_dim,
+                    )
+
+    device_lowers = wp.array(lowers, dtype=wp.vec3, device=device)
+    device_uppers = wp.array(uppers, dtype=wp.vec3, device=device)
+    device_groups = wp.array(groups, dtype=int, device=device)
+    bvh = wp.Bvh(device_lowers, device_uppers, constructor="sah", groups=device_groups, leaf_size=4)
+    left_canary = np.int32(0x13579BDF)
+    right_canary = np.int32(0x2468ACE)
+    initial = np.zeros(3 * num_bounds + 2, dtype=np.int32)
+    initial[0] = left_canary
+    initial[-1] = right_canary
+    expected = initial.copy()
+    group_mask = (groups == 1).astype(np.int32)
+    for query_offset in range(3):
+        expected[query_offset * num_bounds + 1 : (query_offset + 1) * num_bounds + 1] = group_mask
+
+    # Sequential mixed query types retain distinct shared stacks. All four
+    # high-block variants must compile, load, and reuse them without overlap.
+    for block_dim in (128, 256, 512, 1024):
+        with test.subTest(query_kind="mixed", block_dim=block_dim):
+            guarded_hits = wp.array(initial, dtype=int, device=device)
+            wp.launch(
+                bvh_mixed_queries_guarded,
+                dim=1,
+                inputs=[bvh.id, 1, num_bounds, guarded_hits],
+                device=device,
+                block_dim=block_dim,
+            )
+            np.testing.assert_array_equal(guarded_hits.numpy(), expected)
+
+
+def test_bvh_query_volume_grouped_max_depth(test, device):
+    """Preserve full-root volume results for maximum-depth grouped BVHs."""
+    num_deep_bounds = 33
+    exponents = 4 * np.arange(num_deep_bounds - 1, -1, -1, dtype=np.float32) - 32
+    x = np.concatenate((np.exp2(exponents), np.array([-float(2**100)], dtype=np.float32)))
+    num_bounds = len(x)
+    lowers = np.column_stack((x, np.full(num_bounds, -0.1), np.full(num_bounds, -0.1))).astype(np.float32)
+    uppers = np.column_stack((x, np.full(num_bounds, 0.1), np.full(num_bounds, 0.1))).astype(np.float32)
+    groups = np.concatenate((np.zeros(num_deep_bounds, dtype=np.int32), np.ones(1, dtype=np.int32)))
+
+    # The deep group is the left child and retains the right-group item while
+    # descending, requiring one more pending entry than an ungrouped tree.
+    block_dim = 8 if device.is_cuda else None
+    for query_kind in ("aabb", "sphere"):
+        with test.subTest(query_kind=query_kind):
+            assert_bvh_volume_query_guarded(
+                device,
+                lowers,
+                uppers,
+                query_kind,
+                groups=groups,
+                group_id=-1,
+                leaf_size=1,
+                block_dim=block_dim,
+                query_extent=float(2**101),
+            )
 
 
 def test_bvh_cubql_constructor(test, device):
@@ -1261,6 +1486,7 @@ def bvh_query_aabb_mark_all(bvh_id: wp.uint64, lower: wp.vec3, upper: wp.vec3, h
 
 
 def test_bvh_degenerate_deep_tree(test, device):
+    """Enumerate every bound in degenerate maximum-depth BVHs."""
     # Diagonally exponentially spaced boxes give the morton codes a long
     # shared-prefix chain, and the duplicate cluster at the tail pushes the
     # tree to the construction depth bound, maximizing traversal stack
@@ -1279,18 +1505,22 @@ def test_bvh_degenerate_deep_tree(test, device):
                 constructor=constructor,
                 leaf_size=leaf_size,
             )
-            hit = wp.zeros(num_bounds, dtype=int, device=device)
-            wp.launch(
-                bvh_query_aabb_mark_all,
-                dim=1,
-                inputs=[bvh.id, wp.vec3(-1.0, -1.0, -1.0), wp.vec3(2.0, 2.0, 2.0), hit],
-                device=device,
-            )
-            test.assertEqual(
-                int(hit.numpy().sum()),
-                num_bounds,
-                f"missing query results for constructor={constructor} leaf_size={leaf_size}",
-            )
+            block_dims = (None, 512, 1024) if device.is_cuda else (None,)
+            for block_dim in block_dims:
+                hit = wp.zeros(num_bounds, dtype=int, device=device)
+                launch_options = {} if block_dim is None else {"block_dim": block_dim}
+                wp.launch(
+                    bvh_query_aabb_mark_all,
+                    dim=1,
+                    inputs=[bvh.id, wp.vec3(-1.0, -1.0, -1.0), wp.vec3(2.0, 2.0, 2.0), hit],
+                    device=device,
+                    **launch_options,
+                )
+                test.assertEqual(
+                    int(hit.numpy().sum()),
+                    num_bounds,
+                    f"missing query results for constructor={constructor} leaf_size={leaf_size} block_dim={block_dim}",
+                )
 
 
 devices = get_test_devices()
@@ -1300,6 +1530,7 @@ cuda_devices_with_mempool = get_cuda_test_devices_with_mempool()
 
 class TestBvh(unittest.TestCase):
     def test_bvh_query_types_exported(self):
+        """Expose specialized BVH query types from the public module."""
         self.assertIs(wp.BvhQueryRay, BvhQueryRay)
         self.assertIs(wp.BvhQueryCapsule, BvhQueryCapsule)
         self.assertIs(wp.BvhQuerySphere, BvhQuerySphere)
@@ -1348,6 +1579,18 @@ add_function_test(
     TestBvh,
     "test_bvh_capsule_grouped_max_depth",
     test_bvh_query_capsule_grouped_max_depth,
+    devices=devices,
+)
+add_function_test(
+    TestBvh,
+    "test_bvh_volume_high_block",
+    test_bvh_query_volume_high_block,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestBvh,
+    "test_bvh_volume_grouped_max_depth",
+    test_bvh_query_volume_grouped_max_depth,
     devices=devices,
 )
 add_function_test(TestBvh, "test_bvh_cubql_constructor", test_bvh_cubql_constructor, devices=devices)

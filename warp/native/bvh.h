@@ -17,16 +17,29 @@
 #define USE_LOAD4
 #define BVH_QUERY_STACK_SIZE (32)
 // A grouped host tree can combine 31 balanced group ancestors with the
-// 32-level per-group subtree bound. Capsule traversal pushes both children,
-// so it needs the resulting maximum of 64 live entries.
-#define BVH_CAPSULE_QUERY_MAX_STACK_SIZE (64)
-#if BVH_SHARED_STACK && WP_TILE_BLOCK_DIM > 128
-#define BVH_CAPSULE_QUERY_STACK_SIZE BVH_QUERY_STACK_SIZE
+// 32-level per-group subtree bound, so stack-based traversals need up to 64
+// live entries.
+#define BVH_QUERY_MAX_STACK_SIZE (64)
+// Each CUDA query type uses at most 16 KiB of shared memory. A kernel may use
+// volume and capsule queries together, so their distinct stacks plus the
+// remaining per-block state still fit within CUDA's 48 KiB shared-memory
+// floor. Smaller stacks switch overflowing subtrees to skip links, while CPU
+// and performance-sensitive low-block variants keep their original traversal.
+#define BVH_QUERY_SHARED_STACK_SLOT_BUDGET (BVH_QUERY_STACK_SIZE * 128)
+#if BVH_SHARED_STACK && WP_TILE_BLOCK_DIM > 64
+#define BVH_VOLUME_QUERY_STACK_SIZE (BVH_QUERY_SHARED_STACK_SLOT_BUDGET / WP_TILE_BLOCK_DIM)
+#define BVH_VOLUME_QUERY_USE_SKIP_LINKS 1
+#define BVH_CAPSULE_QUERY_STACK_SIZE (BVH_QUERY_SHARED_STACK_SLOT_BUDGET / WP_TILE_BLOCK_DIM)
 #define BVH_CAPSULE_QUERY_USE_SKIP_LINKS 1
+#elif BVH_SHARED_STACK
+#define BVH_VOLUME_QUERY_STACK_SIZE BVH_QUERY_MAX_STACK_SIZE
+#define BVH_VOLUME_QUERY_USE_SKIP_LINKS 0
+#define BVH_CAPSULE_QUERY_STACK_SIZE BVH_QUERY_MAX_STACK_SIZE
+#define BVH_CAPSULE_QUERY_USE_SKIP_LINKS 0
 #else
-// CUDA emits a module variant for each block dimension. Sixty-four entries
-// fit within the 48 KiB per-block shared-memory floor through block size 128.
-#define BVH_CAPSULE_QUERY_STACK_SIZE BVH_CAPSULE_QUERY_MAX_STACK_SIZE
+#define BVH_VOLUME_QUERY_STACK_SIZE BVH_QUERY_MAX_STACK_SIZE
+#define BVH_VOLUME_QUERY_USE_SKIP_LINKS 0
+#define BVH_CAPSULE_QUERY_STACK_SIZE BVH_QUERY_MAX_STACK_SIZE
 #define BVH_CAPSULE_QUERY_USE_SKIP_LINKS 0
 #endif
 
@@ -439,12 +452,16 @@ CUDA_CALLABLE inline uint64_t bvh_query_stack_unpack(unsigned slot_lo, unsigned 
 // two-slot payload pair. A traversal never has more pending stack entries
 // than internal nodes on a root-leaf path (max_depth - 1), and stopping pair
 // pushes above this limit bounds live pairs so that total slot usage stays
-// within BVH_QUERY_STACK_SIZE for every tree the constructors can produce
+// within BVH_VOLUME_QUERY_STACK_SIZE for every tree the constructors can produce
 // (they hard-terminate at the stack depth). An unknown or out-of-range depth
 // yields a negative limit, which disables pairs entirely and falls back to
 // the exactly-safe one-slot-per-entry index encoding.
 CUDA_CALLABLE inline int bvh_query_pair_limit(const BVH& bvh)
 {
+    // Preserve the original 32-slot payload-pair budget when the low-block
+    // stack has extra room for grouped-tree indices.
+    constexpr int pair_stack_size
+        = BVH_VOLUME_QUERY_STACK_SIZE < BVH_QUERY_STACK_SIZE ? BVH_VOLUME_QUERY_STACK_SIZE : BVH_QUERY_STACK_SIZE;
     int max_depth = bvh.max_depth;
 #ifdef __CUDA_ARCH__
     if (bvh.max_depth_ptr)
@@ -455,9 +472,9 @@ CUDA_CALLABLE inline int bvh_query_pair_limit(const BVH& bvh)
 #endif
     // grouped host builds restart the depth counter per group, so their
     // recorded depth is not a root-leaf bound
-    if (max_depth < 1 || max_depth > BVH_QUERY_STACK_SIZE + 1 || bvh.item_groups)
-        max_depth = BVH_QUERY_STACK_SIZE + 1;
-    return std_min(64 - 2 * max_depth, BVH_QUERY_STACK_SIZE - 2);
+    if (max_depth < 1 || max_depth > pair_stack_size + 1 || bvh.item_groups)
+        max_depth = pair_stack_size + 1;
+    return std_min(2 * pair_stack_size - 2 * max_depth, pair_stack_size - 2);
 }
 
 CUDA_CALLABLE inline int lca(int node_a, int node_b, const int* parent)
@@ -548,7 +565,7 @@ struct bvh_query_t {
 #if BVH_SHARED_STACK
     bvh_stack_t stack;
 #else
-    int stack[BVH_QUERY_STACK_SIZE];
+    int stack[BVH_VOLUME_QUERY_STACK_SIZE];
 #endif
 
     int count;
@@ -669,7 +686,8 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_common(uint64_t id, const vec3& lower
 CUDA_CALLABLE inline void bvh_query_alloc_stack(bvh_query_t& query)
 {
 #if BVH_SHARED_STACK
-    __shared__ int stack[BVH_QUERY_STACK_SIZE * WP_TILE_BLOCK_DIM];
+    static_assert(BVH_VOLUME_QUERY_STACK_SIZE >= 2, "BVH volume query stack must have at least two entries");
+    __shared__ int stack[BVH_VOLUME_QUERY_STACK_SIZE * WP_TILE_BLOCK_DIM];
     query.stack.ptr = &stack[threadIdx.x];
 #endif
 }
@@ -677,6 +695,7 @@ CUDA_CALLABLE inline void bvh_query_alloc_stack(bvh_query_t& query)
 CUDA_CALLABLE inline void bvh_query_alloc_stack(bvh_query_capsule_t& query)
 {
 #if BVH_SHARED_STACK
+    static_assert(BVH_CAPSULE_QUERY_STACK_SIZE >= 2, "BVH capsule query stack must have at least two entries");
     __shared__ int stack[BVH_CAPSULE_QUERY_STACK_SIZE * WP_TILE_BLOCK_DIM];
     query.stack.ptr = &stack[threadIdx.x];
 #endif
@@ -794,6 +813,51 @@ CUDA_CALLABLE inline bool bvh_query_next_volume(bvh_query_t& query, int& index, 
             continue;
         }
 
+#if BVH_VOLUME_QUERY_USE_SKIP_LINKS
+        // A high-block CUDA variant has a compact shared stack. If that stack
+        // fills, walk the overflowing subtree by skip links before resuming
+        // the pending entries. Packed-leaf items still use the common loop
+        // above, so every item observes the caller's current max_dist.
+        if (query.cursor != -1) {
+            if (query.cursor == query.end_cursor) {
+                query.cursor = -1;
+                query.end_cursor = -1;
+            } else {
+                const int node_index = query.cursor;
+                const BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
+                const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+
+                if (!bvh_query_test<QUERY_KIND, HAS_RADIUS>(
+                        query, reinterpret_cast<const vec3&>(node_lower), reinterpret_cast<const vec3&>(node_upper),
+                        max_dist
+                    )) {
+                    query.cursor = bvh_load_int(bvh.node_escapes, node_index);
+                    continue;
+                }
+
+                if (node_lower.b) {
+                    const int start = node_lower.i;
+                    const int end = node_upper.i;
+                    query.cursor = bvh_load_int(bvh.node_escapes, node_index);
+
+                    if (end - start == 1) {
+                        const int primitive_index = bvh_load_int(bvh.primitive_indices, start);
+                        index = primitive_index;
+                        query.bounds_nr = primitive_index;
+                        return true;
+                    }
+
+                    query.prim_cur = start;
+                    query.prim_end = end;
+                    continue;
+                }
+
+                query.cursor = node_lower.i;
+                continue;
+            }
+        }
+#endif
+
         if (!query.have_node) {
             if (!query.count)
                 return false;
@@ -857,8 +921,16 @@ CUDA_CALLABLE inline bool bvh_query_next_volume(bvh_query_t& query, int& index, 
                 if (query.count <= query.pair_limit) {
                     query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
                     query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
-                } else if (query.count < BVH_QUERY_STACK_SIZE) {
+                } else if (query.count < BVH_VOLUME_QUERY_STACK_SIZE) {
                     query.stack[query.count++] = right_index;
+#if BVH_VOLUME_QUERY_USE_SKIP_LINKS
+                } else {
+                    // Revisit both already-tested children so subsequent
+                    // iterator calls may apply a tighter max_dist.
+                    query.have_node = false;
+                    query.cursor = left_index;
+                    query.end_cursor = bvh_load_int(bvh.node_escapes, right_index);
+#endif
                 }
             }
         } else if (hit_right) {
@@ -962,7 +1034,9 @@ CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_capsule_t& query, int
 #if BVH_CAPSULE_QUERY_USE_SKIP_LINKS
                 if (skip_links) {
                     const int next = bvh_load_int(bvh.node_escapes, node_index);
-                    query.count = next == query.stack[BVH_QUERY_STACK_SIZE - 1] ? BVH_QUERY_STACK_SIZE - 1 : ~next;
+                    query.count = next == query.stack[BVH_CAPSULE_QUERY_STACK_SIZE - 1]
+                        ? BVH_CAPSULE_QUERY_STACK_SIZE - 1
+                        : ~next;
                 }
 #endif
                 continue;
@@ -977,7 +1051,9 @@ CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_capsule_t& query, int
 #if BVH_CAPSULE_QUERY_USE_SKIP_LINKS
                 if (skip_links) {
                     const int next = bvh_load_int(bvh.node_escapes, node_index);
-                    query.count = next == query.stack[BVH_QUERY_STACK_SIZE - 1] ? BVH_QUERY_STACK_SIZE - 1 : ~next;
+                    query.count = next == query.stack[BVH_CAPSULE_QUERY_STACK_SIZE - 1]
+                        ? BVH_CAPSULE_QUERY_STACK_SIZE - 1
+                        : ~next;
                 }
 #endif
                 index = primitive_index;
@@ -998,7 +1074,9 @@ CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_capsule_t& query, int
 #if BVH_CAPSULE_QUERY_USE_SKIP_LINKS
                 if (skip_links) {
                     const int next = bvh_load_int(bvh.node_escapes, node_index);
-                    query.count = next == query.stack[BVH_QUERY_STACK_SIZE - 1] ? BVH_QUERY_STACK_SIZE - 1 : ~next;
+                    query.count = next == query.stack[BVH_CAPSULE_QUERY_STACK_SIZE - 1]
+                        ? BVH_CAPSULE_QUERY_STACK_SIZE - 1
+                        : ~next;
                 }
 #endif
             }
@@ -1017,11 +1095,11 @@ CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_capsule_t& query, int
 #if BVH_CAPSULE_QUERY_USE_SKIP_LINKS
         if (skip_links) {
             query.count = ~int(node_lower.i);
-        } else if (query.count <= BVH_QUERY_STACK_SIZE - 2) {
+        } else if (query.count <= BVH_CAPSULE_QUERY_STACK_SIZE - 2) {
             query.stack[query.count++] = node_lower.i;
             query.stack[query.count++] = node_upper.i;
         } else {
-            query.stack[BVH_QUERY_STACK_SIZE - 1] = bvh_load_int(bvh.node_escapes, node_index);
+            query.stack[BVH_CAPSULE_QUERY_STACK_SIZE - 1] = bvh_load_int(bvh.node_escapes, node_index);
             query.count = ~int(node_lower.i);
         }
 #else
