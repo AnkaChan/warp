@@ -8400,6 +8400,27 @@ add_builtin(
 )
 
 add_builtin(
+    "mesh_query_ray_exclusive_endpoint_node",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+        "seed_face": int,
+    },
+    value_type=int,
+    group="Geometry",
+    doc="""Return the deepest Exclusive BVH node containing the active ray endpoint.
+
+    The endpoint is the exact packed-seed-leaf hit when one exists, or the point at ``max_t`` otherwise. Unlike
+    :func:`mesh_query_ray_exclusive_node`, the ray origin need not be inside the returned node's exclusive box. This
+    makes the result suitable as a temporally cached starting subtree for endpoint peeling.""",
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+add_builtin(
     "mesh_query_ray_exclusive_node_depth",
     input_types={"id": uint64, "node": int},
     value_type=int,
@@ -8448,6 +8469,73 @@ add_builtin(
     ``cached_node`` is accepted only when its current exclusive box strictly contains the active finite ray segment;
     otherwise its parent chain is searched and the query safely falls back to the root.""",
     require_original_output_arg=True,
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "mesh_query_ray_exclusive_cached_bottom_up",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+        "seed_face": int,
+        "cached_node": int,
+    },
+    value_type=MeshQueryRay,
+    group="Geometry",
+    doc="""Compute the closest ray hit by searching a cached subtree and its ancestor siblings exactly once.
+
+    This is the no-peeling control for :func:`mesh_query_ray_exclusive_cached_peeling`. The complete packed seed leaf
+    is evaluated first and omitted from the disjoint bottom-up traversal. Invalid inputs fall back to
+    :func:`mesh_query_ray`.""",
+    require_original_output_arg=True,
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "mesh_query_ray_exclusive_cached_peeling",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+        "seed_face": int,
+        "cached_node": int,
+    },
+    value_type=MeshQueryRay,
+    group="Geometry",
+    doc="""Compute the closest ray hit with cumulative Exclusive BVH endpoint peeling.
+
+    After each cached or ancestor subtree is completely searched, a strictly covered prefix or suffix is removed from
+    the residual ray interval. Exclusive-box boundaries remain in the residual. Middle intersections that would split
+    the residual into two intervals are declined. Invalid inputs fall back to :func:`mesh_query_ray`.""",
+    require_original_output_arg=True,
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "mesh_query_ray_exclusive_cached_peeling_status",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+        "seed_face": int,
+        "cached_node": int,
+    },
+    value_type=int,
+    group="Geometry",
+    doc="""Return the cumulative endpoint-peeling status bitfield for a cached ray query.
+
+    Bits report terminal completion (1), prefix peeling (2), suffix peeling (4), a declined middle intersection (8),
+    and invalid input or exact-order fallback (16). A zero result means no peel was applicable.""",
     export=False,
     hidden=True,
     is_differentiable=False,
