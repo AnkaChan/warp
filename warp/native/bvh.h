@@ -689,7 +689,9 @@ bvh_query_capsule(uint64_t id, const vec3& start, const vec3& dir, float radius,
     bvh_query_t query = bvh_query_common(id, start, 1.0f / dir);
     query.radius = max(radius, 0.0f);
     query.radius_sq = query.radius * query.radius;
-    bvh_query_init_volume<BvhQueryKind::RAY, true>(query, root);
+    bvh_query_alloc_stack(query);
+    query.stack[0] = root == -1 ? *query.bvh.root : root;
+    query.count = 1;
     return query;
 }
 
@@ -878,6 +880,59 @@ CUDA_CALLABLE inline bool bvh_query_next_directed(bvh_query_t& query, int& index
     }
 }
 
+// Capsule queries use a test-on-pop stack so a caller may tighten max_dist
+// between iterator calls. Packed-leaf items are still tested individually.
+CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_t& query, int& index, const float& max_dist)
+{
+    BVH bvh = query.bvh;
+
+    for (;;) {
+        if (query.prim_cur < query.prim_end) {
+            const int primitive_index = bvh_load_int(bvh.primitive_indices, query.prim_cur++);
+            const vec3 item_lower = bvh_load_vec3(bvh.item_lowers, primitive_index);
+            const vec3 item_upper = bvh_load_vec3(bvh.item_uppers, primitive_index);
+
+            if (bvh_query_test<BvhQueryKind::RAY, true>(query, item_lower, item_upper, max_dist)) {
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            }
+            continue;
+        }
+
+        if (!query.count)
+            return false;
+
+        const int node_index = query.stack[--query.count];
+        const BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
+        const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+
+        if (!bvh_query_test<BvhQueryKind::RAY, true>(
+                query, reinterpret_cast<const vec3&>(node_lower), reinterpret_cast<const vec3&>(node_upper), max_dist
+            )) {
+            continue;
+        }
+
+        if (node_lower.b) {
+            const int start = node_lower.i;
+            const int end = node_upper.i;
+            if (end - start == 1) {
+                const int primitive_index = bvh_load_int(bvh.primitive_indices, start);
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            }
+
+            query.prim_cur = start;
+            query.prim_end = end;
+            continue;
+        }
+
+        query.stack[query.count++] = node_upper.i;
+        query.stack[query.count++] = node_lower.i;
+    }
+}
+
 // Per-kind public iterators. Each is a thin wrapper around the shared template
 // skeletons; the caller's Python type determines which one gets emitted, so
 // NVCC sees only one traversal loop per kernel -- no runtime dispatch.
@@ -897,7 +952,7 @@ CUDA_CALLABLE inline bool bvh_query_ray_next(bvh_query_t& query, int& index, con
 // Capsule iterator (BvhQueryCapsule type)
 CUDA_CALLABLE inline bool bvh_query_capsule_next(bvh_query_t& query, int& index, const float& max_dist)
 {
-    return bvh_query_next_volume<BvhQueryKind::RAY, true>(query, index, max_dist);
+    return bvh_query_next_capsule(query, index, max_dist);
 }
 
 // Sphere iterator (BvhQuerySphere type)
