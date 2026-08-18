@@ -121,6 +121,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.fem.test_fem_quadrature import TestFemQuadrature
     from warp.tests.fem.test_fem_shape import TestFemShape
     from warp.tests.geometry.test_bvh import TestBvh
+    from warp.tests.geometry.test_bvh_aabb_peeling import TestBvhAabbPeeling
     from warp.tests.geometry.test_bvh_exclusive import TestBvhExclusive
     from warp.tests.geometry.test_bvh_temporal_update import TestBvhTemporalUpdate
     from warp.tests.geometry.test_hash_grid import TestHashGrid
@@ -292,6 +293,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestBool,
         TestBuiltinsResolution,
         TestBvh,
+        TestBvhAabbPeeling,
         TestBvhExclusive,
         TestBvhTemporalUpdate,
         TestCaptureMode,

@@ -7046,6 +7046,102 @@ add_builtin(
 )
 
 add_builtin(
+    "bvh_query_aabb_exclusive_cached_bottom_up",
+    input_types={"id": uint64, "low": vec3, "high": vec3, "cached_node": int},
+    value_type=BvhQuery,
+    group="Geometry",
+    doc="""Construct an exact bottom-up AABB query from a cached Exclusive BVH node.
+
+    The cached subtree is searched once, followed by exactly one sibling subtree at each ancestor. This is the
+    identical-topology no-peeling control for :func:`bvh_query_aabb_exclusive_cached_peeling`. Any current reachable
+    node is a valid cache; invalid, muted, or missing Exclusive BVH metadata falls back to a stackless root traversal.
+
+    Args:
+        id: The BVH identifier
+        low: The lower bound of the query box
+        high: The upper bound of the query box
+        cached_node: A spatially or temporally coherent Exclusive BVH node""",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_query_aabb_exclusive_cached_peeling",
+    input_types={"id": uint64, "low": vec3, "high": vec3, "cached_node": int},
+    value_type=BvhQuery,
+    group="Geometry",
+    doc="""Construct an exact restricted face-peeling AABB query from a cached Exclusive BVH node.
+
+    This uses the same bottom-up topology as :func:`bvh_query_aabb_exclusive_cached_bottom_up`. After each completed
+    subtree, it removes the part of the residual query strictly covered by the subtree's exclusive box only when the
+    remainder is one AABB. A lower-side peel sets ``low[axis]`` to the exclusive upper plane; an upper-side peel sets
+    ``high[axis]`` to the exclusive lower plane. Both keep the plane itself searchable for inclusive boundary hits.
+    Middle, edge, corner, and unordered cases are declined.
+
+    Args:
+        id: The BVH identifier
+        low: The lower bound of the query box
+        high: The upper bound of the query box
+        cached_node: A spatially or temporally coherent Exclusive BVH node""",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_query_aabb_exclusive_cached_peeling_status",
+    input_types={"id": uint64, "low": vec3, "high": vec3, "cached_node": int},
+    value_type=int,
+    group="Geometry",
+    doc="""Return the cumulative restricted AABB peeling status bitfield.
+
+    Bits are terminal ``1``, lower residual side removed ``2``, upper residual side removed ``4``, middle/edge/corner
+    declined ``8``, and invalid, unordered, or fallback ``16``.
+
+    Args:
+        id: The BVH identifier
+        low: The lower bound of the query box
+        high: The upper bound of the query box
+        cached_node: A spatially or temporally coherent Exclusive BVH node""",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_query_aabb_exclusive_cached_peeling_count",
+    input_types={"id": uint64, "low": vec3, "high": vec3, "cached_node": int},
+    value_type=int,
+    group="Geometry",
+    doc="""Return the number of successful restricted AABB peels, including a terminal peel.
+
+    Args:
+        id: The BVH identifier
+        low: The lower bound of the query box
+        high: The upper bound of the query box
+        cached_node: A spatially or temporally coherent Exclusive BVH node""",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_query_aabb_exclusive_node_depth",
+    input_types={"id": uint64, "node": int},
+    value_type=int,
+    group="Geometry",
+    doc="""Return the current depth of an Exclusive BVH node, or ``-1`` when invalid.
+
+    Args:
+        id: The BVH identifier
+        node: The node index""",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
     "bvh_query_ray",
     input_types={"id": uint64, "start": vec3, "dir": vec3, "root": int},
     defaults={"root": -1},

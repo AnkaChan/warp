@@ -17,6 +17,8 @@
 #define USE_LOAD4
 #define BVH_QUERY_STACK_SIZE (32)
 #define BVH_CACHED_QUERY_STACK_SIZE (16)
+#define BVH_AABB_BOTTOM_UP_MODE (-BVH_QUERY_STACK_SIZE - 2)
+#define BVH_AABB_PEELING_MODE (-BVH_QUERY_STACK_SIZE - 3)
 
 #define BVH_CONSTRUCTOR_SAH (0)
 #define BVH_CONSTRUCTOR_MEDIAN (1)
@@ -336,6 +338,81 @@ bvh_exclusive_contains_point_radius_strict(const BVHExclusiveNode& node, const v
 {
     return point[0] - radius > node.lower_x && point[1] - radius > node.lower_y && point[2] - radius > node.lower_z
         && point[0] + radius < node.upper_x && point[1] + radius < node.upper_y && point[2] + radius < node.upper_z;
+}
+
+enum BvhQueryAabbPeelingStatus {
+    BVH_QUERY_AABB_PEEL_NONE = 0,
+    BVH_QUERY_AABB_PEEL_TERMINAL = 1 << 0,
+    BVH_QUERY_AABB_PEEL_LOWER = 1 << 1,
+    BVH_QUERY_AABB_PEEL_UPPER = 1 << 2,
+    BVH_QUERY_AABB_PEEL_MIDDLE_DECLINED = 1 << 3,
+    BVH_QUERY_AABB_PEEL_INVALID = 1 << 4,
+};
+
+// Remove the one part of Q covered by interior(E) only when the remainder is
+// still one closed AABB. The clipping plane is retained because Warp's AABB
+// overlap test is inclusive and a complement primitive may touch E there.
+CUDA_CALLABLE inline int
+bvh_query_aabb_peel_exclusive_box(const BVHExclusiveNode& node, vec3& query_lower, vec3& query_upper)
+{
+    if (bvh_exclusive_node_depth(node) < 0)
+        return BVH_QUERY_AABB_PEEL_INVALID;
+
+    const vec3 box_lower = bvh_exclusive_node_lower(node);
+    const vec3 box_upper = bvh_exclusive_node_upper(node);
+    for (int axis = 0; axis < 3; ++axis) {
+        // Unordered inputs are declined without changing the residual. Empty
+        // exclusive boxes have no interior to remove and are harmless.
+        if (query_lower[axis] != query_lower[axis] || query_upper[axis] != query_upper[axis]
+            || box_lower[axis] != box_lower[axis] || box_upper[axis] != box_upper[axis]
+            || query_lower[axis] > query_upper[axis]) {
+            return BVH_QUERY_AABB_PEEL_INVALID;
+        }
+        if (!(box_lower[axis] < box_upper[axis]))
+            return BVH_QUERY_AABB_PEEL_NONE;
+    }
+
+    bool terminal = true;
+    for (int axis = 0; axis < 3; ++axis)
+        terminal = terminal && box_lower[axis] < query_lower[axis] && query_upper[axis] < box_upper[axis];
+    if (terminal)
+        return BVH_QUERY_AABB_PEEL_TERMINAL;
+
+    int lower_axis = -1;
+    int upper_axis = -1;
+    for (int axis = 0; axis < 3; ++axis) {
+        bool covers_other_axes = true;
+        for (int other = 0; other < 3; ++other) {
+            if (other != axis) {
+                covers_other_axes = covers_other_axes && box_lower[other] < query_lower[other]
+                    && query_upper[other] < box_upper[other];
+            }
+        }
+
+        if (covers_other_axes && box_lower[axis] < query_lower[axis] && query_lower[axis] < box_upper[axis]
+            && box_upper[axis] <= query_upper[axis]) {
+            lower_axis = axis;
+        }
+        if (covers_other_axes && query_lower[axis] <= box_lower[axis] && box_lower[axis] < query_upper[axis]
+            && query_upper[axis] < box_upper[axis]) {
+            upper_axis = axis;
+        }
+    }
+
+    if (lower_axis >= 0 && upper_axis < 0) {
+        query_lower[lower_axis] = box_upper[lower_axis];
+        return BVH_QUERY_AABB_PEEL_LOWER;
+    }
+    if (upper_axis >= 0 && lower_axis < 0) {
+        query_upper[upper_axis] = box_lower[upper_axis];
+        return BVH_QUERY_AABB_PEEL_UPPER;
+    }
+
+    bool overlaps_interior = true;
+    for (int axis = 0; axis < 3; ++axis)
+        overlaps_interior
+            = overlaps_interior && box_lower[axis] < query_upper[axis] && query_lower[axis] < box_upper[axis];
+    return overlaps_interior ? BVH_QUERY_AABB_PEEL_MIDDLE_DECLINED : BVH_QUERY_AABB_PEEL_NONE;
 }
 
 // variation of make_node through volatile pointers used in build_hierarchy
@@ -849,6 +926,113 @@ bvh_query_aabb_exclusive_cached(uint64_t id, const vec3& lower, const vec3& uppe
 #endif
 }
 
+CUDA_CALLABLE inline bvh_query_t bvh_query_aabb_exclusive_cached_bottom_up_impl(
+    uint64_t id, const vec3& lower, const vec3& upper, int cached_node, bool peel
+)
+{
+    const BVH bvh = bvh_get(id);
+    const int root = *bvh.root;
+    bool valid_cache = bvh_has_exclusive(bvh) && cached_node >= 0 && cached_node < bvh.num_nodes;
+    if (valid_cache) {
+        valid_cache = bvh_exclusive_node_depth(bvh_get_exclusive_node(bvh, cached_node)) >= 0;
+    }
+
+    // An invalid or muted cache index uses the same stackless machinery at
+    // the root. This fallback is selected before any primitive can be emitted,
+    // so it cannot duplicate results.
+    const int start_node = valid_cache ? cached_node : root;
+    bvh_query_t query;
+    query.bounds_nr = -1;
+    query.bvh = bvh;
+    query.input_lower = lower;
+    query.input_upper = upper;
+    query.is_ray = false;
+    query.count = start_node;
+    query.cur_node = (uint64_t(unsigned(start_node)) << 32) | uint64_t(unsigned(-1));
+    // Marks the first subtree. Later traversal roots are siblings, so their
+    // parent is the completed subtree whose exclusive box may be peeled.
+    query.have_node = true;
+    query.pair_limit = peel && valid_cache ? BVH_AABB_PEELING_MODE : BVH_AABB_BOTTOM_UP_MODE;
+    return query;
+}
+
+CUDA_CALLABLE inline bvh_query_t
+bvh_query_aabb_exclusive_cached_bottom_up(uint64_t id, const vec3& lower, const vec3& upper, int cached_node)
+{
+    return bvh_query_aabb_exclusive_cached_bottom_up_impl(id, lower, upper, cached_node, false);
+}
+
+CUDA_CALLABLE inline bvh_query_t
+bvh_query_aabb_exclusive_cached_peeling(uint64_t id, const vec3& lower, const vec3& upper, int cached_node)
+{
+    return bvh_query_aabb_exclusive_cached_bottom_up_impl(id, lower, upper, cached_node, true);
+}
+
+CUDA_CALLABLE inline int bvh_query_aabb_exclusive_cached_peeling_diagnostics(
+    uint64_t id, const vec3& lower, const vec3& upper, int cached_node, int& peel_count
+)
+{
+    peel_count = 0;
+    const BVH bvh = bvh_get(id);
+    const int root = *bvh.root;
+    if (!bvh_has_exclusive(bvh) || root < 0 || root >= bvh.num_nodes || cached_node < 0
+        || cached_node >= bvh.num_nodes) {
+        return BVH_QUERY_AABB_PEEL_INVALID;
+    }
+
+    vec3 residual_lower = lower;
+    vec3 residual_upper = upper;
+    int status = BVH_QUERY_AABB_PEEL_NONE;
+    int current = cached_node;
+    for (int iteration = 0; current != root; ++iteration) {
+        if (iteration >= bvh.num_nodes || current < 0 || current >= bvh.num_nodes) {
+            return status | BVH_QUERY_AABB_PEEL_INVALID;
+        }
+
+        const BVHExclusiveNode exclusive_node = bvh_get_exclusive_node(bvh, current);
+        const int step_status = bvh_query_aabb_peel_exclusive_box(exclusive_node, residual_lower, residual_upper);
+        status |= step_status;
+        if ((step_status & BVH_QUERY_AABB_PEEL_TERMINAL) || (step_status & BVH_QUERY_AABB_PEEL_LOWER)
+            || (step_status & BVH_QUERY_AABB_PEEL_UPPER))
+            ++peel_count;
+        if ((step_status & BVH_QUERY_AABB_PEEL_TERMINAL) || (step_status & BVH_QUERY_AABB_PEEL_INVALID))
+            return status;
+
+        const int parent = bvh_exclusive_node_parent(exclusive_node);
+        if (parent < 0 || parent >= bvh.num_nodes)
+            return status | BVH_QUERY_AABB_PEEL_INVALID;
+        const BVHPackedNodeHalf parent_lower = bvh_load_node(bvh.node_lowers, parent);
+        const BVHPackedNodeHalf parent_upper = bvh_load_node(bvh.node_uppers, parent);
+        if (parent_lower.b || (int(parent_lower.i) != current && int(parent_upper.i) != current))
+            return status | BVH_QUERY_AABB_PEEL_INVALID;
+        current = parent;
+    }
+    return status;
+}
+
+CUDA_CALLABLE inline int
+bvh_query_aabb_exclusive_cached_peeling_status(uint64_t id, const vec3& lower, const vec3& upper, int cached_node)
+{
+    int peel_count;
+    return bvh_query_aabb_exclusive_cached_peeling_diagnostics(id, lower, upper, cached_node, peel_count);
+}
+
+CUDA_CALLABLE inline int
+bvh_query_aabb_exclusive_cached_peeling_count(uint64_t id, const vec3& lower, const vec3& upper, int cached_node)
+{
+    int peel_count;
+    bvh_query_aabb_exclusive_cached_peeling_diagnostics(id, lower, upper, cached_node, peel_count);
+    return peel_count;
+}
+
+CUDA_CALLABLE inline int bvh_query_aabb_exclusive_node_depth(uint64_t id, int node)
+{
+    const BVH bvh = bvh_get(id);
+    if (!bvh_has_exclusive(bvh) || node < 0 || node >= bvh.num_nodes)
+        return -1;
+    return bvh_exclusive_node_depth(bvh_get_exclusive_node(bvh, node));
+}
+
 CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir, int root)
 {
     return bvh_query(id, true, start, 1.0f / dir, root);
@@ -1124,6 +1308,167 @@ CUDA_CALLABLE inline bool bvh_query_next_aabb_stackless(bvh_query_t& query, int&
     }
 }
 
+CUDA_CALLABLE inline bool bvh_query_aabb_bottom_up_advance(bvh_query_t& query)
+{
+    const BVH bvh = query.bvh;
+    const int root = *bvh.root;
+    const int traversal_root = int(unsigned(query.cur_node >> 32));
+
+    int completed = traversal_root;
+    if (query.have_node) {
+        query.have_node = false;
+    } else {
+        if (traversal_root < 0 || traversal_root >= bvh.num_nodes) {
+            query.count = -1;
+            return false;
+        }
+        const BVHExclusiveNode traversal_exclusive = bvh_get_exclusive_node(bvh, traversal_root);
+        completed = bvh_exclusive_node_parent(traversal_exclusive);
+    }
+
+    if (completed < 0 || completed >= bvh.num_nodes) {
+        query.count = -1;
+        return false;
+    }
+
+    if (query.pair_limit == BVH_AABB_PEELING_MODE && completed != root) {
+        const int status = bvh_query_aabb_peel_exclusive_box(
+            bvh_get_exclusive_node(bvh, completed), query.input_lower, query.input_upper
+        );
+        if (status & BVH_QUERY_AABB_PEEL_INVALID) {
+            // Keep all previously valid cuts, but decline any later peel.
+            query.pair_limit = BVH_AABB_BOTTOM_UP_MODE;
+        } else if (status & BVH_QUERY_AABB_PEEL_TERMINAL) {
+            query.count = -1;
+            return false;
+        }
+    }
+
+    if (completed == root) {
+        query.count = -1;
+        return false;
+    }
+
+    const BVHExclusiveNode completed_exclusive = bvh_get_exclusive_node(bvh, completed);
+    const int parent = bvh_exclusive_node_parent(completed_exclusive);
+    if (parent < 0 || parent >= bvh.num_nodes) {
+        query.count = -1;
+        return false;
+    }
+    const BVHPackedNodeHalf parent_lower = bvh_load_node(bvh.node_lowers, parent);
+    const BVHPackedNodeHalf parent_upper = bvh_load_node(bvh.node_uppers, parent);
+    if (parent_lower.b) {
+        query.count = -1;
+        return false;
+    }
+
+    const int left = int(parent_lower.i);
+    const int right = int(parent_upper.i);
+    int sibling = -1;
+    if (left == completed && right != completed)
+        sibling = right;
+    else if (right == completed && left != completed)
+        sibling = left;
+    if (sibling < 0 || sibling >= bvh.num_nodes) {
+        query.count = -1;
+        return false;
+    }
+
+    query.count = sibling;
+    query.cur_node = (uint64_t(unsigned(sibling)) << 32) | uint64_t(unsigned(-1));
+    return true;
+}
+
+// Stackless bottom-up traversal for both the no-peel control and restricted
+// face-peeling experiment. A completed cached subtree is followed by exactly
+// one sibling per ancestor, so no primitive can be visited twice.
+CUDA_CALLABLE inline bool bvh_query_next_aabb_bottom_up(bvh_query_t& query, int& index)
+{
+    const BVH bvh = query.bvh;
+
+    for (;;) {
+        if (query.prim_cur < query.prim_end) {
+            const int primitive_index = bvh_load_int(bvh.primitive_indices, query.prim_cur++);
+            const vec3 item_lower = bvh_load_vec3(bvh.item_lowers, primitive_index);
+            const vec3 item_upper = bvh_load_vec3(bvh.item_uppers, primitive_index);
+            if (intersect_aabb_aabb(query.input_lower, query.input_upper, item_lower, item_upper)) {
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            }
+            continue;
+        }
+
+        if (query.count < 0) {
+            if (!bvh_query_aabb_bottom_up_advance(query))
+                return false;
+            continue;
+        }
+
+        const int traversal_root = int(unsigned(query.cur_node >> 32));
+        int previous = int(unsigned(query.cur_node));
+        const int node_index = query.count;
+        const BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
+
+        if (previous < 0) {
+            const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+            if (!intersect_aabb_aabb(
+                    query.input_lower, query.input_upper, reinterpret_cast<const vec3&>(node_lower),
+                    reinterpret_cast<const vec3&>(node_upper)
+                )) {
+                if (node_index == traversal_root) {
+                    query.count = -1;
+                } else {
+                    query.count = bvh_load_int(bvh.node_parents, node_index);
+                    previous = node_index;
+                    query.cur_node = (uint64_t(unsigned(traversal_root)) << 32) | uint64_t(unsigned(previous));
+                }
+                continue;
+            }
+
+            if (node_lower.b) {
+                const int start = int(node_lower.i);
+                const int end = int(node_upper.i);
+                if (node_index == traversal_root) {
+                    query.count = -1;
+                } else {
+                    query.count = bvh_load_int(bvh.node_parents, node_index);
+                    previous = node_index;
+                    query.cur_node = (uint64_t(unsigned(traversal_root)) << 32) | uint64_t(unsigned(previous));
+                }
+
+                if (end - start == 1) {
+                    const int primitive_index = bvh_load_int(bvh.primitive_indices, start);
+                    index = primitive_index;
+                    query.bounds_nr = primitive_index;
+                    return true;
+                }
+                query.prim_cur = start;
+                query.prim_end = end;
+                continue;
+            }
+
+            query.count = int(node_lower.i);
+            previous = ~node_index;
+            query.cur_node = (uint64_t(unsigned(traversal_root)) << 32) | uint64_t(unsigned(previous));
+            continue;
+        }
+
+        if (previous == int(node_lower.i)) {
+            const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+            query.count = int(node_upper.i);
+            previous = ~node_index;
+            query.cur_node = (uint64_t(unsigned(traversal_root)) << 32) | uint64_t(unsigned(previous));
+        } else if (node_index == traversal_root) {
+            query.count = -1;
+        } else {
+            query.count = bvh_load_int(bvh.node_parents, node_index);
+            previous = node_index;
+            query.cur_node = (uint64_t(unsigned(traversal_root)) << 32) | uint64_t(unsigned(previous));
+        }
+    }
+}
+
 CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const float& max_dist)
 {
     // is_ray is fixed per query, so this branch is uniform and hoists the
@@ -1132,6 +1477,8 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
         return bvh_query_next_ray(query, index, max_dist);
     else if (query.pair_limit == -BVH_QUERY_STACK_SIZE - 1)
         return bvh_query_next_aabb_stackless(query, index);
+    else if (query.pair_limit == BVH_AABB_BOTTOM_UP_MODE || query.pair_limit == BVH_AABB_PEELING_MODE)
+        return bvh_query_next_aabb_bottom_up(query, index);
     else
         return bvh_query_next_aabb(query, index);
 }
