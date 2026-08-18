@@ -617,10 +617,9 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_common(uint64_t id, const vec3& lower
     return query;
 }
 
-// The shared-memory traversal stack is used (and allocated) only by the
-// volume-query traversal below; ray and capsule kernels are stackless.
-// Kept in a single non-template function so every volume kind shares one
-// block-wide allocation.
+// The shared-memory traversal stack is used by volume and capsule queries;
+// plain ray queries remain stackless. Kept in a single non-template function
+// so every stack-based query shares one block-wide allocation.
 CUDA_CALLABLE inline void bvh_query_alloc_stack(bvh_query_t& query)
 {
 #if BVH_SHARED_STACK
@@ -652,7 +651,7 @@ CUDA_CALLABLE inline void bvh_query_init_volume(bvh_query_t& query, int root)
     }
 }
 
-// Directed queries (ray, capsule) traverse stackless via the skip links.
+// Plain ray queries traverse stackless via the skip links.
 CUDA_CALLABLE inline void bvh_query_init_directed(bvh_query_t& query, int root)
 {
     const BVH& bvh = query.bvh;
@@ -685,12 +684,12 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, c
 CUDA_CALLABLE inline bvh_query_t
 bvh_query_capsule(uint64_t id, const vec3& start, const vec3& dir, float radius, int root)
 {
-    // like the plain ray, input_upper stores the reciprocal direction;
-    // bvh_query_test<RAY, true> derives the raw direction from it
+    // Like the plain ray, input_upper stores the reciprocal direction;
+    // bvh_query_test<RAY, true> derives the raw direction from it.
     bvh_query_t query = bvh_query_common(id, start, 1.0f / dir);
     query.radius = max(radius, 0.0f);
     query.radius_sq = query.radius * query.radius;
-    bvh_query_init_directed(query, root);
+    bvh_query_init_volume<BvhQueryKind::RAY, true>(query, root);
     return query;
 }
 
@@ -809,7 +808,7 @@ CUDA_CALLABLE inline bool bvh_query_next_volume(bvh_query_t& query, int& index, 
     }
 }
 
-// Directed traversal (ray, capsule): stackless skip-link walk. Every visited
+// Directed traversal (plain ray): stackless skip-link walk. Every visited
 // node is loaded and tested exactly once; a culled or finished subtree jumps
 // to its precomputed escape node, an overlapped internal node descends to its
 // left child. State is two scalar cursors, so directed queries need no
@@ -898,7 +897,7 @@ CUDA_CALLABLE inline bool bvh_query_ray_next(bvh_query_t& query, int& index, con
 // Capsule iterator (BvhQueryCapsule type)
 CUDA_CALLABLE inline bool bvh_query_capsule_next(bvh_query_t& query, int& index, const float& max_dist)
 {
-    return bvh_query_next_directed<true>(query, index, max_dist);
+    return bvh_query_next_volume<BvhQueryKind::RAY, true>(query, index, max_dist);
 }
 
 // Sphere iterator (BvhQuerySphere type)
