@@ -8359,6 +8359,101 @@ add_builtin(
 )
 
 add_builtin(
+    "mesh_query_ray_seeded",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+        "seed_face": int,
+    },
+    value_type=MeshQueryRay,
+    group="Geometry",
+    doc="""Compute the closest ray hit after warming the traversal with the packed leaf containing ``seed_face``.
+
+    The complete packed seed leaf is evaluated exactly before traversing the root, and that leaf is not revisited.
+    Invalid seeds and meshes without Exclusive BVH metadata fall back to :func:`mesh_query_ray`.""",
+    require_original_output_arg=True,
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "mesh_query_ray_exclusive_node",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+        "seed_face": int,
+    },
+    value_type=int,
+    group="Geometry",
+    doc="""Return the deepest Exclusive BVH node containing the active finite ray segment.
+
+    The active segment ends at the exact packed-seed-leaf hit when one exists, or at ``max_t`` otherwise. The result
+    can be reused by :func:`mesh_query_ray_exclusive_cached`.""",
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "mesh_query_ray_exclusive_node_depth",
+    input_types={"id": uint64, "node": int},
+    value_type=int,
+    group="Geometry",
+    doc="""Return the recorded depth of an Exclusive BVH node, or -1 when unavailable.""",
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "mesh_query_ray_exclusive",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+        "seed_face": int,
+    },
+    value_type=MeshQueryRay,
+    group="Geometry",
+    doc="""Compute the closest ray hit inside a certified Exclusive BVH segment-containment node.
+
+    The packed seed leaf supplies an exact active segment bound. The query walks toward the root until an exclusive
+    box strictly contains that segment, then traverses only the certified subtree while skipping the seed leaf.""",
+    require_original_output_arg=True,
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "mesh_query_ray_exclusive_cached",
+    input_types={
+        "id": uint64,
+        "start": vec3,
+        "dir": vec3,
+        "max_t": float,
+        "seed_face": int,
+        "cached_node": int,
+    },
+    value_type=MeshQueryRay,
+    group="Geometry",
+    doc="""Compute the closest ray hit from a revalidated cached Exclusive BVH node.
+
+    ``cached_node`` is accepted only when its current exclusive box strictly contains the active finite ray segment;
+    otherwise its parent chain is searched and the query safely falls back to the root.""",
+    require_original_output_arg=True,
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+add_builtin(
     "mesh_query_ray_anyhit",
     input_types={
         "id": uint64,
