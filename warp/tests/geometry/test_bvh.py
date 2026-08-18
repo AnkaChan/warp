@@ -6,6 +6,7 @@ import unittest
 import numpy as np
 
 import warp as wp
+from warp._src.types import BvhQueryCapsule, BvhQueryRay, BvhQuerySphere
 from warp.tests.unittest_utils import *
 
 
@@ -1224,6 +1225,11 @@ cuda_devices_with_mempool = get_cuda_test_devices_with_mempool()
 
 
 class TestBvh(unittest.TestCase):
+    def test_bvh_query_types_exported(self):
+        self.assertIs(wp.BvhQueryRay, BvhQueryRay)
+        self.assertIs(wp.BvhQueryCapsule, BvhQueryCapsule)
+        self.assertIs(wp.BvhQuerySphere, BvhQuerySphere)
+
     def test_bvh_codegen_adjoints_with_select(self):
         def kernel_fn(bvh: wp.uint64):
             v = wp.vec3(0.0, 0.0, 0.0)

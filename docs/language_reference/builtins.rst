@@ -252,6 +252,7 @@ Geometry
    bvh_get_group_root
    bvh_query_aabb
    bvh_query_aabb_tiled
+   bvh_query_capsule
    bvh_query_next
    bvh_query_next_tiled
    bvh_query_ray

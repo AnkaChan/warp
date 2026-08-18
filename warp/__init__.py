@@ -261,6 +261,9 @@ from warp._src.types import Mesh as Mesh
 from warp._src.types import HashGrid as HashGrid
 from warp._src.types import Volume as Volume
 from warp._src.types import BvhQuery as BvhQuery
+from warp._src.types import BvhQueryRay as BvhQueryRay
+from warp._src.types import BvhQueryCapsule as BvhQueryCapsule
+from warp._src.types import BvhQuerySphere as BvhQuerySphere
 from warp._src.types import BvhQueryTiled as BvhQueryTiled
 from warp._src.types import HashGridQuery as HashGridQuery
 from warp._src.types import MeshQueryAABB as MeshQueryAABB

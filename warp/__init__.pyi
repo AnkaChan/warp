@@ -71,6 +71,9 @@ from warp._src.types import Mesh as Mesh
 from warp._src.types import HashGrid as HashGrid
 from warp._src.types import Volume as Volume
 from warp._src.types import BvhQuery as BvhQuery
+from warp._src.types import BvhQueryRay as BvhQueryRay
+from warp._src.types import BvhQueryCapsule as BvhQueryCapsule
+from warp._src.types import BvhQuerySphere as BvhQuerySphere
 from warp._src.types import BvhQueryTiled as BvhQueryTiled
 from warp._src.types import HashGridQuery as HashGridQuery
 from warp._src.types import MeshQueryAABB as MeshQueryAABB
@@ -4432,12 +4435,13 @@ def bvh_query_next(
     Writes the index of the current item to ``index`` and returns ``True``; returns ``False`` once
     the query is exhausted (``index`` is then left unchanged). The reported index is the item's
     index into the ``lowers``/``uppers`` arrays passed to :class:`warp.Bvh`. Used in a ``while``
-    loop together with :func:`bvh_query_aabb`, :func:`bvh_query_ray`, or :func:`bvh_query_sphere`.
+    loop together with :func:`bvh_query_aabb`, :func:`bvh_query_ray`, :func:`bvh_query_capsule`,
+    or :func:`bvh_query_sphere`.
 
     For plain ray queries, ``max_dist`` bounds how far along the ray to look for intersections,
     measured in multiples of ``dir``'s length (so it is a distance only if ``dir`` was normalized).
-    For capsule-style queries (``bvh_query_ray`` with ``radius > 0``), pass an unnormalized
-    ``dir = p1 - p0`` together with ``max_dist = 1.0`` to sweep from ``p0`` to ``p1``.
+    For capsule queries, pass an unnormalized ``dir = p1 - p0`` to
+    :func:`bvh_query_capsule` together with ``max_dist = 1.0`` to sweep from ``p0`` to ``p1``.
     ``max_dist`` has no effect on AABB or sphere queries.
 
     Note that increasing ``max_dist`` may miss intersections: a subtree already rejected for being
@@ -4445,7 +4449,8 @@ def bvh_query_next(
     is therefore only safe to monotonically *reduce* ``max_dist`` during a query.
 
     Args:
-        query: The query to advance, from :func:`bvh_query_aabb`, :func:`bvh_query_ray`, or :func:`bvh_query_sphere`
+        query: The query to advance, from :func:`bvh_query_aabb`, :func:`bvh_query_ray`,
+            :func:`bvh_query_capsule`, or :func:`bvh_query_sphere`
         index: Output; receives the index of the current overlapping item
         max_dist: For ray queries, the maximum distance along the ray to check for intersections
             (in multiples of ``dir``'s length). Has no effect on AABB or sphere queries.
