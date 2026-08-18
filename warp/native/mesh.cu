@@ -255,7 +255,7 @@ static void wp_mesh_free_device_allocations(wp::Mesh& mesh, wp::Mesh* mesh_devic
     }
 }
 
-uint64_t wp_mesh_create_device(
+uint64_t wp_mesh_create_device_ex(
     void* context,
     wp::array_t<wp::vec3> points,
     wp::array_t<wp::vec3> velocities,
@@ -265,7 +265,8 @@ uint64_t wp_mesh_create_device(
     int support_winding_number,
     int constructor_type,
     int* groups,
-    int bvh_leaf_size
+    int bvh_leaf_size,
+    int enable_exclusive
 )
 {
     ContextGuard guard(context);
@@ -311,30 +312,17 @@ uint64_t wp_mesh_create_device(
         WP_CURRENT_CONTEXT, wp::compute_triangle_bounds, mesh.num_tris,
         (mesh.num_tris, mesh.points, mesh.indices, mesh.lowers, mesh.uppers)
     );
-#ifndef WP_DISABLE_CUBQL
-    if (use_cubql) {
-        wp::cubql_bvh_create_device(mesh.context, mesh.lowers, mesh.uppers, num_tris, bvh_leaf_size, mesh.bvh);
-        if ((!mesh.bvh.node_lowers || !mesh.bvh.primitive_indices) && num_tris > 0) {
-            wp::cubql_bvh_destroy_device(mesh.bvh);
-            wp_mesh_free_device_allocations(mesh, mesh_device);
-            return 0;
-        }
-        wp_memcpy_h2d(WP_CURRENT_CONTEXT, &(mesh_device->bvh), &mesh.bvh, sizeof(wp::BVH));
-    } else
-#else
-    if (use_cubql) {
-        wp::set_error_string("Warp error: cuBQL support disabled (WP_DISABLE_CUBQL)");
+    wp::bvh_create_device(
+        mesh.context, mesh.lowers, mesh.uppers, num_tris, constructor_type, groups, bvh_leaf_size,
+        enable_exclusive != 0, mesh.bvh
+    );
+    if ((!mesh.bvh.node_lowers || !mesh.bvh.primitive_indices) && num_tris > 0) {
+        wp::bvh_destroy_device(mesh.bvh);
         wp_mesh_free_device_allocations(mesh, mesh_device);
         return 0;
     }
-#endif
-    {
-        wp::bvh_create_device(
-            mesh.context, mesh.lowers, mesh.uppers, num_tris, constructor_type, groups, bvh_leaf_size, mesh.bvh
-        );
-        // we need to overwrite mesh.bvh because it is not initialized when we construct it on device
-        wp_memcpy_h2d(WP_CURRENT_CONTEXT, &(mesh_device->bvh), &mesh.bvh, sizeof(wp::BVH));
-    }
+    // we need to overwrite mesh.bvh because it is not initialized when we construct it on device
+    wp_memcpy_h2d(WP_CURRENT_CONTEXT, &(mesh_device->bvh), &mesh.bvh, sizeof(wp::BVH));
 
     mesh_add_descriptor(mesh_id, mesh);
 
@@ -342,6 +330,25 @@ uint64_t wp_mesh_create_device(
         wp_mesh_refit_device(mesh_id);
 
     return mesh_id;
+}
+
+uint64_t wp_mesh_create_device(
+    void* context,
+    wp::array_t<wp::vec3> points,
+    wp::array_t<wp::vec3> velocities,
+    wp::array_t<int> indices,
+    int num_points,
+    int num_tris,
+    int support_winding_number,
+    int constructor_type,
+    int* groups,
+    int bvh_leaf_size
+)
+{
+    return wp_mesh_create_device_ex(
+        context, points, velocities, indices, num_points, num_tris, support_winding_number, constructor_type, groups,
+        bvh_leaf_size, 0
+    );
 }
 
 void wp_mesh_destroy_device(uint64_t id)
@@ -396,6 +403,7 @@ int wp_mesh_refit_device(uint64_t id)
         if (m.solid_angle_props) {
             // update solid angle data
             bvh_refit_with_solid_angle_device(m.bvh, m);
+            bvh_refit_exclusive_device(m.bvh);
         } else {
             wp::bvh_refit_device(m.bvh);
         }

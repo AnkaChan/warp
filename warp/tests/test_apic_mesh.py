@@ -166,6 +166,17 @@ def mesh_eval_position_kernel(
 
 
 @wp.kernel
+def mesh_exclusive_node_kernel(
+    mesh_id: wp.handle,
+    query_points: wp.array(dtype=wp.vec3),
+    seed_faces: wp.array(dtype=int),
+    nodes: wp.array(dtype=int),
+):
+    tid = wp.tid()
+    nodes[tid] = wp.mesh_query_point_no_sign_exclusive_node(mesh_id, query_points[tid], 100.0, seed_faces[tid])
+
+
+@wp.kernel
 def mesh_combined_operations_kernel(
     mesh_id: wp.handle,
     query_points: wp.array(dtype=wp.vec3),
@@ -323,6 +334,64 @@ def test_apic_mesh_query_ray(test, device):
 
         np.testing.assert_array_almost_equal(new_distances.numpy(), ref_distances, decimal=4)
         np.testing.assert_array_equal(new_flags.numpy(), ref_flags)
+
+
+def test_apic_mesh_exclusive_metadata(test, device):
+    """Test that APIC preserves opt-in Exclusive BVH metadata."""
+    n = 8
+    points_np = np.empty((n * 3, 3), dtype=np.float32)
+    query_points_np = np.empty((n, 3), dtype=np.float32)
+    for face in range(n):
+        x = 4.0 * face
+        points_np[face * 3 + 0] = (x, 0.0, 0.0)
+        points_np[face * 3 + 1] = (x + 1.0, 0.0, 0.0)
+        points_np[face * 3 + 2] = (x, 1.0, 0.0)
+        query_points_np[face] = (x + 0.2, 0.2, 0.05)
+
+    points = wp.array(points_np, dtype=wp.vec3, device=device)
+    indices = wp.array(np.arange(n * 3, dtype=np.int32), dtype=int, device=device)
+    mesh = wp.Mesh(
+        points,
+        indices,
+        bvh_constructor="sah",
+        bvh_leaf_size=1,
+        enable_exclusive=True,
+    )
+    query_points = wp.array(query_points_np, dtype=wp.vec3, device=device)
+    seed_faces = wp.array(np.arange(n, dtype=np.int32), dtype=int, device=device)
+    nodes = wp.empty(n, dtype=int, device=device)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        graph_path = os.path.join(tmpdir, "mesh_exclusive_metadata")
+
+        wp.load_module(device=device)
+        with wp.ScopedCapture(device=device, apic=True, force_module_load=False) as capture:
+            wp.launch(
+                mesh_exclusive_node_kernel,
+                dim=n,
+                inputs=[mesh.id, query_points, seed_faces, nodes],
+                device=device,
+            )
+
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(device)
+        reference_nodes = nodes.numpy().copy()
+        test.assertGreater(len(np.unique(reference_nodes)), 1)
+
+        wp.capture_save(
+            capture.graph,
+            graph_path,
+            inputs={"query_points": query_points, "seed_faces": seed_faces},
+            outputs={"nodes": nodes},
+        )
+
+        loaded = wp.capture_load(graph_path, device=device)
+        wp.capture_launch(loaded)
+        wp.synchronize_device(device)
+
+        loaded_nodes = wp.empty(n, dtype=int, device=device)
+        loaded.get_param("nodes", loaded_nodes)
+        np.testing.assert_array_equal(loaded_nodes.numpy(), reference_nodes)
 
 
 def test_apic_mesh_eval_position(test, device):
@@ -567,6 +636,7 @@ devices = get_test_devices_with_cuda_graph_module_load()
 
 add_function_test(TestApicMesh, "test_apic_mesh_query_point", test_apic_mesh_query_point, devices=devices)
 add_function_test(TestApicMesh, "test_apic_mesh_query_ray", test_apic_mesh_query_ray, devices=devices)
+add_function_test(TestApicMesh, "test_apic_mesh_exclusive_metadata", test_apic_mesh_exclusive_metadata, devices=devices)
 add_function_test(TestApicMesh, "test_apic_mesh_eval_position", test_apic_mesh_eval_position, devices=devices)
 add_function_test(
     TestApicMesh, "test_apic_mesh_combined_operations", test_apic_mesh_combined_operations, devices=devices

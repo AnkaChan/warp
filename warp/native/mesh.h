@@ -542,14 +542,14 @@ mesh_query_point_no_sign(uint64_t id, const vec3& point, float max_dist, int& fa
             const int end = right_index;
             // loops through primitives in the leaf
             for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
-                int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                int i = mesh.indices[primitive_index * 3 + 0];
-                int j = mesh.indices[primitive_index * 3 + 1];
-                int k = mesh.indices[primitive_index * 3 + 2];
+                const int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
+                const int i = bvh_load_int(mesh.indices, primitive_index * 3 + 0);
+                const int j = bvh_load_int(mesh.indices, primitive_index * 3 + 1);
+                const int k = bvh_load_int(mesh.indices, primitive_index * 3 + 2);
 
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
+                const vec3 p = bvh_load_vec3(mesh.points, i);
+                const vec3 q = bvh_load_vec3(mesh.points, j);
+                const vec3 r = bvh_load_vec3(mesh.points, k);
                 vec3 e0 = q - p;
                 vec3 e1 = r - p;
                 vec3 e2 = r - q;
@@ -669,6 +669,376 @@ mesh_query_point_no_sign(uint64_t id, const vec3& point, float max_dist, int& fa
     } else {
         return false;
     }
+}
+
+CUDA_CALLABLE inline void mesh_query_point_no_sign_update_primitive(
+    const Mesh& mesh,
+    int primitive_index,
+    const vec3& point,
+    float& min_dist_sq,
+    int& min_face,
+    float& min_v,
+    float& min_w
+)
+{
+    const int i = bvh_load_int(mesh.indices, primitive_index * 3 + 0);
+    const int j = bvh_load_int(mesh.indices, primitive_index * 3 + 1);
+    const int k = bvh_load_int(mesh.indices, primitive_index * 3 + 2);
+
+    const vec3 p = bvh_load_vec3(mesh.points, i);
+    const vec3 q = bvh_load_vec3(mesh.points, j);
+    const vec3 r = bvh_load_vec3(mesh.points, k);
+    vec3 e0 = q - p;
+    vec3 e1 = r - p;
+    vec3 e2 = r - q;
+    vec3 normal = cross(e0, e1);
+
+    // Match mesh_query_point_no_sign() by ignoring sliver triangles. Keep the
+    // same arithmetic as the stock query: squaring this comparison can
+    // overflow for large but otherwise valid triangles.
+    if (length(normal) / (dot(e0, e0) + dot(e1, e1) + dot(e2, e2)) < 1.e-6f)
+        return;
+
+    vec2 barycentric = closest_point_to_triangle(p, q, r, point);
+    float triangle_u = barycentric[0];
+    float triangle_v = barycentric[1];
+    float triangle_w = 1.f - triangle_u - triangle_v;
+    vec3 closest = triangle_u * p + triangle_v * q + triangle_w * r;
+
+    float dist_sq = length_sq(closest - point);
+
+    if (dist_sq < min_dist_sq) {
+        min_dist_sq = dist_sq;
+        min_v = triangle_v;
+        min_w = triangle_w;
+        min_face = primitive_index;
+    }
+}
+
+CUDA_CALLABLE inline void mesh_query_point_no_sign_update_leaf(
+    const Mesh& mesh,
+    int start,
+    int end,
+    const vec3& point,
+    float& min_dist_sq,
+    int& min_face,
+    float& min_v,
+    float& min_w
+)
+{
+    for (int primitive_counter = start; primitive_counter < end; ++primitive_counter) {
+        const int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
+        mesh_query_point_no_sign_update_primitive(mesh, primitive_index, point, min_dist_sq, min_face, min_v, min_w);
+    }
+}
+
+template <bool TestStartNode, bool SkipLeaf>
+CUDA_CALLABLE inline void mesh_query_point_no_sign_traverse(
+    const Mesh& mesh,
+    int start_node,
+    int skip_leaf,
+    const vec3& point,
+    float& min_dist_sq,
+    int& min_face,
+    float& min_v,
+    float& min_w
+)
+{
+    int stack[BVH_QUERY_STACK_SIZE];
+    int count = 0;
+
+    const BVHPackedNodeHalf start_lower = bvh_load_node(mesh.bvh.node_lowers, start_node);
+    const BVHPackedNodeHalf start_upper = bvh_load_node(mesh.bvh.node_uppers, start_node);
+    if (TestStartNode
+        && distance_to_aabb_sq(
+               point, reinterpret_cast<const vec3&>(start_lower), reinterpret_cast<const vec3&>(start_upper)
+           ) > min_dist_sq) {
+        return;
+    }
+
+    uint64_t node = bvh_query_node_pack(start_lower, start_upper);
+    bool have_node = true;
+
+    // Carry the near child in registers and store only far-child indices.
+    // Popped far children are re-tested against the current shrinking radius;
+    // the packed leaf payload is passed through without reloading the leaf.
+    while (have_node || count) {
+        if (!have_node) {
+            const int node_index = stack[--count];
+            const BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
+            const BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
+
+            const float node_dist_sq = distance_to_aabb_sq(
+                point, reinterpret_cast<const vec3&>(lower), reinterpret_cast<const vec3&>(upper)
+            );
+            if (node_dist_sq > min_dist_sq)
+                continue;
+
+            node = bvh_query_node_pack(lower, upper);
+        }
+        have_node = false;
+
+        if (bvh_query_node_is_leaf(node)) {
+            mesh_query_point_no_sign_update_leaf(
+                mesh, bvh_query_node_lower_payload(node), bvh_query_node_upper_payload(node), point, min_dist_sq,
+                min_face, min_v, min_w
+            );
+            continue;
+        }
+
+        const int left_index = bvh_query_node_lower_payload(node);
+        const int right_index = bvh_query_node_upper_payload(node);
+        const BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
+        const BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
+        const BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
+        const BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
+
+        const float left_dist_sq = distance_to_aabb_sq(
+            point, reinterpret_cast<const vec3&>(left_lower), reinterpret_cast<const vec3&>(left_upper)
+        );
+        const float right_dist_sq = distance_to_aabb_sq(
+            point, reinterpret_cast<const vec3&>(right_lower), reinterpret_cast<const vec3&>(right_upper)
+        );
+
+        // Ties visit the right child first, matching the existing traversal.
+        if (left_dist_sq < right_dist_sq) {
+            if (right_dist_sq < min_dist_sq && (!SkipLeaf || right_index != skip_leaf))
+                stack[count++] = right_index;
+            if (left_dist_sq < min_dist_sq && (!SkipLeaf || left_index != skip_leaf)) {
+                node = bvh_query_node_pack(left_lower, left_upper);
+                have_node = true;
+            }
+        } else {
+            if (left_dist_sq < min_dist_sq && (!SkipLeaf || left_index != skip_leaf))
+                stack[count++] = left_index;
+            if (right_dist_sq < min_dist_sq && (!SkipLeaf || right_index != skip_leaf)) {
+                node = bvh_query_node_pack(right_lower, right_upper);
+                have_node = true;
+            }
+        }
+    }
+}
+
+CUDA_CALLABLE inline int mesh_query_point_no_sign_initialize_seed_leaf(
+    const Mesh& mesh, int seed_face, const vec3& point, float& min_dist_sq, int& min_face, float& min_v, float& min_w
+)
+{
+    if (seed_face < 0 || seed_face >= mesh.num_tris)
+        return -1;
+
+    const int seed_leaf = bvh_get_primitive_leaf(mesh.bvh, seed_face);
+    if (seed_leaf < 0 || seed_leaf >= mesh.bvh.num_nodes)
+        return -1;
+
+    const BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, seed_leaf);
+    if (!lower.b)
+        return -1;
+
+    const BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, seed_leaf);
+    const int start = int(lower.i);
+    const int end = int(upper.i);
+    if (end - start == 1) {
+        mesh_query_point_no_sign_update_primitive(mesh, seed_face, point, min_dist_sq, min_face, min_v, min_w);
+    } else {
+        for (int primitive_counter = start; primitive_counter < end; ++primitive_counter) {
+            const int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
+            mesh_query_point_no_sign_update_primitive(
+                mesh, primitive_index, point, min_dist_sq, min_face, min_v, min_w
+            );
+        }
+    }
+    return seed_leaf;
+}
+
+CUDA_CALLABLE inline bool
+mesh_query_point_no_sign_exclusive_contains_distance(const BVHExclusiveNode& node, const vec3& point, float distance_sq)
+{
+    // A radius-r sphere lies strictly inside the exclusive box exactly when
+    // r is smaller than all six point-to-plane margins. The minimum of the
+    // rounded float differences is monotone; stepping that minimum down by
+    // one representable value therefore cannot enlarge the exact margin.
+    // Squaring a binary32 value is exact in binary64, so the final strict
+    // comparison stays conservative without a square root.
+    union FloatBits {
+        float f;
+        uint32_t u;
+    };
+
+    const float margin_0 = point[0] - node.lower_x;
+    const float margin_1 = point[1] - node.lower_y;
+    const float margin_2 = point[2] - node.lower_z;
+    const float margin_3 = node.upper_x - point[0];
+    const float margin_4 = node.upper_y - point[1];
+    const float margin_5 = node.upper_z - point[2];
+    if (!(distance_sq >= 0.0f && margin_0 > 0.0f && margin_1 > 0.0f && margin_2 > 0.0f && margin_3 > 0.0f
+          && margin_4 > 0.0f && margin_5 > 0.0f))
+        return false;
+
+    FloatBits margin;
+    margin.f = min(min(min(margin_0, margin_1), min(margin_2, margin_3)), min(margin_4, margin_5));
+    margin.u--;
+    const double margin_d = double(margin.f);
+    return double(distance_sq) < margin_d * margin_d;
+}
+
+// Revalidate a candidate containment node against the current Exclusive BVH.
+// A cached node may be stale after a refit or rebuild, so every record and
+// parent index is range-checked before it is read. Only current strict sphere
+// containment is accepted as a traversal certificate.
+CUDA_CALLABLE inline int mesh_query_point_no_sign_find_exclusive_containment(
+    const Mesh& mesh, const vec3& point, float distance_sq, int candidate_node
+)
+{
+    if (!bvh_has_exclusive(mesh.bvh) || candidate_node < 0 || candidate_node >= mesh.bvh.num_nodes)
+        return *mesh.bvh.root;
+
+    int node_index = candidate_node;
+    while (node_index >= 0 && node_index < mesh.bvh.num_nodes) {
+        const BVHExclusiveNode exclusive_node = bvh_get_exclusive_node(mesh.bvh, node_index);
+        if (bvh_exclusive_node_depth(exclusive_node) >= 0
+            && mesh_query_point_no_sign_exclusive_contains_distance(exclusive_node, point, distance_sq))
+            return node_index;
+
+        const int parent = bvh_exclusive_node_parent(exclusive_node);
+        if (parent == -1)
+            break;
+        if (parent < 0 || parent >= mesh.bvh.num_nodes)
+            return *mesh.bvh.root;
+        node_index = parent;
+    }
+    return *mesh.bvh.root;
+}
+
+CUDA_CALLABLE inline bool mesh_query_point_no_sign_finish(
+    float min_dist_sq,
+    float max_dist_sq,
+    const int& min_face,
+    const float& min_v,
+    const float& min_w,
+    int& face,
+    float& u,
+    float& v
+)
+{
+    if (min_dist_sq < max_dist_sq) {
+        u = 1.0f - min_v - min_w;
+        v = min_v;
+        face = min_face;
+        return true;
+    }
+    return false;
+}
+
+// Returns true if there is a point (strictly) < distance max_dist. The exact
+// triangles in seed_face's packed leaf initialize the branch-and-bound radius.
+CUDA_CALLABLE inline bool mesh_query_point_no_sign_seeded(
+    uint64_t id, const vec3& point, float max_dist, int seed_face, int& face, float& u, float& v
+)
+{
+    Mesh mesh = mesh_get(id);
+    const float max_dist_sq = max_dist * max_dist;
+    float min_dist_sq = max_dist_sq;
+    int min_face;
+    float min_v;
+    float min_w;
+
+    const int seed_leaf
+        = mesh_query_point_no_sign_initialize_seed_leaf(mesh, seed_face, point, min_dist_sq, min_face, min_v, min_w);
+    if (seed_leaf == -1)
+        return mesh_query_point_no_sign(id, point, max_dist, face, u, v);
+
+    const int root = *mesh.bvh.root;
+    if (root != seed_leaf)
+        mesh_query_point_no_sign_traverse<false, true>(
+            mesh, root, seed_leaf, point, min_dist_sq, min_face, min_v, min_w
+        );
+
+    return mesh_query_point_no_sign_finish(min_dist_sq, max_dist_sq, min_face, min_v, min_w, face, u, v);
+}
+
+// Returns true if there is a point (strictly) < distance max_dist. The exact
+// seed-leaf result defines a shrinking sphere; strict containment by an
+// exclusive box certifies that traversal may begin at that box's node.
+CUDA_CALLABLE inline bool mesh_query_point_no_sign_exclusive(
+    uint64_t id, const vec3& point, float max_dist, int seed_face, int& face, float& u, float& v
+)
+{
+    Mesh mesh = mesh_get(id);
+    const float max_dist_sq = max_dist * max_dist;
+    float min_dist_sq = max_dist_sq;
+    int min_face;
+    float min_v;
+    float min_w;
+
+    // Packed leaves may hold more than the seed face. Every primitive must be
+    // tested to obtain the tightest exact upper bound for both leaf_size=1 and
+    // larger leaves.
+    const int seed_leaf
+        = mesh_query_point_no_sign_initialize_seed_leaf(mesh, seed_face, point, min_dist_sq, min_face, min_v, min_w);
+    if (seed_leaf == -1)
+        return mesh_query_point_no_sign(id, point, max_dist, face, u, v);
+
+    const int start_node = mesh_query_point_no_sign_find_exclusive_containment(mesh, point, min_dist_sq, seed_leaf);
+
+    if (start_node != seed_leaf)
+        mesh_query_point_no_sign_traverse<false, true>(
+            mesh, start_node, seed_leaf, point, min_dist_sq, min_face, min_v, min_w
+        );
+
+    return mesh_query_point_no_sign_finish(min_dist_sq, max_dist_sq, min_face, min_v, min_w, face, u, v);
+}
+
+// Return the current Exclusive BVH node that certifies a seed-leaf exact
+// distance bound. The global root is the safe result for invalid seeds or
+// meshes without Exclusive BVH metadata.
+CUDA_CALLABLE inline int
+mesh_query_point_no_sign_exclusive_node(uint64_t id, const vec3& point, float max_dist, int seed_face)
+{
+    const Mesh mesh = mesh_get(id);
+    const int root = *mesh.bvh.root;
+    if (!bvh_has_exclusive(mesh.bvh))
+        return root;
+
+    float min_dist_sq = max_dist * max_dist;
+    int min_face;
+    float min_v;
+    float min_w;
+    const int seed_leaf
+        = mesh_query_point_no_sign_initialize_seed_leaf(mesh, seed_face, point, min_dist_sq, min_face, min_v, min_w);
+    if (seed_leaf == -1)
+        return root;
+
+    return mesh_query_point_no_sign_find_exclusive_containment(mesh, point, min_dist_sq, seed_leaf);
+}
+
+// Reuse a previously certified node while preserving correctness across
+// refits and rebuilds. The candidate is accepted only when its current
+// exclusive box strictly contains the exact seed-leaf distance sphere;
+// otherwise its current parent chain is searched and traversal falls back to
+// the root.
+CUDA_CALLABLE inline bool mesh_query_point_no_sign_exclusive_cached(
+    uint64_t id, const vec3& point, float max_dist, int seed_face, int cached_node, int& face, float& u, float& v
+)
+{
+    const Mesh mesh = mesh_get(id);
+    const float max_dist_sq = max_dist * max_dist;
+    float min_dist_sq = max_dist_sq;
+    int min_face;
+    float min_v;
+    float min_w;
+
+    const int seed_leaf
+        = mesh_query_point_no_sign_initialize_seed_leaf(mesh, seed_face, point, min_dist_sq, min_face, min_v, min_w);
+    if (seed_leaf == -1)
+        return mesh_query_point_no_sign(id, point, max_dist, face, u, v);
+
+    const int start_node = mesh_query_point_no_sign_find_exclusive_containment(mesh, point, min_dist_sq, cached_node);
+    if (start_node != seed_leaf)
+        mesh_query_point_no_sign_traverse<false, true>(
+            mesh, start_node, seed_leaf, point, min_dist_sq, min_face, min_v, min_w
+        );
+
+    return mesh_query_point_no_sign_finish(min_dist_sq, max_dist_sq, min_face, min_v, min_w, face, u, v);
 }
 
 // returns true if there is a point (strictly) > distance min_dist
@@ -1392,6 +1762,77 @@ CUDA_CALLABLE inline void adj_mesh_query_point_no_sign(
     adj_closest_point_to_triangle(p, q, r, point, adj_p, adj_q, adj_r, adj_point, adj_uv);
 }
 
+CUDA_CALLABLE inline void adj_mesh_query_point_no_sign_seeded(
+    uint64_t id,
+    const vec3& point,
+    float max_dist,
+    int seed_face,
+    const int& face,
+    const float& u,
+    const float& v,
+    uint64_t adj_id,
+    vec3& adj_point,
+    float& adj_max_dist,
+    int& adj_seed_face,
+    int& adj_face,
+    float& adj_u,
+    float& adj_v,
+    bool& adj_ret
+)
+{
+    adj_mesh_query_point_no_sign(
+        id, point, max_dist, face, u, v, adj_id, adj_point, adj_max_dist, adj_face, adj_u, adj_v, adj_ret
+    );
+}
+
+CUDA_CALLABLE inline void adj_mesh_query_point_no_sign_exclusive(
+    uint64_t id,
+    const vec3& point,
+    float max_dist,
+    int seed_face,
+    const int& face,
+    const float& u,
+    const float& v,
+    uint64_t adj_id,
+    vec3& adj_point,
+    float& adj_max_dist,
+    int& adj_seed_face,
+    int& adj_face,
+    float& adj_u,
+    float& adj_v,
+    bool& adj_ret
+)
+{
+    adj_mesh_query_point_no_sign(
+        id, point, max_dist, face, u, v, adj_id, adj_point, adj_max_dist, adj_face, adj_u, adj_v, adj_ret
+    );
+}
+
+CUDA_CALLABLE inline void adj_mesh_query_point_no_sign_exclusive_cached(
+    uint64_t id,
+    const vec3& point,
+    float max_dist,
+    int seed_face,
+    int cached_node,
+    const int& face,
+    const float& u,
+    const float& v,
+    uint64_t adj_id,
+    vec3& adj_point,
+    float& adj_max_dist,
+    int& adj_seed_face,
+    int& adj_cached_node,
+    int& adj_face,
+    float& adj_u,
+    float& adj_v,
+    bool& adj_ret
+)
+{
+    adj_mesh_query_point_no_sign(
+        id, point, max_dist, face, u, v, adj_id, adj_point, adj_max_dist, adj_face, adj_u, adj_v, adj_ret
+    );
+}
+
 CUDA_CALLABLE inline void adj_mesh_query_furthest_point_no_sign(
     uint64_t id,
     const vec3& point,
@@ -1604,6 +2045,36 @@ CUDA_CALLABLE inline mesh_query_point_t mesh_query_point_no_sign(uint64_t id, co
 }
 
 CUDA_CALLABLE inline mesh_query_point_t
+mesh_query_point_no_sign_seeded(uint64_t id, const vec3& point, float max_dist, int seed_face)
+{
+    mesh_query_point_t query;
+    query.sign = 0.0;
+    query.result = mesh_query_point_no_sign_seeded(id, point, max_dist, seed_face, query.face, query.u, query.v);
+    return query;
+}
+
+CUDA_CALLABLE inline mesh_query_point_t
+mesh_query_point_no_sign_exclusive(uint64_t id, const vec3& point, float max_dist, int seed_face)
+{
+    mesh_query_point_t query;
+    query.sign = 0.0;
+    query.result = mesh_query_point_no_sign_exclusive(id, point, max_dist, seed_face, query.face, query.u, query.v);
+    return query;
+}
+
+CUDA_CALLABLE inline mesh_query_point_t mesh_query_point_no_sign_exclusive_cached(
+    uint64_t id, const vec3& point, float max_dist, int seed_face, int cached_node
+)
+{
+    mesh_query_point_t query;
+    query.sign = 0.0;
+    query.result = mesh_query_point_no_sign_exclusive_cached(
+        id, point, max_dist, seed_face, cached_node, query.face, query.u, query.v
+    );
+    return query;
+}
+
+CUDA_CALLABLE inline mesh_query_point_t
 mesh_query_furthest_point_no_sign(uint64_t id, const vec3& point, float min_dist)
 {
     mesh_query_point_t query;
@@ -1667,6 +2138,65 @@ CUDA_CALLABLE inline void adj_mesh_query_point_no_sign(
     adj_mesh_query_point_no_sign(
         id, point, max_dist, ret.face, ret.u, ret.v, adj_id, adj_point, adj_max_dist, adj_ret.face, adj_ret.u,
         adj_ret.v, adj_ret.result
+    );
+}
+
+CUDA_CALLABLE inline void adj_mesh_query_point_no_sign_seeded(
+    uint64_t id,
+    const vec3& point,
+    float max_dist,
+    int seed_face,
+    const mesh_query_point_t& ret,
+    uint64_t adj_id,
+    vec3& adj_point,
+    float& adj_max_dist,
+    int& adj_seed_face,
+    mesh_query_point_t& adj_ret
+)
+{
+    adj_mesh_query_point_no_sign_seeded(
+        id, point, max_dist, seed_face, ret.face, ret.u, ret.v, adj_id, adj_point, adj_max_dist, adj_seed_face,
+        adj_ret.face, adj_ret.u, adj_ret.v, adj_ret.result
+    );
+}
+
+CUDA_CALLABLE inline void adj_mesh_query_point_no_sign_exclusive(
+    uint64_t id,
+    const vec3& point,
+    float max_dist,
+    int seed_face,
+    const mesh_query_point_t& ret,
+    uint64_t adj_id,
+    vec3& adj_point,
+    float& adj_max_dist,
+    int& adj_seed_face,
+    mesh_query_point_t& adj_ret
+)
+{
+    adj_mesh_query_point_no_sign_exclusive(
+        id, point, max_dist, seed_face, ret.face, ret.u, ret.v, adj_id, adj_point, adj_max_dist, adj_seed_face,
+        adj_ret.face, adj_ret.u, adj_ret.v, adj_ret.result
+    );
+}
+
+CUDA_CALLABLE inline void adj_mesh_query_point_no_sign_exclusive_cached(
+    uint64_t id,
+    const vec3& point,
+    float max_dist,
+    int seed_face,
+    int cached_node,
+    const mesh_query_point_t& ret,
+    uint64_t adj_id,
+    vec3& adj_point,
+    float& adj_max_dist,
+    int& adj_seed_face,
+    int& adj_cached_node,
+    mesh_query_point_t& adj_ret
+)
+{
+    adj_mesh_query_point_no_sign_exclusive_cached(
+        id, point, max_dist, seed_face, cached_node, ret.face, ret.u, ret.v, adj_id, adj_point, adj_max_dist,
+        adj_seed_face, adj_cached_node, adj_ret.face, adj_ret.u, adj_ret.v, adj_ret.result
     );
 }
 
@@ -2396,8 +2926,12 @@ struct mesh_query_aabb_t {
         , count(0)
         , input_lower()
         , input_upper()
+        , prim_cur(0)
+        , prim_end(0)
+        , cur_node(0)
+        , have_node(false)
+        , pair_limit(-1)
         , face(0)
-        , primitive_counter(-1)
         , last_query_valid(true)
     {
     }
@@ -2405,9 +2939,13 @@ struct mesh_query_aabb_t {
     // Required for adjoint computations.
     CUDA_CALLABLE inline mesh_query_aabb_t& operator+=(const mesh_query_aabb_t& other) { return *this; }
 
-    // Mesh Id
+    // Mesh ID
     Mesh mesh;
-    // BVH traversal stack:
+
+    // BVH traversal stack of node indices; every entry passed its AABB test
+    // before being pushed.
+    // On CUDA the stack lives in shared memory: keeping an array out of this
+    // struct lets the compiler keep the remaining members in registers.
 #if BVH_SHARED_STACK
     bvh_stack_t stack;
 #else
@@ -2420,8 +2958,20 @@ struct mesh_query_aabb_t {
     wp::vec3 input_lower;
     wp::vec3 input_upper;
 
-    // >= 0 if currently in a packed leaf node
-    int primitive_counter;
+    // primitive range of the packed leaf currently being enumerated;
+    // when prim_cur < prim_end the query resumes mid-leaf on the next
+    // mesh_query_aabb_next() call
+    int prim_cur;
+    int prim_end;
+
+    // packed payload (see bvh_query_node_pack()) of the node to process next,
+    // valid when have_node is set; it already passed its AABB test
+    uint64_t cur_node;
+    bool have_node;
+
+    // stack occupancy up to which far children may be pushed as two-slot
+    // payload pairs (see bvh_query_pair_limit())
+    int pair_limit;
 
     // Face
     int face;
@@ -2435,9 +2985,6 @@ struct mesh_query_aabb_t {
 
 CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper)
 {
-    // This routine traverses the BVH tree until it finds
-    // the first triangle with an overlapping bvh.
-
     // initialize empty
     mesh_query_aabb_t query;
     query.face = -1;
@@ -2450,41 +2997,22 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& 
     query.stack.ptr = &stack[threadIdx.x];
 #endif
 
-    query.stack[0] = *mesh.bvh.root;
-    query.count = 1;
     query.input_lower = lower;
     query.input_upper = upper;
 
-    // Navigate through the bvh, find the first overlapping leaf node.
-    while (query.count) {
-        const int nodeIndex = query.stack[--query.count];
-        BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
-        BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
+    query.pair_limit = bvh_query_pair_limit(mesh.bvh);
 
-        if (query.primitive_counter == 0) {
-            if (!intersect_aabb_aabb(
-                    query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
-                    reinterpret_cast<vec3&>(node_upper)
-                )) {
-                // Skip this box, it doesn't overlap with our target box.
-                continue;
-            }
-        }
+    // Both stack entries and cur_node must have passed their AABB test
+    // already, so test the root here.
+    const int root_index = *mesh.bvh.root;
+    const BVHPackedNodeHalf root_lower = bvh_load_node(mesh.bvh.node_lowers, root_index);
+    const BVHPackedNodeHalf root_upper = bvh_load_node(mesh.bvh.node_uppers, root_index);
 
-        const int left_index = node_lower.i;
-        const int right_index = node_upper.i;
-
-        // Make bounds from this AABB
-        if (node_lower.b) {
-            // Reached a leaf node, point to its first primitive
-            // Back up one level and return
-            query.primitive_counter = 0;
-            query.stack[query.count++] = nodeIndex;
-            return query;
-        } else {
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
-        }
+    if (intersect_aabb_aabb(
+            lower, upper, reinterpret_cast<const vec3&>(root_lower), reinterpret_cast<const vec3&>(root_upper)
+        )) {
+        query.cur_node = bvh_query_node_pack(root_lower, root_upper);
+        query.have_node = true;
     }
 
     return query;
@@ -2492,64 +3020,100 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_aabb(uint64_t id, const vec3& 
 
 CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& index)
 {
-    Mesh mesh = query.mesh;
+    const Mesh mesh = query.mesh;
 
-    // Navigate through the bvh, find the first overlapping leaf node.
-    while (query.count) {
-        const int node_index = query.stack[--query.count];
-        BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
-        BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
+    // A single flat loop; every iteration either emits one primitive from
+    // the packed leaf currently being enumerated, or processes one node.
+    for (;;) {
+        if (query.prim_cur < query.prim_end) {
+            const int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, query.prim_cur++);
 
-        if (!intersect_aabb_aabb(
-                query.input_lower, query.input_upper, reinterpret_cast<vec3&>(node_lower),
-                reinterpret_cast<vec3&>(node_upper)
-            )) {
-            // Skip this box, it doesn't overlap with our target box.
-            continue;
-        }
+            // Load the face bounds eagerly so the test below compiles to one
+            // predicate chain instead of a branch per component.
+            const vec3 face_lower = bvh_load_vec3(mesh.lowers, primitive_index);
+            const vec3 face_upper = bvh_load_vec3(mesh.uppers, primitive_index);
 
-        const int left_index = node_lower.i;
-        const int right_index = node_upper.i;
-
-        // Make bounds from this AABB
-        if (node_lower.b) {
-            // found leaf, loop through its content primitives
-            const int start = left_index;
-            const int end = right_index;
-
-            if (end - start == 1) {
-                int primitive_index = mesh.bvh.primitive_indices[start];
+            if (intersect_aabb_aabb(query.input_lower, query.input_upper, face_lower, face_upper)) {
                 index = primitive_index;
                 query.face = primitive_index;
                 return true;
+            }
+            continue;
+        }
+
+        if (!query.have_node) {
+            if (!query.count)
+                return false;
+
+            const unsigned top = unsigned(query.stack[--query.count]);
+            if (top & 0x80000000u) {
+                // Payload pair: reconstruct the node without any memory access.
+                query.cur_node = bvh_query_stack_unpack(unsigned(query.stack[--query.count]), top);
             } else {
-                int primitive_index = mesh.bvh.primitive_indices[start + (query.primitive_counter++)];
-                // if already visited the last primitive in the leaf node
-                // move to the next node and reset the primitive counter to 0
-                if (start + query.primitive_counter == end) {
-                    query.primitive_counter = 0;
-                }
-                // otherwise we need to keep this leaf node in stack for a future visit
-                else {
-                    query.count++;
-                }
+                // Index entry: it already passed its AABB test, so the AABB
+                // part of this load is unused and no re-test is needed.
+                query.cur_node = bvh_query_node_load(mesh.bvh, int(top));
+            }
+        }
 
-                if (intersect_aabb_aabb(
-                        query.input_lower, query.input_upper, mesh.lowers[primitive_index], mesh.uppers[primitive_index]
-                    )) {
-                    index = primitive_index;
-                    query.face = primitive_index;
+        const uint64_t node = query.cur_node;
+        query.have_node = false;
 
-                    return true;
+        if (bvh_query_node_is_leaf(node)) {
+            const int start = bvh_query_node_lower_payload(node);
+            const int end = bvh_query_node_upper_payload(node);
+
+            // Fast path when the leaf contains exactly one primitive: its
+            // AABB is the leaf node's AABB, which already passed its test.
+            if (end - start == 1) {
+                const int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, start);
+                index = primitive_index;
+                query.face = primitive_index;
+                return true;
+            }
+
+            // Packed leaf: enumerate its primitives one per loop iteration,
+            // without re-loading the leaf node.
+            query.prim_cur = start;
+            query.prim_end = end;
+            continue;
+        }
+
+        const int left_index = bvh_query_node_lower_payload(node);
+        const int right_index = bvh_query_node_upper_payload(node);
+
+        const BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
+        const BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
+        const BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
+        const BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
+
+        const bool hit_left = intersect_aabb_aabb(
+            query.input_lower, query.input_upper, reinterpret_cast<const vec3&>(left_lower),
+            reinterpret_cast<const vec3&>(left_upper)
+        );
+        const bool hit_right = intersect_aabb_aabb(
+            query.input_lower, query.input_upper, reinterpret_cast<const vec3&>(right_lower),
+            reinterpret_cast<const vec3&>(right_upper)
+        );
+
+        if (hit_left) {
+            query.cur_node = bvh_query_node_pack(left_lower, left_upper);
+            query.have_node = true;
+            if (hit_right) {
+                // Pair pushes stop at pair_limit so slot usage cannot exceed
+                // the stack for constructor-produced trees.
+                if (query.count <= query.pair_limit) {
+                    query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
+                    query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
+                } else if (query.count < BVH_QUERY_STACK_SIZE) {
+                    query.stack[query.count++] = right_index;
                 }
             }
-        } else {
-            query.primitive_counter = 0;
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
+        } else if (hit_right) {
+            query.cur_node = bvh_query_node_pack(right_lower, right_upper);
+            query.have_node = true;
         }
     }
-    return false;
 }
 
 

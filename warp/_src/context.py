@@ -6191,6 +6191,17 @@ class Runtime:
                 ctypes.c_int,
             ]
 
+            self.core.wp_bvh_create_host_ex.restype = ctypes.c_uint64
+            self.core.wp_bvh_create_host_ex.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+
             self.core.wp_bvh_create_device.restype = ctypes.c_uint64
             self.core.wp_bvh_create_device.argtypes = [
                 ctypes.c_void_p,
@@ -6199,6 +6210,18 @@ class Runtime:
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+
+            self.core.wp_bvh_create_device_ex.restype = ctypes.c_uint64
+            self.core.wp_bvh_create_device_ex.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_int,
                 ctypes.c_int,
             ]
 
@@ -6223,6 +6246,20 @@ class Runtime:
                 ctypes.c_int,
             ]
 
+            self.core.wp_mesh_create_host_ex.restype = ctypes.c_uint64
+            self.core.wp_mesh_create_host_ex.argtypes = [
+                warp._src.types.array_t,
+                warp._src.types.array_t,
+                warp._src.types.array_t,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+
             self.core.wp_mesh_create_device.restype = ctypes.c_uint64
             self.core.wp_mesh_create_device.argtypes = [
                 ctypes.c_void_p,
@@ -6234,6 +6271,21 @@ class Runtime:
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+
+            self.core.wp_mesh_create_device_ex.restype = ctypes.c_uint64
+            self.core.wp_mesh_create_device_ex.argtypes = [
+                ctypes.c_void_p,
+                warp._src.types.array_t,
+                warp._src.types.array_t,
+                warp._src.types.array_t,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_int,
                 ctypes.c_int,
             ]
 

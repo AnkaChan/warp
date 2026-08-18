@@ -37,6 +37,53 @@ NUM_MESHES = 10
 seed = 42
 
 
+def _verify_closest_query_results(reference, result, label):
+    reference_np = reference.numpy()
+    result_np = result.numpy()
+    np.testing.assert_array_equal(reference_np[:, 0], result_np[:, 0], err_msg=f"{label} face mismatch")
+    np.testing.assert_allclose(
+        reference_np[:, 1:],
+        result_np[:, 1:],
+        rtol=0.0,
+        atol=1.0e-6,
+        err_msg=f"{label} barycentric mismatch",
+    )
+
+
+def _verify_aabb_query_results(
+    reference_counts,
+    reference_pairs,
+    result_counts,
+    result_pairs,
+    buffer_size,
+    label,
+):
+    reference_counts_np = reference_counts.numpy()
+    result_counts_np = result_counts.numpy()
+    np.testing.assert_array_equal(reference_counts_np, result_counts_np, err_msg=f"{label} count mismatch")
+
+    max_count = int(reference_counts_np.max())
+    if max_count > buffer_size:
+        raise AssertionError(
+            f"{label} requires {max_count} stored primitive IDs per query, but the validation buffer holds "
+            f"only {buffer_size}"
+        )
+
+    # Compare every primitive ID as a set because a valid traversal may
+    # enumerate hits in a different order.
+    reference_primitive_ids = reference_pairs.numpy().reshape((-1, buffer_size, 2))[:, :, 1]
+    result_primitive_ids = result_pairs.numpy().reshape((-1, buffer_size, 2))[:, :, 1]
+    valid = np.arange(buffer_size)[None, :] < np.minimum(reference_counts_np[:, None], buffer_size)
+    sentinel = np.iinfo(np.int32).min
+    reference_primitive_ids = np.sort(np.where(valid, reference_primitive_ids, sentinel), axis=1)
+    result_primitive_ids = np.sort(np.where(valid, result_primitive_ids, sentinel), axis=1)
+    np.testing.assert_array_equal(
+        reference_primitive_ids,
+        result_primitive_ids,
+        err_msg=f"{label} stored primitive mismatch",
+    )
+
+
 @wp.kernel
 def sample_mesh_query_no_sign(
     mesh: wp.uint64,
@@ -47,6 +94,101 @@ def sample_mesh_query_no_sign(
     tid = wp.tid()
     p = query_points[tid]
     query = wp.mesh_query_point_no_sign(mesh, p, query_d_max)
+
+    if query.result:
+        face = query.face
+        cp = wp.vec3(float(face), query.u, query.v)
+        query_closest_points[tid] = cp
+
+
+@wp.kernel
+def sample_mesh_query_no_sign_seed_faces(
+    mesh: wp.uint64,
+    query_points: wp.array(dtype=wp.vec3),
+    query_d_max: float,
+    query_seed_faces: wp.array(dtype=wp.int32),
+):
+    tid = wp.tid()
+    p = query_points[tid]
+    query = wp.mesh_query_point_no_sign(mesh, p, query_d_max)
+
+    if query.result:
+        query_seed_faces[tid] = query.face
+    else:
+        query_seed_faces[tid] = 0
+
+
+@wp.kernel
+def sample_mesh_query_no_sign_seeded(
+    mesh: wp.uint64,
+    query_points: wp.array(dtype=wp.vec3),
+    query_d_max: float,
+    query_seed_faces: wp.array(dtype=wp.int32),
+    query_closest_points: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    p = query_points[tid]
+    query = wp.mesh_query_point_no_sign_seeded(mesh, p, query_d_max, query_seed_faces[tid])
+
+    if query.result:
+        face = query.face
+        cp = wp.vec3(float(face), query.u, query.v)
+        query_closest_points[tid] = cp
+
+
+@wp.kernel
+def sample_mesh_query_no_sign_exclusive(
+    mesh: wp.uint64,
+    query_points: wp.array(dtype=wp.vec3),
+    query_d_max: float,
+    query_seed_faces: wp.array(dtype=wp.int32),
+    query_closest_points: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    p = query_points[tid]
+    query = wp.mesh_query_point_no_sign_exclusive(mesh, p, query_d_max, query_seed_faces[tid])
+
+    if query.result:
+        face = query.face
+        cp = wp.vec3(float(face), query.u, query.v)
+        query_closest_points[tid] = cp
+
+
+@wp.kernel
+def sample_mesh_query_no_sign_exclusive_nodes(
+    mesh: wp.uint64,
+    query_points: wp.array(dtype=wp.vec3),
+    query_d_max: float,
+    query_seed_faces: wp.array(dtype=wp.int32),
+    query_cached_nodes: wp.array(dtype=wp.int32),
+):
+    tid = wp.tid()
+    query_cached_nodes[tid] = wp.mesh_query_point_no_sign_exclusive_node(
+        mesh,
+        query_points[tid],
+        query_d_max,
+        query_seed_faces[tid],
+    )
+
+
+@wp.kernel
+def sample_mesh_query_no_sign_exclusive_cached(
+    mesh: wp.uint64,
+    query_points: wp.array(dtype=wp.vec3),
+    query_d_max: float,
+    query_seed_faces: wp.array(dtype=wp.int32),
+    query_cached_nodes: wp.array(dtype=wp.int32),
+    query_closest_points: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    p = query_points[tid]
+    query = wp.mesh_query_point_no_sign_exclusive_cached(
+        mesh,
+        p,
+        query_d_max,
+        query_seed_faces[tid],
+        query_cached_nodes[tid],
+    )
 
     if query.result:
         face = query.face
@@ -100,25 +242,55 @@ class MeshQuery:
         )
         self.query_points = wp.array(query_points_np, dtype=wp.vec3, device=self.device)
 
-        # create wp mesh
-        if leaf_size == 0:
-            self.mesh = wp.Mesh(
-                points=wp.array(points, dtype=wp.vec3, device=self.device),
-                velocities=None,
-                indices=wp.array(indices, dtype=int, device=self.device),
-                bvh_constructor=bvh_constructor,
-            )
+        mesh_points = wp.array(points, dtype=wp.vec3, device=self.device)
+        mesh_indices = wp.array(indices, dtype=int, device=self.device)
+        mesh_kwargs = {
+            "points": mesh_points,
+            "velocities": None,
+            "indices": mesh_indices,
+            "bvh_constructor": bvh_constructor,
+        }
+        if leaf_size != 0:
+            mesh_kwargs["bvh_leaf_size"] = leaf_size
 
-        else:
-            self.mesh = wp.Mesh(
-                points=wp.array(points, dtype=wp.vec3, device=self.device),
-                velocities=None,
-                indices=wp.array(indices, dtype=int, device=self.device),
-                bvh_leaf_size=leaf_size,
-                bvh_constructor=bvh_constructor,
-            )
+        # Keep the stock mesh as the control and construct a matching mesh with
+        # Exclusive BVH metadata for the opt-in traversal.
+        self.mesh = wp.Mesh(**mesh_kwargs)
+        self.mesh_exclusive = wp.Mesh(**mesh_kwargs, enable_exclusive=True)
+
+        # Derive one stable face seed per point with an untimed stock query over
+        # the same point. These are explicit current-query oracle controls, not
+        # seed-discovery-inclusive timings. The very large query distance
+        # guarantees a valid seed for these non-empty benchmark meshes.
+        self.query_seed_faces = wp.zeros(NUM_QUERY_POINTS, dtype=wp.int32, device=self.device)
+        wp.launch(
+            sample_mesh_query_no_sign_seed_faces,
+            dim=(NUM_QUERY_POINTS,),
+            inputs=[self.mesh.id, self.query_points, 1.0e7, self.query_seed_faces],
+            device=self.device,
+        )
+        wp.synchronize_device(self.device)
+
+        self.query_cached_nodes = wp.empty(NUM_QUERY_POINTS, dtype=wp.int32, device=self.device)
+        wp.launch(
+            sample_mesh_query_no_sign_exclusive_nodes,
+            dim=(NUM_QUERY_POINTS,),
+            inputs=[
+                self.mesh_exclusive.id,
+                self.query_points,
+                1.0e7,
+                self.query_seed_faces,
+                self.query_cached_nodes,
+            ],
+            device=self.device,
+        )
+        wp.synchronize_device(self.device)
 
         self.query_closest_points = wp.empty_like(self.query_points, device=self.device)
+        self.query_closest_points_signed = wp.empty_like(self.query_points, device=self.device)
+        self.query_closest_points_seeded = wp.empty_like(self.query_points, device=self.device)
+        self.query_closest_points_exclusive = wp.empty_like(self.query_points, device=self.device)
+        self.query_closest_points_exclusive_cached = wp.empty_like(self.query_points, device=self.device)
 
         self.cmd_no_sign = wp.launch(
             sample_mesh_query_no_sign,
@@ -131,14 +303,75 @@ class MeshQuery:
         self.cmd_signed = wp.launch(
             sample_mesh_query_signed,
             dim=(NUM_QUERY_POINTS,),
-            inputs=[self.mesh.id, self.query_points, 1.0e7, self.query_closest_points],
+            inputs=[self.mesh.id, self.query_points, 1.0e7, self.query_closest_points_signed],
+            device=self.device,
+            record_cmd=True,
+        )
+
+        self.cmd_no_sign_seeded = wp.launch(
+            sample_mesh_query_no_sign_seeded,
+            dim=(NUM_QUERY_POINTS,),
+            inputs=[
+                self.mesh_exclusive.id,
+                self.query_points,
+                1.0e7,
+                self.query_seed_faces,
+                self.query_closest_points_seeded,
+            ],
+            device=self.device,
+            record_cmd=True,
+        )
+
+        self.cmd_no_sign_exclusive = wp.launch(
+            sample_mesh_query_no_sign_exclusive,
+            dim=(NUM_QUERY_POINTS,),
+            inputs=[
+                self.mesh_exclusive.id,
+                self.query_points,
+                1.0e7,
+                self.query_seed_faces,
+                self.query_closest_points_exclusive,
+            ],
+            device=self.device,
+            record_cmd=True,
+        )
+        self.cmd_no_sign_exclusive_cached = wp.launch(
+            sample_mesh_query_no_sign_exclusive_cached,
+            dim=(NUM_QUERY_POINTS,),
+            inputs=[
+                self.mesh_exclusive.id,
+                self.query_points,
+                1.0e7,
+                self.query_seed_faces,
+                self.query_cached_nodes,
+                self.query_closest_points_exclusive_cached,
+            ],
             device=self.device,
             record_cmd=True,
         )
         # Warmup
         self.cmd_no_sign.launch()
         self.cmd_signed.launch()
+        self.cmd_no_sign_seeded.launch()
+        self.cmd_no_sign_exclusive.launch()
+        self.cmd_no_sign_exclusive_cached.launch()
         wp.synchronize_device(self.device)
+
+        _verify_closest_query_results(
+            self.query_closest_points,
+            self.query_closest_points_seeded,
+            "seeded closest-point query",
+        )
+        _verify_closest_query_results(
+            self.query_closest_points,
+            self.query_closest_points_exclusive,
+            "Exclusive BVH closest-point query",
+        )
+        _verify_closest_query_results(
+            self.query_closest_points,
+            self.query_closest_points_exclusive_cached,
+            "cached Exclusive BVH closest-point query",
+        )
 
     @skip_benchmark_if(USD_AVAILABLE is False)
     def time_mesh_query_closest_point(self, leaf_size, asset, bvh_constructor):
@@ -148,6 +381,21 @@ class MeshQuery:
     @skip_benchmark_if(USD_AVAILABLE is False)
     def time_mesh_query_closest_point_signed(self, leaf_size, asset, bvh_constructor):
         self.cmd_signed.launch()
+        wp.synchronize_device(self.device)
+
+    @skip_benchmark_if(USD_AVAILABLE is False)
+    def time_mesh_query_closest_point_seeded_oracle(self, leaf_size, asset, bvh_constructor):
+        self.cmd_no_sign_seeded.launch()
+        wp.synchronize_device(self.device)
+
+    @skip_benchmark_if(USD_AVAILABLE is False)
+    def time_mesh_query_closest_point_exclusive_oracle(self, leaf_size, asset, bvh_constructor):
+        self.cmd_no_sign_exclusive.launch()
+        wp.synchronize_device(self.device)
+
+    @skip_benchmark_if(USD_AVAILABLE is False)
+    def time_mesh_query_closest_point_exclusive_cached_oracle(self, leaf_size, asset, bvh_constructor):
+        self.cmd_no_sign_exclusive_cached.launch()
         wp.synchronize_device(self.device)
 
 
@@ -215,6 +463,78 @@ def get_v_t_collision_kernel(is_wp_bvh):
         vertex_colliding_triangles_count[v_index] = vertex_num_collisions
 
     return vertex_triangle_collision_detection_kernel_broad_only_base
+
+
+def get_v_t_collision_exclusive_kernel():
+    @wp.kernel
+    def vertex_triangle_collision_detection_kernel_broad_only_exclusive(
+        query_radius: float,
+        geom_id: wp.uint64,
+        pos: wp.array(dtype=wp.vec3),
+        query_seed_primitives: wp.array(dtype=wp.int32),
+        vertex_colliding_triangles_offsets: wp.array(dtype=wp.int32),
+        # outputs
+        vertex_colliding_triangles: wp.array(dtype=wp.int32),
+        vertex_colliding_triangles_count: wp.array(dtype=wp.int32),
+    ):
+        v_index = wp.tid()
+        v = pos[v_index]
+        vertex_buffer_offset = vertex_colliding_triangles_offsets[v_index]
+        vertex_buffer_size = vertex_colliding_triangles_offsets[v_index + 1] - vertex_buffer_offset
+
+        lower = wp.vec3(v[0] - query_radius, v[1] - query_radius, v[2] - query_radius)
+        upper = wp.vec3(v[0] + query_radius, v[1] + query_radius, v[2] + query_radius)
+
+        tri_index = wp.int32(0)
+        vertex_num_collisions = wp.int32(0)
+
+        query = wp.bvh_query_aabb_exclusive(geom_id, lower, upper, query_seed_primitives[v_index])
+        while wp.bvh_query_next(query, tri_index):
+            if vertex_num_collisions < vertex_buffer_size:
+                vertex_colliding_triangles[2 * (vertex_buffer_offset + vertex_num_collisions)] = v_index
+                vertex_colliding_triangles[2 * (vertex_buffer_offset + vertex_num_collisions) + 1] = tri_index
+
+            vertex_num_collisions = vertex_num_collisions + 1
+
+        vertex_colliding_triangles_count[v_index] = vertex_num_collisions
+
+    return vertex_triangle_collision_detection_kernel_broad_only_exclusive
+
+
+def get_v_t_collision_exclusive_cached_kernel():
+    @wp.kernel
+    def vertex_triangle_collision_detection_kernel_broad_only_exclusive_cached(
+        query_radius: float,
+        geom_id: wp.uint64,
+        pos: wp.array(dtype=wp.vec3),
+        query_cached_nodes: wp.array(dtype=wp.int32),
+        vertex_colliding_triangles_offsets: wp.array(dtype=wp.int32),
+        # outputs
+        vertex_colliding_triangles: wp.array(dtype=wp.int32),
+        vertex_colliding_triangles_count: wp.array(dtype=wp.int32),
+    ):
+        v_index = wp.tid()
+        v = pos[v_index]
+        vertex_buffer_offset = vertex_colliding_triangles_offsets[v_index]
+        vertex_buffer_size = vertex_colliding_triangles_offsets[v_index + 1] - vertex_buffer_offset
+
+        lower = wp.vec3(v[0] - query_radius, v[1] - query_radius, v[2] - query_radius)
+        upper = wp.vec3(v[0] + query_radius, v[1] + query_radius, v[2] + query_radius)
+
+        tri_index = wp.int32(0)
+        vertex_num_collisions = wp.int32(0)
+
+        query = wp.bvh_query_aabb_exclusive_cached(geom_id, lower, upper, query_cached_nodes[v_index])
+        while wp.bvh_query_next(query, tri_index):
+            if vertex_num_collisions < vertex_buffer_size:
+                vertex_colliding_triangles[2 * (vertex_buffer_offset + vertex_num_collisions)] = v_index
+                vertex_colliding_triangles[2 * (vertex_buffer_offset + vertex_num_collisions) + 1] = tri_index
+
+            vertex_num_collisions = vertex_num_collisions + 1
+
+        vertex_colliding_triangles_count[v_index] = vertex_num_collisions
+
+    return vertex_triangle_collision_detection_kernel_broad_only_exclusive_cached
 
 
 def get_ray_query_kernel(is_wp_bvh):
@@ -295,6 +615,53 @@ def compute_tri_aabbs(
 
     lower_bounds[t_id] = wp.min(wp.min(v1, v2), v3)
     upper_bounds[t_id] = wp.max(wp.max(v1, v2), v3)
+
+
+@wp.kernel
+def sample_bvh_query_aabb_seed_primitives(
+    query_radius: float,
+    bvh_id: wp.uint64,
+    mesh_id: wp.uint64,
+    query_points: wp.array(dtype=wp.vec3),
+    query_seed_primitives: wp.array(dtype=wp.int32),
+):
+    tid = wp.tid()
+    p = query_points[tid]
+    lower = wp.vec3(p[0] - query_radius, p[1] - query_radius, p[2] - query_radius)
+    upper = wp.vec3(p[0] + query_radius, p[1] + query_radius, p[2] + query_radius)
+
+    query = wp.bvh_query_aabb(bvh_id, lower, upper)
+    seed_primitive = wp.int32(0)
+    if wp.bvh_query_next(query, seed_primitive):
+        query_seed_primitives[tid] = seed_primitive
+    else:
+        # Use a spatially coherent cached face when the AABB has no overlap.
+        # Mesh face IDs match the primitive IDs of the BVH built above.
+        closest = wp.mesh_query_point_no_sign(mesh_id, p, 1.0e7)
+        if closest.result:
+            query_seed_primitives[tid] = closest.face
+        else:
+            query_seed_primitives[tid] = 0
+
+
+@wp.kernel
+def sample_bvh_query_aabb_exclusive_nodes(
+    query_radius: float,
+    bvh_id: wp.uint64,
+    query_points: wp.array(dtype=wp.vec3),
+    query_seed_primitives: wp.array(dtype=wp.int32),
+    query_cached_nodes: wp.array(dtype=wp.int32),
+):
+    tid = wp.tid()
+    p = query_points[tid]
+    lower = wp.vec3(p[0] - query_radius, p[1] - query_radius, p[2] - query_radius)
+    upper = wp.vec3(p[0] + query_radius, p[1] + query_radius, p[2] + query_radius)
+    query_cached_nodes[tid] = wp.bvh_query_aabb_exclusive_node(
+        bvh_id,
+        lower,
+        upper,
+        query_seed_primitives[tid],
+    )
 
 
 def replicate_mesh_with_random_perturbation(
@@ -425,9 +792,19 @@ class BvhAABBQuery:
 
             if leaf_size == 0:
                 self.bvh = wp.Bvh(self.lowers, self.uppers, constructor=bvh_constructor)
+                self.bvh_exclusive = wp.Bvh(
+                    self.lowers, self.uppers, constructor=bvh_constructor, enable_exclusive=True
+                )
                 self.mesh = wp.Mesh(self.points, wp.array(indices, dtype=int), bvh_constructor=bvh_constructor)
             else:
                 self.bvh = wp.Bvh(self.lowers, self.uppers, leaf_size=leaf_size, constructor=bvh_constructor)
+                self.bvh_exclusive = wp.Bvh(
+                    self.lowers,
+                    self.uppers,
+                    leaf_size=leaf_size,
+                    constructor=bvh_constructor,
+                    enable_exclusive=True,
+                )
                 self.mesh = wp.Mesh(
                     self.points, wp.array(indices, dtype=int), bvh_leaf_size=leaf_size, bvh_constructor=bvh_constructor
                 )
@@ -439,8 +816,52 @@ class BvhAABBQuery:
             )
             self.vertex_colliding_triangles = wp.zeros(2 * buffer_size_per_vertex * NUM_QUERY_POINTS, dtype=wp.int32)
             self.vertex_colliding_triangles_count = wp.zeros(NUM_QUERY_POINTS, dtype=wp.int32)
+            self.exclusive_vertex_colliding_triangles = wp.zeros(
+                2 * buffer_size_per_vertex * NUM_QUERY_POINTS, dtype=wp.int32
+            )
+            self.exclusive_vertex_colliding_triangles_count = wp.zeros(NUM_QUERY_POINTS, dtype=wp.int32)
+            self.exclusive_cached_vertex_colliding_triangles = wp.zeros(
+                2 * buffer_size_per_vertex * NUM_QUERY_POINTS, dtype=wp.int32
+            )
+            self.exclusive_cached_vertex_colliding_triangles_count = wp.zeros(NUM_QUERY_POINTS, dtype=wp.int32)
+            self.mesh_vertex_colliding_triangles = wp.zeros(
+                2 * buffer_size_per_vertex * NUM_QUERY_POINTS, dtype=wp.int32
+            )
+            self.mesh_vertex_colliding_triangles_count = wp.zeros(NUM_QUERY_POINTS, dtype=wp.int32)
+
+            # Seed each Exclusive BVH traversal with the first primitive found
+            # by an untimed stock query over the exact same AABB. These are
+            # explicit current-query oracle controls, not seed-discovery-
+            # inclusive timings. Empty queries use the stock mesh's closest
+            # face as a coherent cached seed.
+            self.query_seed_primitives = wp.zeros(NUM_QUERY_POINTS, dtype=wp.int32)
+            wp.launch(
+                dim=NUM_QUERY_POINTS,
+                kernel=sample_bvh_query_aabb_seed_primitives,
+                inputs=[query_radius, self.bvh.id, self.mesh.id, self.query_points],
+                outputs=[self.query_seed_primitives],
+            )
+            wp.synchronize_device(self.device)
+
+            self.query_cached_nodes = wp.empty(NUM_QUERY_POINTS, dtype=wp.int32)
+            wp.launch(
+                dim=NUM_QUERY_POINTS,
+                kernel=sample_bvh_query_aabb_exclusive_nodes,
+                inputs=[
+                    query_radius,
+                    self.bvh_exclusive.id,
+                    self.query_points,
+                    self.query_seed_primitives,
+                    self.query_cached_nodes,
+                ],
+            )
+            wp.synchronize_device(self.device)
 
             self.bvh_vertex_triangle_collision_detection_kernel = get_v_t_collision_kernel(True)
+            self.bvh_exclusive_vertex_triangle_collision_detection_kernel = get_v_t_collision_exclusive_kernel()
+            self.bvh_exclusive_cached_vertex_triangle_collision_detection_kernel = (
+                get_v_t_collision_exclusive_cached_kernel()
+            )
             self.mesh_vertex_triangle_collision_detection_kernel = get_v_t_collision_kernel(False)
 
             wp.load_module(device=device)
@@ -464,6 +885,46 @@ class BvhAABBQuery:
                 for _ in range(NUM_TRIES):
                     wp.launch(
                         dim=NUM_QUERY_POINTS,
+                        kernel=self.bvh_exclusive_vertex_triangle_collision_detection_kernel,
+                        inputs=[
+                            query_radius,
+                            self.bvh_exclusive.id,
+                            self.query_points,
+                            self.query_seed_primitives,
+                            self.vertex_colliding_triangles_offsets,
+                        ],
+                        outputs=[
+                            self.exclusive_vertex_colliding_triangles,
+                            self.exclusive_vertex_colliding_triangles_count,
+                        ],
+                    )
+
+            self.cuda_graph_bvh_exclusive_aabb_vs_aabb = capture.graph
+
+            with wp.ScopedCapture(force_module_load=False) as capture:
+                for _ in range(NUM_TRIES):
+                    wp.launch(
+                        dim=NUM_QUERY_POINTS,
+                        kernel=self.bvh_exclusive_cached_vertex_triangle_collision_detection_kernel,
+                        inputs=[
+                            query_radius,
+                            self.bvh_exclusive.id,
+                            self.query_points,
+                            self.query_cached_nodes,
+                            self.vertex_colliding_triangles_offsets,
+                        ],
+                        outputs=[
+                            self.exclusive_cached_vertex_colliding_triangles,
+                            self.exclusive_cached_vertex_colliding_triangles_count,
+                        ],
+                    )
+
+            self.cuda_graph_bvh_exclusive_cached_aabb_vs_aabb = capture.graph
+
+            with wp.ScopedCapture(force_module_load=False) as capture:
+                for _ in range(NUM_TRIES):
+                    wp.launch(
+                        dim=NUM_QUERY_POINTS,
                         kernel=self.mesh_vertex_triangle_collision_detection_kernel,
                         inputs=[
                             query_radius,
@@ -471,15 +932,37 @@ class BvhAABBQuery:
                             self.query_points,
                             self.vertex_colliding_triangles_offsets,
                         ],
-                        outputs=[self.vertex_colliding_triangles, self.vertex_colliding_triangles_count],
+                        outputs=[
+                            self.mesh_vertex_colliding_triangles,
+                            self.mesh_vertex_colliding_triangles_count,
+                        ],
                     )
 
             self.cuda_graph_mesh_aabb_vs_aabb = capture.graph
 
             # warm up run
             wp.capture_launch(self.cuda_graph_bvh_aabb_vs_aabb)
+            wp.capture_launch(self.cuda_graph_bvh_exclusive_aabb_vs_aabb)
+            wp.capture_launch(self.cuda_graph_bvh_exclusive_cached_aabb_vs_aabb)
             wp.capture_launch(self.cuda_graph_mesh_aabb_vs_aabb)
             wp.synchronize_device(self.device)
+
+            _verify_aabb_query_results(
+                self.vertex_colliding_triangles_count,
+                self.vertex_colliding_triangles,
+                self.exclusive_vertex_colliding_triangles_count,
+                self.exclusive_vertex_colliding_triangles,
+                buffer_size_per_vertex,
+                "Exclusive BVH AABB query",
+            )
+            _verify_aabb_query_results(
+                self.vertex_colliding_triangles_count,
+                self.vertex_colliding_triangles,
+                self.exclusive_cached_vertex_colliding_triangles_count,
+                self.exclusive_cached_vertex_colliding_triangles,
+                buffer_size_per_vertex,
+                "cached Exclusive BVH AABB query",
+            )
 
     @skip_benchmark_if(USD_AVAILABLE is False)
     def time_bvh_aabb_vs_aabb_query(self, query_radius, leaf_size, device, bvh_constructor):
@@ -489,6 +972,22 @@ class BvhAABBQuery:
     @skip_benchmark_if(USD_AVAILABLE is False)
     def time_mesh_aabb_vs_aabb_query(self, query_radius, leaf_size, device, bvh_constructor):
         wp.capture_launch(self.cuda_graph_mesh_aabb_vs_aabb)
+        wp.synchronize_device(self.device)
+
+    @skip_benchmark_if(USD_AVAILABLE is False)
+    def time_bvh_aabb_vs_aabb_query_exclusive_oracle(self, query_radius, leaf_size, device, bvh_constructor):
+        wp.capture_launch(self.cuda_graph_bvh_exclusive_aabb_vs_aabb)
+        wp.synchronize_device(self.device)
+
+    @skip_benchmark_if(USD_AVAILABLE is False)
+    def time_bvh_aabb_vs_aabb_query_exclusive_cached_oracle(
+        self,
+        query_radius,
+        leaf_size,
+        device,
+        bvh_constructor,
+    ):
+        wp.capture_launch(self.cuda_graph_bvh_exclusive_cached_aabb_vs_aabb)
         wp.synchronize_device(self.device)
 
 

@@ -90,12 +90,31 @@ WP_API void wp_memtile_device(void* context, void* dest, const void* src, size_t
 
 WP_API uint64_t
 wp_bvh_create_host(wp::vec3* lowers, wp::vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size);
+WP_API uint64_t wp_bvh_create_host_ex(
+    wp::vec3* lowers,
+    wp::vec3* uppers,
+    int num_items,
+    int constructor_type,
+    int* groups,
+    int leaf_size,
+    int enable_exclusive
+);
 WP_API void wp_bvh_destroy_host(uint64_t id);
 WP_API void wp_bvh_refit_host(uint64_t id);
 WP_API void wp_bvh_rebuild_host(uint64_t id, int constructor_type);
 
 WP_API uint64_t wp_bvh_create_device(
     void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size
+);
+WP_API uint64_t wp_bvh_create_device_ex(
+    void* context,
+    wp::vec3* lowers,
+    wp::vec3* uppers,
+    int num_items,
+    int constructor_type,
+    int* groups,
+    int leaf_size,
+    int enable_exclusive
 );
 WP_API void wp_bvh_destroy_device(uint64_t id);
 WP_API void wp_bvh_refit_device(uint64_t id);
@@ -114,6 +133,18 @@ WP_API uint64_t wp_mesh_create_host(
     int* groups,
     int bvh_leaf_size
 );
+WP_API uint64_t wp_mesh_create_host_ex(
+    wp::array_t<wp::vec3> points,
+    wp::array_t<wp::vec3> velocities,
+    wp::array_t<int> tris,
+    int num_points,
+    int num_tris,
+    int support_winding_number,
+    int constructor_type,
+    int* groups,
+    int bvh_leaf_size,
+    int enable_exclusive
+);
 WP_API void wp_mesh_destroy_host(uint64_t id);
 WP_API void wp_mesh_refit_host(uint64_t id);
 
@@ -128,6 +159,19 @@ WP_API uint64_t wp_mesh_create_device(
     int constructor_type,
     int* groups,
     int bvh_leaf_size
+);
+WP_API uint64_t wp_mesh_create_device_ex(
+    void* context,
+    wp::array_t<wp::vec3> points,
+    wp::array_t<wp::vec3> velocities,
+    wp::array_t<int> tris,
+    int num_points,
+    int num_tris,
+    int support_winding_number,
+    int constructor_type,
+    int* groups,
+    int bvh_leaf_size,
+    int enable_exclusive
 );
 WP_API void wp_mesh_destroy_device(uint64_t id);
 WP_API int wp_mesh_refit_device(uint64_t id);

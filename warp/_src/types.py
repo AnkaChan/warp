@@ -5543,7 +5543,89 @@ class BvhConstructor(enum.IntEnum):
 
 
 class Bvh:
-    """Bounding Volume Hierarchy (BVH) for accelerated spatial queries."""
+    """Bounding Volume Hierarchy (BVH) for accelerated spatial queries.
+
+    Depending on the device that stores the input bounds, the BVH is either a CPU tree or a GPU tree.
+
+    Args:
+        lowers: Array of lower bounds of data type :class:`warp.vec3`.
+        uppers: Array of upper bounds of data type :class:`warp.vec3`.
+          ``lowers`` and ``uppers`` must live on the same device.
+        constructor: The construction algorithm used to build the tree.
+          Valid choices are ``"sah"``, ``"median"``, ``"lbvh"``, ``"cubql"``, or ``None``.
+          When ``None``, the constructor is selected based on the device (see the note).
+        groups: Optional array of group indices of data type :class:`warp.int32`.
+        leaf_size: The number of primitives (AABBs) stored in each leaf node. The optimal value depends on the primary
+          use case. For intersection queries (e.g., AABB queries), a small value such as 1 is generally recommended.
+          For closest-point queries, a larger value such as 4 or 8 can be more performant. This is an intrinsic
+          parameter that does not affect the return value of query methods.
+        enable_exclusive: Whether to build the additional Exclusive BVH bounds and primitive-to-leaf mapping used by
+          :func:`warp.bvh_query_aabb_exclusive` and its cached query path. Enabling this option uses additional memory
+          and adds work to construction, refit, and rebuild operations. This option is not supported when ``groups``
+          is provided.
+
+    Attributes:
+        id: Unique identifier for this BVH object, which can be passed to kernels.
+        device: Device on which this object lives. All buffers must live on the same device.
+
+    Note:
+        **Explanation of BVH constructors:**
+
+        - ``"sah"``: A CPU-based top-down constructor where the AABBs are split based on Surface Area
+          Heuristics (SAH). Construction takes slightly longer than others but has the best query
+          performance.
+        - ``"median"``: A CPU-based top-down constructor where the AABBs are split based on the median
+          of centroids of primitives in an AABB. This constructor is faster than SAH but offers
+          inferior query performance.
+        - ``"lbvh"``: A GPU-based bottom-up constructor which maximizes parallelism. Construction is very
+          fast, especially for large models. Query performance is slightly slower than ``"sah"``.
+        - ``"cubql"``: An experimental cuBQL constructor. It builds a temporary cuBQL BVH and converts
+          it into Warp's native BVH layout for traversal. Grouped BVHs are not supported with this
+          constructor.
+        - ``None``: The constructor is automatically chosen based on the device where the tree
+          lives. For a GPU tree, the ``"lbvh"`` constructor is selected; for a CPU tree, the ``"sah"``
+          constructor is selected.
+
+        All constructors are supported for GPU trees when Warp is compiled with cuBQL support. When a
+        CPU-based constructor is selected for a GPU tree, bounds are copied back to the CPU to run
+        the CPU-based constructor. After construction, the CPU tree is copied to the GPU.
+
+        ``"sah"``, ``"median"``, and ``"cubql"`` are supported for CPU trees when Warp is compiled with cuBQL
+        support. If ``"lbvh"`` is selected for a CPU tree, a warning message is issued, and the constructor
+        automatically falls back to ``"sah"``.
+
+        The ``leaf_size`` parameter controls the number of primitives (AABBs) stored in each leaf node of the BVH.
+        This parameter can have a considerable impact on query performance, and the optimal value depends on the
+        types of queries that will be performed:
+
+        - For intersection queries (such as ray or AABB queries), smaller ``leaf_size`` values (e.g., 1) are generally
+          preferred, as they reduce the number of unnecessary primitive checks and can improve traversal speed.
+        - For closest-point queries, larger ``leaf_size`` values (e.g., 4 or more) may be beneficial, as they allow
+          more primitives to be checked together, potentially reducing traversal overhead.
+
+        For use cases that involve both intersection and closest-point queries (such as mesh queries), a moderate
+        value (e.g., 4) may provide a good balance. Users are encouraged to experiment with this parameter to find
+        the best value for their specific workload.
+
+        **Concept of Grouped BVH:**
+
+        A Grouped BVH extends the traditional Bounding Volume Hierarchy to efficiently handle multiple independent
+        groups of objects—such as distinct environments in parallel robot simulations—within a single BVH structure.
+
+        In a standard BVH, all objects share one global tree, so queries must traverse the entire hierarchy and filter
+        results in user space. Grouped BVH introduces a group identifier for each object and makes sure that objects
+        from the same group occupy an entire subtree whose root can be quickly identified by calling
+        :func:`~warp._src.lang.bvh_get_group_root`.
+
+        By starting traversal directly from a group's root node, queries are confined to that group's objects only,
+        avoiding unnecessary intersection tests with other groups. This design significantly reduces query overhead
+        for large multi-environment workloads, improves memory coherence, and eliminates the need for spatial
+        separation between groups.
+
+        The grouped BVH thus allows Warp to perform environment-specific queries—such as collision detection,
+        sensor simulation, or rendering—within a unified BVH framework, maintaining compatibility with existing APIs
+        and near-identical performance for non-grouped use cases.
+    """
 
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
@@ -5557,86 +5639,8 @@ class Bvh:
         constructor: BvhConstructor | str | None = None,
         groups: array | None = None,
         leaf_size: int = 1,
+        enable_exclusive: builtins.bool = False,
     ):
-        """Class representing a bounding volume hierarchy.
-
-        Depending on which device the input bounds live, it can be either a CPU tree or a GPU tree.
-
-        Attributes:
-            id: Unique identifier for this BVH object, can be passed to kernels.
-            device: Device this object lives on, all buffers must live on the same device.
-
-        Args:
-            lowers: Array of lower bounds of data type :class:`warp.vec3`.
-            uppers: Array of upper bounds of data type :class:`warp.vec3`.
-              ``lowers`` and ``uppers`` must live on the same device.
-            constructor: The construction algorithm used to build the tree.
-              Valid choices are ``"sah"``, ``"median"``, ``"lbvh"``, ``"cubql"``, or ``None``.
-              When ``None``, the default constructor will be used (see the note).
-            groups: Optional array of group indices of data type :class:`warp.int32`.
-            leaf_size: The number of primitives (AABBs) stored in each leaf node. The optimal value depends on the primary
-              use case. For intersection queries (e.g., AABB query), a small value like 1 (the default) is generally
-              recommended for optimal performance. For closest point queries, a larger value like 4 or 8 can be more
-              performant. This is an intrinsic parameter which does not impact the return value of the query method.
-
-        Note:
-            **Explanation of BVH constructors:**
-
-            - ``"sah"``: A CPU-based top-down constructor where the AABBs are split based on Surface Area
-              Heuristics (SAH). Construction takes slightly longer than others but has the best query
-              performance.
-            - ``"median"``: A CPU-based top-down constructor where the AABBs are split based on the median
-              of centroids of primitives in an AABB. This constructor is faster than SAH but offers
-              inferior query performance.
-            - ``"lbvh"``: A GPU-based bottom-up constructor which maximizes parallelism. Construction is very
-              fast, especially for large models. Query performance is slightly slower than ``"sah"``.
-            - ``"cubql"``: An experimental cuBQL constructor. It builds a temporary cuBQL BVH and converts
-              it into Warp's native BVH layout for traversal. Grouped BVHs are not supported with this
-              constructor.
-            - ``None``: The constructor will be automatically chosen based on the device where the tree
-              lives. For a GPU tree, the ``"lbvh"`` constructor will be selected; for a CPU tree, the ``"sah"``
-              constructor will be selected.
-
-            All constructors are supported for GPU trees when Warp is compiled with cuBQL support. When a
-            CPU-based constructor is selected for a GPU tree, bounds will be copied back to the CPU to run
-            the CPU-based constructor. After construction, the CPU tree will be copied to the GPU.
-
-            ``"sah"``, ``"median"``, and ``"cubql"`` are supported for CPU trees when Warp is compiled with cuBQL
-            support. If ``"lbvh"`` is selected for a CPU tree, a warning message will be issued, and the constructor
-            will automatically fall back to ``"sah"``.
-
-            The ``leaf_size`` parameter controls the number of primitives (AABBs) stored in each leaf node of the BVH.
-            This parameter can have a considerable impact on query performance, and the optimal value depends on the
-            types of queries that will be performed:
-
-            - For intersection queries (such as ray or AABB queries), smaller ``leaf_size`` values (e.g., 1) are generally
-              preferred, as they reduce the number of unnecessary primitive checks and can improve traversal speed.
-            - For closest point queries, larger ``leaf_size`` values (e.g., 4 or more) may be beneficial, as they allow
-              more primitives to be checked together, potentially reducing traversal overhead.
-
-            The default value is 1, which is optimal for intersection queries. For use cases that involve both intersection
-            and closest point queries (such as mesh queries), a moderate value (e.g., 4) may provide a good balance.
-            Users are encouraged to experiment with this parameter to find the best value for their specific workload.
-
-            **Concept of Grouped BVH:**
-
-            A Grouped BVH extends the traditional Bounding Volume Hierarchy to efficiently handle multiple independent
-            groups of objects—such as distinct environments in parallel robot simulations—within a single BVH structure.
-
-            In a standard BVH, all objects share one global tree, so queries must traverse the entire hierarchy and filter
-            results in user space. Grouped BVH introduces a group identifier for each object and makes sure that objects
-            from the same group occupy an entire subtree whose root can be quickly identified by calling
-            :func:`~warp._src.lang.bvh_get_group_root`.
-
-            By starting traversal directly from a group's root node, queries are confined to that group's objects only,
-            avoiding unnecessary intersection tests with other groups. This design significantly reduces query overhead
-            for large multi-environment workloads, improves memory coherence, and eliminates the need for spatial
-            separation between groups.
-
-            The grouped BVH thus allows Warp to perform environment-specific queries—such as collision detection,
-            sensor simulation, or rendering—within a unified BVH framework, maintaining compatibility with existing APIs
-            and near-identical performance for non-grouped use cases.
-        """
         if len(lowers) != len(uppers):
             raise RuntimeError("The same number of lower and upper bounds must be provided")
 
@@ -5656,6 +5660,8 @@ class Bvh:
                 raise RuntimeError("groups must live on the same device as lowers/uppers")
             if len(groups) != len(lowers):
                 raise RuntimeError("groups must have the same length as lowers/uppers")
+            if enable_exclusive:
+                raise RuntimeError("enable_exclusive=True is not supported with grouped BVHs")
 
         self.device = lowers.device
         self.lowers = lowers
@@ -5693,16 +5699,17 @@ class Bvh:
                 )
                 constructor = BvhConstructor.SAH
 
-            self.id = self.runtime.core.wp_bvh_create_host(
+            self.id = self.runtime.core.wp_bvh_create_host_ex(
                 get_data(lowers),
                 get_data(uppers),
                 len(lowers),
                 constructor,
                 get_data(groups),
                 leaf_size,
+                int(enable_exclusive),
             )
         else:
-            self.id = self.runtime.core.wp_bvh_create_device(
+            self.id = self.runtime.core.wp_bvh_create_device_ex(
                 self.device.context,
                 get_data(lowers),
                 get_data(uppers),
@@ -5710,6 +5717,7 @@ class Bvh:
                 constructor,
                 get_data(groups),
                 leaf_size,
+                int(enable_exclusive),
             )
 
         self._constructor = constructor
@@ -5820,7 +5828,34 @@ class Bvh:
 
 
 class Mesh:
-    """Triangle mesh for collision detection, ray casting, and spatial queries."""
+    """Triangle mesh for collision detection, ray casting, and spatial queries.
+
+    Args:
+        points: Array of vertex positions of data type :class:`warp.vec3`.
+        indices: Array of triangle indices of data type :class:`warp.int32`.
+          Should be a 1D array with shape ``(num_tris * 3)``.
+        velocities: Optional array of vertex velocities of data type :class:`warp.vec3`.
+        support_winding_number: If ``True``, the mesh builds additional data structures to support
+          :func:`warp.mesh_query_point_sign_winding_number` queries.
+        bvh_constructor: The construction algorithm for the underlying BVH
+          (see the docstring of :class:`Bvh` for an explanation).
+          Valid choices are ``"sah"``, ``"median"``, ``"lbvh"``, ``"cubql"``, or ``None``.
+          When ``"cubql"`` is selected (**experimental**), cuBQL builds the underlying BVH in Warp's native layout.
+          Grouped meshes and ``support_winding_number=True`` are not supported with this constructor.
+        bvh_leaf_size: The number of primitives (AABBs) stored in each leaf node
+          (see the docstring of :class:`Bvh` for more details). When ``None``, Warp selects a value based on
+          ``bvh_constructor``.
+        groups: Optional array of triangle group indices of data type :class:`warp.int32`.
+          Should be a 1D array with shape ``(num_tris)``.
+        enable_exclusive: Whether to build the additional Exclusive BVH bounds and primitive-to-leaf mapping used by
+          coherent closest-point queries, including :func:`warp.mesh_query_point_no_sign_seeded`. Enabling this option
+          uses additional memory and adds work to construction and refit operations. This option is not supported when
+          ``groups`` is provided.
+
+    Attributes:
+        id: Unique identifier for this mesh object, which can be passed to kernels.
+        device: Device on which this object lives. All buffers must live on the same device.
+    """
 
     from warp._src.codegen import Var as _Var  # noqa: PLC0415
 
@@ -5844,32 +5879,8 @@ class Mesh:
         bvh_constructor: BvhConstructor | str | None = None,
         bvh_leaf_size: int | None = None,
         groups: array | None = None,
+        enable_exclusive: builtins.bool = False,
     ):
-        """Class representing a triangle mesh.
-
-        Attributes:
-            id: Unique identifier for this mesh object, can be passed to kernels.
-            device: Device this object lives on, all buffers must live on the same device.
-
-        Args:
-            points: Array of vertex positions of data type :class:`warp.vec3`.
-            indices: Array of triangle indices of data type :class:`warp.int32`.
-              Should be a 1D array with shape ``(num_tris * 3)``.
-            velocities: Optional array of vertex velocities of data type :class:`warp.vec3`.
-            support_winding_number: If ``True``, the mesh will build additional
-              data structures to support ``wp.mesh_query_point_sign_winding_number()`` queries.
-            bvh_constructor: The construction algorithm for the underlying BVH
-              (see the docstring of :class:`Bvh` for explanation).
-              Valid choices are ``"sah"``, ``"median"``, ``"lbvh"``, ``"cubql"``, or ``None``.
-              When ``"cubql"`` is selected (**experimental**), cuBQL is used to
-              build the underlying BVH in Warp's native layout. Grouped meshes and
-              ``support_winding_number=True`` are not supported with this constructor.
-            bvh_leaf_size: The number of primitives (AABBs) stored in each leaf node
-              (see the docstring of :class:`Bvh` for more details). If ``None`` the default
-              value based on the ``bvh_constructor`` will be used.
-            groups: Optional array of triangle group indices of data type :class:`warp.int32`.
-              Should be a 1D array with shape ``(num_tris)``.
-        """
         if points.device != indices.device:
             raise RuntimeError("Mesh points and indices must live on the same device")
 
@@ -5892,6 +5903,8 @@ class Mesh:
                 raise RuntimeError("groups must live on the same device as points")
             if len(groups) != len(indices) // 3:
                 raise RuntimeError("groups must have the same length as indices / 3")
+            if enable_exclusive:
+                raise RuntimeError("enable_exclusive=True is not supported with grouped meshes")
 
         self.device = points.device
         self._points = points
@@ -5931,7 +5944,7 @@ class Mesh:
                 )
                 bvh_constructor = BvhConstructor.SAH
 
-            self.id = self.runtime.core.wp_mesh_create_host(
+            self.id = self.runtime.core.wp_mesh_create_host_ex(
                 points.__ctype__(),
                 velocities.__ctype__() if velocities else array().__ctype__(),
                 indices.__ctype__(),
@@ -5941,9 +5954,10 @@ class Mesh:
                 bvh_constructor,
                 ctypes.c_void_p(groups.ptr) if groups else ctypes.c_void_p(0),
                 bvh_leaf_size,
+                int(enable_exclusive),
             )
         else:
-            self.id = self.runtime.core.wp_mesh_create_device(
+            self.id = self.runtime.core.wp_mesh_create_device_ex(
                 self.device.context,
                 points.__ctype__(),
                 velocities.__ctype__() if velocities else array().__ctype__(),
@@ -5954,6 +5968,7 @@ class Mesh:
                 bvh_constructor,
                 ctypes.c_void_p(groups.ptr) if groups else ctypes.c_void_p(0),
                 bvh_leaf_size,
+                int(enable_exclusive),
             )
 
         if not self.id:

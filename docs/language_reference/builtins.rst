@@ -249,6 +249,9 @@ Geometry
 
    bvh_get_group_root
    bvh_query_aabb
+   bvh_query_aabb_exclusive
+   bvh_query_aabb_exclusive_cached
+   bvh_query_aabb_exclusive_node
    bvh_query_aabb_tiled
    bvh_query_next
    bvh_query_next_tiled
@@ -274,6 +277,10 @@ Geometry
    mesh_query_furthest_point_no_sign
    mesh_query_point
    mesh_query_point_no_sign
+   mesh_query_point_no_sign_exclusive
+   mesh_query_point_no_sign_exclusive_cached
+   mesh_query_point_no_sign_exclusive_node
+   mesh_query_point_no_sign_seeded
    mesh_query_point_sign_normal
    mesh_query_point_sign_parity
    mesh_query_point_sign_winding_number

@@ -62,13 +62,18 @@ private:
 void TopDownBVHBuilder::initialize_empty(BVH& bvh)
 {
     bvh.max_depth = 0;
+    bvh.max_depth_ptr = nullptr;
     bvh.max_nodes = 0;
+    bvh.num_nodes = 0;
     bvh.node_lowers = nullptr;
     bvh.node_uppers = nullptr;
     bvh.node_parents = nullptr;
     bvh.node_counts = nullptr;
     bvh.root = nullptr;
     bvh.primitive_indices = nullptr;
+    bvh.exclusive_nodes = nullptr;
+    bvh.primitive_leaf_indices = nullptr;
+    bvh.exclusive_enabled = 0;
     bvh.num_leaf_nodes = 0;
     bvh.num_items = 0;
     bvh.constructor_type = BVH_CONSTRUCTOR_SAH;
@@ -520,8 +525,9 @@ int TopDownBVHBuilder::build_recursive(
     if (assigned_node < 0)
         assert(node_index < bvh.max_nodes);
 
-    if (depth > bvh.max_depth)
-        bvh.max_depth = depth;
+    // Record the deepest node, counting the root as depth 1.
+    if (depth + 1 > bvh.max_depth)
+        bvh.max_depth = depth + 1;
 
     bounds3 b = calc_bounds(lowers, uppers, bvh.primitive_indices, start, end);
 
@@ -730,7 +736,110 @@ void bvh_refit_recursive(BVH& bvh, int index)
     }
 }
 
-void bvh_refit_host(BVH& bvh) { bvh_refit_recursive(bvh, *bvh.root); }
+struct ExclusiveBuildEntry {
+    int node;
+    int depth;
+    vec3 lower;
+    vec3 upper;
+};
+
+static void bvh_build_exclusive_host(BVH& bvh)
+{
+    if (!bvh.exclusive_nodes || !bvh.primitive_leaf_indices || !bvh.root || bvh.num_nodes <= 0)
+        return;
+
+    const vec3 empty_lower(INFINITY);
+    const vec3 empty_upper(-INFINITY);
+    for (int node = 0; node < bvh.max_nodes; ++node) {
+        bvh.exclusive_nodes[node] = make_exclusive_node(empty_lower, empty_upper, -1, -1);
+    }
+    std::fill(bvh.primitive_leaf_indices, bvh.primitive_leaf_indices + bvh.num_items, -1);
+
+    std::vector<ExclusiveBuildEntry> stack;
+    stack.push_back({ *bvh.root, 0, vec3(-INFINITY), vec3(INFINITY) });
+
+    while (!stack.empty()) {
+        const ExclusiveBuildEntry entry = stack.back();
+        stack.pop_back();
+
+        const int node_index = entry.node;
+        const BVHPackedNodeHalf node_lower = bvh.node_lowers[node_index];
+        const BVHPackedNodeHalf node_upper = bvh.node_uppers[node_index];
+        bvh.exclusive_nodes[node_index]
+            = make_exclusive_node(entry.lower, entry.upper, bvh.node_parents[node_index], entry.depth);
+
+        if (node_lower.b) {
+            for (int primitive_offset = int(node_lower.i); primitive_offset < int(node_upper.i); ++primitive_offset) {
+                const int primitive = bvh.primitive_indices[primitive_offset];
+                bvh.primitive_leaf_indices[primitive] = node_index;
+            }
+            continue;
+        }
+
+        const int first_child = int(node_lower.i);
+        const int second_child = int(node_upper.i);
+        const vec3 first_lower = reinterpret_cast<const vec3&>(bvh.node_lowers[first_child]);
+        const vec3 first_upper = reinterpret_cast<const vec3&>(bvh.node_uppers[first_child]);
+        const vec3 second_lower = reinterpret_cast<const vec3&>(bvh.node_lowers[second_child]);
+        const vec3 second_upper = reinterpret_cast<const vec3&>(bvh.node_uppers[second_child]);
+
+        int low_child;
+        const int axis = bvh_exclusive_split_axis(
+            first_lower, first_upper, first_child, second_lower, second_upper, second_child, low_child
+        );
+        const int high_child = low_child == first_child ? second_child : first_child;
+        const vec3 low_inclusive_upper = low_child == first_child ? first_upper : second_upper;
+        const vec3 high_inclusive_lower = high_child == first_child ? first_lower : second_lower;
+
+        vec3 low_exclusive_upper = entry.upper;
+        low_exclusive_upper[axis] = std_min(low_exclusive_upper[axis], high_inclusive_lower[axis]);
+        vec3 high_exclusive_lower = entry.lower;
+        high_exclusive_lower[axis] = std_max(high_exclusive_lower[axis], low_inclusive_upper[axis]);
+
+        stack.push_back({ high_child, entry.depth + 1, high_exclusive_lower, entry.upper });
+        stack.push_back({ low_child, entry.depth + 1, entry.lower, low_exclusive_upper });
+    }
+}
+
+bool bvh_create_exclusive_host(BVH& bvh)
+{
+    bvh.exclusive_enabled = 1;
+    if (bvh.num_items <= 0 || bvh.max_nodes <= 0)
+        return true;
+
+    wp_free_host(bvh.exclusive_nodes);
+    wp_free_host(bvh.primitive_leaf_indices);
+    bvh.exclusive_nodes
+        = static_cast<BVHExclusiveNode*>(wp_alloc_host(sizeof(BVHExclusiveNode) * bvh.max_nodes, "(native:bvh)"));
+    bvh.primitive_leaf_indices = static_cast<int*>(wp_alloc_host(sizeof(int) * bvh.num_items, "(native:bvh)"));
+    if (!bvh.exclusive_nodes || !bvh.primitive_leaf_indices) {
+        wp::set_error_string("Warp error: failed to allocate exclusive BVH storage");
+        wp_free_host(bvh.exclusive_nodes);
+        wp_free_host(bvh.primitive_leaf_indices);
+        bvh.exclusive_nodes = nullptr;
+        bvh.primitive_leaf_indices = nullptr;
+        return false;
+    }
+
+    bvh_build_exclusive_host(bvh);
+    return true;
+}
+
+void bvh_refit_exclusive_host(BVH& bvh)
+{
+    if (bvh.exclusive_enabled)
+        bvh_build_exclusive_host(bvh);
+}
+
+void bvh_refit_host(BVH& bvh)
+{
+    if (!bvh.root || bvh.num_nodes <= 0)
+        return;
+
+    bvh_refit_recursive(bvh, *bvh.root);
+    bvh_refit_exclusive_host(bvh);
+}
+
 void bvh_rebuild_host(BVH& bvh, int constructor_type)
 {
     if (constructor_type == BVH_CONSTRUCTOR_CUBQL) {
@@ -742,7 +851,12 @@ void bvh_rebuild_host(BVH& bvh, int constructor_type)
             wp::set_error_string("Warp error: cannot rebuild a non-cuBQL BVH with cuBQL construction in place");
             return;
         }
+        const bool enable_exclusive = bvh.exclusive_enabled;
         cubql_bvh_rebuild_host(bvh);
+        if (enable_exclusive && !bvh_create_exclusive_host(bvh)) {
+            bvh_destroy_host(bvh);
+            return;
+        }
         bvh.constructor_type = constructor_type;
         return;
     }
@@ -755,6 +869,7 @@ void bvh_rebuild_host(BVH& bvh, int constructor_type)
     TopDownBVHBuilder builder;
     builder.rebuild(bvh, constructor_type);
     bvh.constructor_type = constructor_type;
+    bvh_refit_exclusive_host(bvh);
 }
 
 }  // namespace wp
@@ -788,21 +903,33 @@ void bvh_rem_descriptor(uint64_t id) { g_bvh_descriptors.erase(id); }
 
 // create in-place given existing descriptor
 void bvh_create_host(
-    vec3* lowers, vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size, BVH& bvh
+    vec3* lowers,
+    vec3* uppers,
+    int num_items,
+    int constructor_type,
+    int* groups,
+    int leaf_size,
+    bool enable_exclusive,
+    BVH& bvh
 )
 {
+    memset(&bvh, 0, sizeof(BVH));
+    if (enable_exclusive && groups) {
+        wp::set_error_string("Warp error: Exclusive BVH metadata is not supported with grouped BVHs");
+        return;
+    }
+
     if (constructor_type == BVH_CONSTRUCTOR_CUBQL) {
         if (groups) {
             wp::set_error_string("Warp error: grouped BVHs are not supported with cuBQL construction");
-            memset(&bvh, 0, sizeof(BVH));
             return;
         }
         cubql_bvh_create_host(lowers, uppers, num_items, leaf_size, bvh);
         bvh.constructor_type = constructor_type;
+        if (enable_exclusive && !bvh_create_exclusive_host(bvh))
+            bvh_destroy_host(bvh);
         return;
     }
-
-    memset(&bvh, 0, sizeof(BVH));
 
     bvh.item_lowers = lowers;
     bvh.item_uppers = uppers;
@@ -813,6 +940,8 @@ void bvh_create_host(
 
     TopDownBVHBuilder builder;
     builder.build(bvh, lowers, uppers, num_items, constructor_type, groups);
+    if (enable_exclusive && !bvh_create_exclusive_host(bvh))
+        bvh_destroy_host(bvh);
 }
 
 
@@ -823,25 +952,41 @@ void bvh_destroy_host(BVH& bvh)
     wp_free_host(bvh.node_parents);
     wp_free_host(bvh.primitive_indices);
     wp_free_host(bvh.root);
+    wp_free_host(bvh.exclusive_nodes);
+    wp_free_host(bvh.primitive_leaf_indices);
 
     bvh.node_lowers = nullptr;
     bvh.node_uppers = nullptr;
     bvh.node_parents = nullptr;
     bvh.primitive_indices = nullptr;
     bvh.root = nullptr;
+    bvh.exclusive_nodes = nullptr;
+    bvh.primitive_leaf_indices = nullptr;
+    bvh.exclusive_enabled = 0;
 
+    bvh.max_depth = 0;
+    bvh.max_depth_ptr = nullptr;
     bvh.max_nodes = 0;
+    bvh.num_nodes = 0;
+    bvh.num_leaf_nodes = 0;
     bvh.num_items = 0;
+    bvh.leaf_size = 0;
+    bvh.item_lowers = nullptr;
+    bvh.item_uppers = nullptr;
+    bvh.item_groups = nullptr;
+    bvh.context = nullptr;
     bvh.constructor_type = BVH_CONSTRUCTOR_SAH;
 }
 
 }  // namespace wp
 
-uint64_t wp_bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size)
+uint64_t wp_bvh_create_host_ex(
+    vec3* lowers, vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size, int enable_exclusive
+)
 {
     BVH* bvh = static_cast<BVH*>(wp_alloc_host(sizeof(BVH), "(native:bvh)"));
     memset(bvh, 0, sizeof(BVH));
-    wp::bvh_create_host(lowers, uppers, num_items, constructor_type, groups, leaf_size, *bvh);
+    wp::bvh_create_host(lowers, uppers, num_items, constructor_type, groups, leaf_size, enable_exclusive != 0, *bvh);
 
     if (!bvh->node_lowers && num_items > 0) {
         wp_free_host(bvh);
@@ -849,6 +994,11 @@ uint64_t wp_bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int const
     }
 
     return (uint64_t)bvh;
+}
+
+uint64_t wp_bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size)
+{
+    return wp_bvh_create_host_ex(lowers, uppers, num_items, constructor_type, groups, leaf_size, 0);
 }
 
 void wp_bvh_refit_host(uint64_t id)
@@ -874,11 +1024,24 @@ void wp_bvh_destroy_host(uint64_t id)
 // stubs for non-CUDA platforms
 #if !WP_ENABLE_CUDA
 
+uint64_t wp_bvh_create_device_ex(
+    void* context,
+    wp::vec3* lowers,
+    wp::vec3* uppers,
+    int num_items,
+    int constructor_type,
+    int* groups,
+    int leaf_size,
+    int enable_exclusive
+)
+{
+    return 0;
+}
 uint64_t wp_bvh_create_device(
     void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size
 )
 {
-    return 0;
+    return wp_bvh_create_device_ex(context, lowers, uppers, num_items, constructor_type, groups, leaf_size, 0);
 }
 void wp_bvh_refit_device(uint64_t id) { }
 void wp_bvh_destroy_device(uint64_t id) { }

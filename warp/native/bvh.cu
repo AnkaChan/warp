@@ -22,7 +22,16 @@
 extern CUcontext get_current_context();
 
 namespace wp {
-void bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int constructor_type, BVH& bvh, int leaf_size);
+void bvh_create_host(
+    vec3* lowers,
+    vec3* uppers,
+    int num_items,
+    int constructor_type,
+    int* groups,
+    int leaf_size,
+    bool enable_exclusive,
+    BVH& bvh
+);
 void bvh_destroy_host(BVH& bvh);
 
 __global__ void memset_kernel(int* dest, int value, size_t n)
@@ -33,6 +42,13 @@ __global__ void memset_kernel(int* dest, int value, size_t n)
     if (tid < n) {
         dest[tid] = value;
     }
+}
+
+__global__ void bvh_update_descriptor_after_lbvh_rebuild_kernel(BVH* bvh)
+{
+    bvh->num_nodes = bvh->max_nodes;
+    bvh->num_leaf_nodes = bvh->num_items;
+    bvh->constructor_type = BVH_CONSTRUCTOR_LBVH;
 }
 
 // for LBVH: this will start with some muted leaf nodes, but that is okay, we can still trace up because there parents
@@ -140,6 +156,129 @@ __global__ void bvh_refit_kernel(
                 break;
             }
         }
+    }
+}
+
+__global__ void bvh_build_exclusive_nodes_kernel(
+    int num_nodes,
+    const int* __restrict__ root,
+    const int* __restrict__ parents,
+    const BVHPackedNodeHalf* __restrict__ node_lowers,
+    const BVHPackedNodeHalf* __restrict__ node_uppers,
+    BVHExclusiveNode* __restrict__ exclusive_nodes
+)
+{
+    const int node_index = blockDim.x * blockIdx.x + threadIdx.x;
+    if (node_index >= num_nodes)
+        return;
+
+    vec3 exclusive_lower(-INFINITY);
+    vec3 exclusive_upper(INFINITY);
+    int depth = 0;
+    int child = node_index;
+    int parent = parents[child];
+    int record_parent = parent;
+    int ancestor_count = 0;
+
+    // cuBQL reserves an unreachable sentinel node whose parent is also -1.
+    // Only the descriptor's actual root receives an infinite certificate.
+    if (parent == -1 && node_index != *root) {
+        exclusive_lower = vec3(INFINITY);
+        exclusive_upper = vec3(-INFINITY);
+        depth = -1;
+    }
+
+    while (depth >= 0 && parent != -1) {
+        if (parent < 0 || parent >= num_nodes || ancestor_count++ >= num_nodes) {
+            exclusive_lower = vec3(INFINITY);
+            exclusive_upper = vec3(-INFINITY);
+            record_parent = -1;
+            depth = -1;
+            break;
+        }
+
+        ++depth;
+        const BVHPackedNodeHalf parent_lower = bvh_load_node(node_lowers, parent);
+        const BVHPackedNodeHalf parent_upper = bvh_load_node(node_uppers, parent);
+
+        // Nodes below an LBVH packed leaf are muted and cannot be reached by a
+        // query. Give them an empty certificate so they cannot be used by
+        // accident through stale auxiliary data.
+        if (parent_lower.b) {
+            exclusive_lower = vec3(INFINITY);
+            exclusive_upper = vec3(-INFINITY);
+            depth = -1;
+            break;
+        }
+
+        const int first_child = int(parent_lower.i);
+        const int second_child = int(parent_upper.i);
+        if (child != first_child && child != second_child) {
+            exclusive_lower = vec3(INFINITY);
+            exclusive_upper = vec3(-INFINITY);
+            depth = -1;
+            break;
+        }
+
+        const BVHPackedNodeHalf first_lower_node = bvh_load_node(node_lowers, first_child);
+        const BVHPackedNodeHalf first_upper_node = bvh_load_node(node_uppers, first_child);
+        const BVHPackedNodeHalf second_lower_node = bvh_load_node(node_lowers, second_child);
+        const BVHPackedNodeHalf second_upper_node = bvh_load_node(node_uppers, second_child);
+        const vec3 first_lower(first_lower_node.x, first_lower_node.y, first_lower_node.z);
+        const vec3 first_upper(first_upper_node.x, first_upper_node.y, first_upper_node.z);
+        const vec3 second_lower(second_lower_node.x, second_lower_node.y, second_lower_node.z);
+        const vec3 second_upper(second_upper_node.x, second_upper_node.y, second_upper_node.z);
+
+        int low_child;
+        const int axis = bvh_exclusive_split_axis(
+            first_lower, first_upper, first_child, second_lower, second_upper, second_child, low_child
+        );
+        const int high_child = low_child == first_child ? second_child : first_child;
+        if (child == low_child) {
+            const vec3 high_inclusive_lower = high_child == first_child ? first_lower : second_lower;
+            exclusive_upper[axis] = std_min(exclusive_upper[axis], high_inclusive_lower[axis]);
+        } else {
+            const vec3 low_inclusive_upper = low_child == first_child ? first_upper : second_upper;
+            exclusive_lower[axis] = std_max(exclusive_lower[axis], low_inclusive_upper[axis]);
+        }
+
+        child = parent;
+        parent = parents[child];
+    }
+
+    exclusive_nodes[node_index] = make_exclusive_node(exclusive_lower, exclusive_upper, record_parent, depth);
+}
+
+__global__ void bvh_build_primitive_leaf_indices_kernel(
+    int num_nodes,
+    const int* __restrict__ parents,
+    const BVHPackedNodeHalf* __restrict__ node_lowers,
+    const BVHPackedNodeHalf* __restrict__ node_uppers,
+    const int* __restrict__ primitive_indices,
+    int* __restrict__ primitive_leaf_indices
+)
+{
+    const int node_index = blockDim.x * blockIdx.x + threadIdx.x;
+    if (node_index >= num_nodes || !node_lowers[node_index].b)
+        return;
+
+    // LBVH retains nodes below a packed leaf in its backing arrays. A leaf is
+    // active only when no ancestor has itself been packed into a leaf.
+    int ancestor = parents[node_index];
+    int ancestor_count = 0;
+    while (ancestor != -1) {
+        if (ancestor < 0 || ancestor >= num_nodes || ancestor_count++ >= num_nodes)
+            return;
+        if (node_lowers[ancestor].b)
+            return;
+        ancestor = parents[ancestor];
+    }
+
+    const int start = int(node_lowers[node_index].i);
+    const int end = int(node_uppers[node_index].i);
+    for (int primitive_offset = start; primitive_offset < end; ++primitive_offset) {
+        const int primitive = primitive_indices[primitive_offset];
+        primitive_leaf_indices[primitive] = node_index;
     }
 }
 
@@ -407,7 +546,8 @@ __global__ void mark_packed_leaf_nodes(
     const uint64_t* __restrict__ keys,
     BVHPackedNodeHalf* __restrict__ lowers,
     BVHPackedNodeHalf* __restrict__ uppers,
-    const int leaf_size
+    const int leaf_size,
+    int* __restrict__ max_depth_out
 )
 {
     int node_index = blockDim.x * blockIdx.x + threadIdx.x;
@@ -422,6 +562,11 @@ __global__ void mark_packed_leaf_nodes(
             parent = parents[parent];
             depth++;
         }
+
+        // Record tree depth (root = 1) for bvh_query_pair_limit(); nodes
+        // muted below forced leaves clamp to the traversal bound.
+        if (max_depth_out)
+            atomicMax(max_depth_out, ::min(depth, BVH_QUERY_STACK_SIZE));
 
         int left = range_lefts[node_index];
         // the LBVH constructor's range is defined as left <= i <= right
@@ -596,10 +741,12 @@ void LinearBVHBuilderGPU::build(
         (num_items, bvh.root, deltas, keys, num_children, bvh.primitive_indices, range_lefts, range_rights,
          bvh.node_parents, bvh.node_lowers, bvh.node_uppers)
     );
+    if (bvh.max_depth_ptr)
+        wp_memset_device(WP_CURRENT_CONTEXT, bvh.max_depth_ptr, 0, sizeof(int));
     wp_launch_device(
         WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes,
         (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, keys, bvh.node_lowers, bvh.node_uppers,
-         bvh.leaf_size)
+         bvh.leaf_size, bvh.max_depth_ptr)
     );
 
     // free temporary memory
@@ -642,6 +789,11 @@ void copy_host_tree_to_device(void* context, BVH& bvh_host, BVH& bvh_device_on_h
 
     bvh_device_on_host.root = (int*)wp_alloc_device(context, sizeof(int), "(native:bvh)");
     wp_memcpy_h2d(context, bvh_device_on_host.root, bvh_host.root, sizeof(int));
+    // Depth lives behind a device pointer so an in-place (graph-captured)
+    // LBVH rebuild of this tree can update it.
+    bvh_device_on_host.max_depth_ptr = (int*)wp_alloc_device(context, sizeof(int), "(native:bvh)");
+    if (bvh_device_on_host.max_depth_ptr)
+        wp_memcpy_h2d(context, bvh_device_on_host.max_depth_ptr, &bvh_host.max_depth, sizeof(int));
     bvh_device_on_host.context = context;
 
     bvh_device_on_host.node_lowers = make_device_buffer_of(context, bvh_host.node_lowers, bvh_host.max_nodes);
@@ -660,10 +812,29 @@ void bvh_create_device(
     int constructor_type,
     int* groups,
     int leaf_size,
+    bool enable_exclusive,
     BVH& bvh_device_on_host
 )
 {
     ContextGuard guard(context);
+    memset(&bvh_device_on_host, 0, sizeof(BVH));
+    if (enable_exclusive && groups) {
+        wp::set_error_string("Warp error: Exclusive BVH metadata is not supported with grouped BVHs");
+        return;
+    }
+
+    bvh_device_on_host.context = context ? context : wp_cuda_context_get_current();
+    bvh_device_on_host.item_lowers = lowers;
+    bvh_device_on_host.item_uppers = uppers;
+    bvh_device_on_host.item_groups = groups;
+    bvh_device_on_host.num_items = num_items;
+    bvh_device_on_host.leaf_size = leaf_size;
+    bvh_device_on_host.constructor_type = constructor_type;
+    if (num_items <= 0) {
+        bvh_device_on_host.exclusive_enabled = enable_exclusive ? 1 : 0;
+        return;
+    }
+
     if (constructor_type == BVH_CONSTRUCTOR_CUBQL) {
         if (groups) {
             wp::set_error_string("Warp error: grouped BVHs are not supported with cuBQL construction");
@@ -671,7 +842,13 @@ void bvh_create_device(
             return;
         }
         cubql_bvh_create_device(context, lowers, uppers, num_items, leaf_size, bvh_device_on_host);
+        if (!bvh_device_on_host.root || !bvh_device_on_host.node_lowers || !bvh_device_on_host.node_uppers
+            || !bvh_device_on_host.node_parents || !bvh_device_on_host.primitive_indices) {
+            return;
+        }
         bvh_device_on_host.constructor_type = constructor_type;
+        if (enable_exclusive && !bvh_create_exclusive_device(bvh_device_on_host))
+            bvh_destroy_device(bvh_device_on_host);
         return;
     }
 
@@ -695,7 +872,8 @@ void bvh_create_device(
         // run CPU based constructor
         wp::BVH bvh_host;
         wp::bvh_create_host(
-            lowers_host.data(), uppers_host.data(), num_items, constructor_type, groups_host_ptr, leaf_size, bvh_host
+            lowers_host.data(), uppers_host.data(), num_items, constructor_type, groups_host_ptr, leaf_size, false,
+            bvh_host
         );
 
         // copy host tree to device
@@ -713,6 +891,7 @@ void bvh_create_device(
         bvh_device_on_host.leaf_size = leaf_size;
         bvh_device_on_host.num_items = num_items;
         bvh_device_on_host.max_nodes = 2 * num_items - 1;
+        bvh_device_on_host.num_nodes = bvh_device_on_host.max_nodes;
         bvh_device_on_host.num_leaf_nodes = num_items;
         bvh_device_on_host.node_lowers = (BVHPackedNodeHalf*)wp_alloc_device(
             WP_CURRENT_CONTEXT, sizeof(BVHPackedNodeHalf) * bvh_device_on_host.max_nodes, "(native:bvh)"
@@ -733,6 +912,8 @@ void bvh_create_device(
         bvh_device_on_host.node_counts
             = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh_device_on_host.max_nodes, "(native:bvh)");
         bvh_device_on_host.root = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int), "(native:bvh)");
+        bvh_device_on_host.max_depth_ptr = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int), "(native:bvh)");
+        bvh_device_on_host.max_depth = 0;
         bvh_device_on_host.primitive_indices
             = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * num_items, "(native:bvh)");
         bvh_device_on_host.item_lowers = lowers;
@@ -748,7 +929,61 @@ void bvh_create_device(
             "Unrecognized Constructor type: %d! For GPU constructor it should be SAH (0), Median (1), or LBVH (2)!\n",
             constructor_type
         );
+        return;
     }
+
+
+    if (enable_exclusive && !bvh_create_exclusive_device(bvh_device_on_host))
+        bvh_destroy_device(bvh_device_on_host);
+}
+
+bool bvh_create_exclusive_device(BVH& bvh)
+{
+    ContextGuard guard(bvh.context);
+    bvh.exclusive_enabled = 1;
+    if (bvh.num_items <= 0)
+        return true;
+    if (bvh.max_nodes <= 0 || bvh.num_nodes <= 0 || !bvh.root || !bvh.node_lowers || !bvh.node_uppers
+        || !bvh.node_parents || !bvh.primitive_indices) {
+        wp::set_error_string("Warp error: cannot create exclusive BVH storage without a valid BVH");
+        return false;
+    }
+
+    wp_free_device(WP_CURRENT_CONTEXT, bvh.exclusive_nodes);
+    wp_free_device(WP_CURRENT_CONTEXT, bvh.primitive_leaf_indices);
+    bvh.exclusive_nodes = (BVHExclusiveNode*)wp_alloc_device(
+        WP_CURRENT_CONTEXT, sizeof(BVHExclusiveNode) * bvh.max_nodes, "(native:bvh)"
+    );
+    bvh.primitive_leaf_indices = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh.num_items, "(native:bvh)");
+    if (!bvh.exclusive_nodes || !bvh.primitive_leaf_indices) {
+        wp::set_error_string("Warp error: failed to allocate exclusive BVH storage");
+        wp_free_device(WP_CURRENT_CONTEXT, bvh.exclusive_nodes);
+        wp_free_device(WP_CURRENT_CONTEXT, bvh.primitive_leaf_indices);
+        bvh.exclusive_nodes = nullptr;
+        bvh.primitive_leaf_indices = nullptr;
+        return false;
+    }
+
+    bvh_refit_exclusive_device(bvh);
+    return true;
+}
+
+void bvh_refit_exclusive_device(BVH& bvh)
+{
+    if (!bvh.exclusive_enabled || !bvh.exclusive_nodes || !bvh.primitive_leaf_indices || bvh.num_nodes <= 0)
+        return;
+
+    ContextGuard guard(bvh.context);
+    wp_memset_device(WP_CURRENT_CONTEXT, bvh.primitive_leaf_indices, 0xFF, sizeof(int) * bvh.num_items);
+    wp_launch_device(
+        WP_CURRENT_CONTEXT, bvh_build_exclusive_nodes_kernel, bvh.num_nodes,
+        (bvh.num_nodes, bvh.root, bvh.node_parents, bvh.node_lowers, bvh.node_uppers, bvh.exclusive_nodes)
+    );
+    wp_launch_device(
+        WP_CURRENT_CONTEXT, bvh_build_primitive_leaf_indices_kernel, bvh.num_nodes,
+        (bvh.num_nodes, bvh.node_parents, bvh.node_lowers, bvh.node_uppers, bvh.primitive_indices,
+         bvh.primitive_leaf_indices)
+    );
 }
 
 void bvh_destroy_device(BVH& bvh)
@@ -767,6 +1002,25 @@ void bvh_destroy_device(BVH& bvh)
     bvh.primitive_indices = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.root);
     bvh.root = NULL;
+    wp_free_device(WP_CURRENT_CONTEXT, bvh.max_depth_ptr);
+    bvh.max_depth_ptr = NULL;
+    wp_free_device(WP_CURRENT_CONTEXT, bvh.exclusive_nodes);
+    bvh.exclusive_nodes = NULL;
+    wp_free_device(WP_CURRENT_CONTEXT, bvh.primitive_leaf_indices);
+    bvh.primitive_leaf_indices = NULL;
+    bvh.exclusive_enabled = 0;
+
+    bvh.max_depth = 0;
+    bvh.max_nodes = 0;
+    bvh.num_nodes = 0;
+    bvh.num_leaf_nodes = 0;
+    bvh.num_items = 0;
+    bvh.leaf_size = 0;
+    bvh.item_lowers = nullptr;
+    bvh.item_uppers = nullptr;
+    bvh.item_groups = nullptr;
+    bvh.context = nullptr;
+    bvh.constructor_type = BVH_CONSTRUCTOR_SAH;
 }
 
 void bvh_refit_device(BVH& bvh)
@@ -785,6 +1039,7 @@ void bvh_refit_device(BVH& bvh)
         (bvh.num_leaf_nodes, bvh.node_parents, bvh.node_counts, bvh.primitive_indices, bvh.node_lowers, bvh.node_uppers,
          bvh.item_lowers, bvh.item_uppers)
     );
+    bvh_refit_exclusive_device(bvh);
 }
 
 void bvh_rebuild_device(BVH& bvh)
@@ -792,14 +1047,30 @@ void bvh_rebuild_device(BVH& bvh)
     ContextGuard guard(bvh.context);
 
     if (bvh.constructor_type == BVH_CONSTRUCTOR_CUBQL) {
+        const bool enable_exclusive = bvh.exclusive_enabled;
+        const int num_items = bvh.num_items;
         cubql_bvh_rebuild_device(bvh);
+        if (num_items > 0
+            && (!bvh.root || !bvh.node_lowers || !bvh.node_uppers || !bvh.node_parents || !bvh.primitive_indices)) {
+            return;
+        }
+        if (enable_exclusive && !bvh_create_exclusive_device(bvh)) {
+            bvh_destroy_device(bvh);
+            return;
+        }
         bvh.constructor_type = BVH_CONSTRUCTOR_CUBQL;
         return;
     }
 
+    // An in-place LBVH rebuild expands a compact host-built tree back to the
+    // full device layout. Keep the local descriptor authoritative for the
+    // Exclusive refresh and for subsequent host-dispatched refits.
+    bvh.num_nodes = bvh.max_nodes;
+    bvh.num_leaf_nodes = bvh.num_items;
     LinearBVHBuilderGPU builder;
     builder.build(bvh, bvh.item_lowers, bvh.item_uppers, bvh.num_items, NULL, bvh.item_groups);
     bvh.constructor_type = BVH_CONSTRUCTOR_LBVH;
+    bvh_refit_exclusive_device(bvh);
 }
 
 
@@ -832,12 +1103,16 @@ void wp_bvh_rebuild_device(uint64_t id)
         // Refresh the host-side descriptor in case any fields changed.
         wp::bvh_add_descriptor(id, bvh);
 
-        // Only the cuBQL path needs the device-side descriptor refreshed. The host->device
-        // copy of pageable memory is not CUDA-graph-capture safe, so we must skip it for the
-        // in-place LBVH rebuild to keep grouped/LBVH rebuilds capture-safe (its device struct
-        // is unchanged anyway).
+        // A pageable host-to-device descriptor copy is not CUDA-graph-capture
+        // safe. cuBQL reallocates buffers and therefore still needs that copy;
+        // the in-place LBVH path updates only its changed scalar fields with a
+        // capture-safe device kernel.
         if (was_cubql) {
             wp_memcpy_h2d(WP_CURRENT_CONTEXT, (void*)id, &bvh, sizeof(wp::BVH));
+        } else {
+            wp_launch_device(
+                WP_CURRENT_CONTEXT, wp::bvh_update_descriptor_after_lbvh_rebuild_kernel, 1, ((wp::BVH*)id)
+            );
         }
     }
 }
@@ -849,8 +1124,15 @@ void wp_bvh_rebuild_device(uint64_t id)
  * muted. However, the muted leaf nodes will still have the pointer to their parents, thus the up-tracing
  * can still work. We will only compute the bounding box of a leaf node if its parent is not a leaf node.
  */
-uint64_t wp_bvh_create_device(
-    void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size
+uint64_t wp_bvh_create_device_ex(
+    void* context,
+    wp::vec3* lowers,
+    wp::vec3* uppers,
+    int num_items,
+    int constructor_type,
+    int* groups,
+    int leaf_size,
+    int enable_exclusive
 )
 {
     ContextGuard guard(context);
@@ -858,7 +1140,8 @@ uint64_t wp_bvh_create_device(
     wp::BVH* bvh_device_ptr = nullptr;
 
     wp::bvh_create_device(
-        WP_CURRENT_CONTEXT, lowers, uppers, num_items, constructor_type, groups, leaf_size, bvh_device_on_host
+        WP_CURRENT_CONTEXT, lowers, uppers, num_items, constructor_type, groups, leaf_size, enable_exclusive != 0,
+        bvh_device_on_host
     );
 
     if (!bvh_device_on_host.node_lowers && num_items > 0) {
@@ -872,6 +1155,13 @@ uint64_t wp_bvh_create_device(
     uint64_t bvh_id = (uint64_t)bvh_device_ptr;
     wp::bvh_add_descriptor(bvh_id, bvh_device_on_host);
     return bvh_id;
+}
+
+uint64_t wp_bvh_create_device(
+    void* context, wp::vec3* lowers, wp::vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size
+)
+{
+    return wp_bvh_create_device_ex(context, lowers, uppers, num_items, constructor_type, groups, leaf_size, 0);
 }
 
 

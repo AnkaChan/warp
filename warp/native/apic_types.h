@@ -10,7 +10,7 @@
 // APIC Format Constants
 // =============================================================================
 
-#define APIC_FORMAT_VERSION 14
+#define APIC_FORMAT_VERSION 15
 #define APIC_MIN_SUPPORTED_FORMAT_VERSION 13
 #define APIC_MAGIC "WRP1"
 #define APIC_MAGIC_VALUE 0x31505257  // "WRP1" as little-endian uint32
@@ -109,10 +109,15 @@ struct APICSectionEntry {
 // Mesh Serialization Records
 // =============================================================================
 
+enum APICMeshFlags : uint8_t {
+    APIC_MESH_FLAG_SUPPORT_WINDING_NUMBER = 1 << 0,
+    APIC_MESH_FLAG_ENABLE_EXCLUSIVE = 1 << 1,
+};
+
 struct APICMeshRecord {
     int32_t num_points;
     int32_t num_tris;
-    uint8_t support_winding_number;
+    uint8_t flags;
     uint8_t bvh_constructor;
     uint16_t bvh_leaf_size;
     uint32_t points_region_id;

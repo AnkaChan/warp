@@ -2466,6 +2466,81 @@ a specified bounding box.
 The kernel is nearly identical to the ray-traversal example, except we obtain ``query`` using
 :func:`wp.bvh_query_aabb() <warp._src.lang.bvh_query_aabb>`.
 
+Coherent Exclusive BVH Queries
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Applications that repeatedly issue spatially or temporally coherent queries can opt in to Exclusive BVH metadata::
+
+    bvh = wp.Bvh(device_lowers, device_uppers, enable_exclusive=True)
+    mesh = wp.Mesh(points, indices, enable_exclusive=True)
+
+This stores additional exclusive bounds for each node and a primitive-to-leaf mapping. It therefore uses more memory
+and adds work to construction, refit, and rebuild operations. Leave this option disabled when the coherent query paths
+are not needed. Exclusive metadata is not supported when constructing a BVH or mesh with ``groups``.
+
+For an AABB query, pass a primitive index from a nearby or previous query to
+:func:`wp.bvh_query_aabb_exclusive() <warp._src.lang.bvh_query_aabb_exclusive>`. Use
+:func:`wp.bvh_query_aabb_exclusive_node() <warp._src.lang.bvh_query_aabb_exclusive_node>` to retain its containment
+node across launches, then pass that node to
+:func:`wp.bvh_query_aabb_exclusive_cached() <warp._src.lang.bvh_query_aabb_exclusive_cached>`. The cached path
+revalidates the node before using it. Initialize ``cached_nodes`` to ``-1`` before the first launch. The following
+kernel initializes one cache entry per query and reuses it on later launches:
+
+.. code:: python
+
+    @wp.kernel
+    def coherent_aabb_queries(
+        bvh_id: wp.uint64,
+        lowers: wp.array[wp.vec3],
+        uppers: wp.array[wp.vec3],
+        seed_primitives: wp.array[int],
+        cached_nodes: wp.array[int],
+        hit_counts: wp.array[int],
+    ):
+        tid = wp.tid()
+        node = cached_nodes[tid]
+        if node < 0:
+            node = wp.bvh_query_aabb_exclusive_node(
+                bvh_id,
+                lowers[tid],
+                uppers[tid],
+                seed_primitives[tid],
+            )
+            cached_nodes[tid] = node
+
+        query = wp.bvh_query_aabb_exclusive_cached(bvh_id, lowers[tid], uppers[tid], node)
+        primitive = wp.int32(0)
+        count = wp.int32(0)
+        while wp.bvh_query_next(query, primitive):
+            count += 1
+        hit_counts[tid] = count
+
+Unsigned closest-point queries have corresponding warm-start paths. These paths also need a mesh constructed with
+``enable_exclusive=True`` for acceleration, including the seeded path, which uses the primitive-to-leaf mapping. Without
+that metadata they safely fall back to the regular query. Pass a face from a nearby or previous query to
+:func:`wp.mesh_query_point_no_sign_seeded() <warp._src.lang.mesh_query_point_no_sign_seeded>` to test every triangle in
+its packed leaf before traversing from the root, or to
+:func:`wp.mesh_query_point_no_sign_exclusive() <warp._src.lang.mesh_query_point_no_sign_exclusive>` to begin at an
+Exclusive BVH containment node. For repeated queries, pair
+:func:`wp.mesh_query_point_no_sign_exclusive_node() <warp._src.lang.mesh_query_point_no_sign_exclusive_node>` with
+:func:`wp.mesh_query_point_no_sign_exclusive_cached() <warp._src.lang.mesh_query_point_no_sign_exclusive_cached>`.
+The cached closest-point query still needs the coherent face so that it can establish an exact distance bound.
+
+The seed should already be available from a nearby or previous query. Obtaining the seed by first running the same
+current query is an oracle experiment: include that seed-discovery work when comparing end-to-end performance.
+
+Containment is strict: a query box or closest-point sphere that touches an exclusive boundary ascends to a safe
+ancestor. Consequently, AABB queries return the same complete hit set, including boundary-touching overlaps, as the
+regular query. Closest distances are also exact, but when multiple faces are tied at that distance, a seeded traversal
+may select a different tied face because it visits nodes in a different order. Do not depend on face identity as a
+stable tie-breaker.
+
+Exclusive metadata is refreshed by :meth:`Bvh.refit`, :meth:`Bvh.rebuild`, and :meth:`Mesh.refit`. Cached queries
+revalidate nodes against the current metadata and walk the current parent chain when necessary, so a stale cache
+remains correct after these operations, although it may provide less acceleration. Recompute cached nodes after a large
+refit or rebuild when query performance matters. Invalid seeds, missing Exclusive BVH metadata, and unusable cached
+nodes safely fall back toward traversal from the global root.
+
 .. _object lifetime pitfall:
 
 Object Lifetime Pitfall

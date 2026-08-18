@@ -136,7 +136,10 @@ bool wp_apic_register_mesh(APICState* state, uint64_t mesh_id)
     APICMeshRecord rec = {};
     rec.num_points = mesh.num_points;
     rec.num_tris = mesh.num_tris;
-    rec.support_winding_number = mesh.solid_angle_props ? 1 : 0;
+    if (mesh.solid_angle_props)
+        rec.flags |= APIC_MESH_FLAG_SUPPORT_WINDING_NUMBER;
+    if (mesh.bvh.exclusive_enabled)
+        rec.flags |= APIC_MESH_FLAG_ENABLE_EXCLUSIVE;
     rec.bvh_constructor = 0;
     rec.bvh_leaf_size = 1;
     rec.points_region_id = points_region_id;

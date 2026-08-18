@@ -43,6 +43,8 @@
 - Add `constructor="cubql"` support to `wp.Bvh` and allow `wp.Mesh(..., bvh_constructor="cubql")`
   to use AABB, point, furthest-point, and ray queries when Warp is built with cuBQL.
   Grouped BVHs/meshes and mesh winding-number queries remain unsupported. ([GH-1467](https://github.com/NVIDIA/warp/issues/1467))
+- Add opt-in Exclusive BVH metadata to `wp.Bvh` and `wp.Mesh` through `enable_exclusive=True`, with seeded and
+  cached coherent-query paths for AABB overlap and unsigned closest-point queries.
 - Add a `cluster_dim` option to `@wp.kernel` and a `wp.get_cuda_max_cluster_dim()` query helper for using CUDA Thread
   Block Clusters from `@wp.func_native` code ([GH-1401](https://github.com/NVIDIA/warp/issues/1401)).
 - Add `wp.CudaManagedAllocator()` for explicit CUDA managed-memory arrays. CPU kernels can use managed arrays as an
@@ -112,6 +114,7 @@
   entire array). It also rejects copies between contiguous arrays whose element sizes differ, matching the existing
   behavior for non-contiguous arrays ([GH-1584](https://github.com/NVIDIA/warp/issues/1584)).
 - Speed up CPU APIC graph replay for launch-dense graphs ([GH-1431](https://github.com/NVIDIA/warp/issues/1431)).
+- Speed up scalar BVH AABB overlap queries, especially for small query boxes and packed leaves.
 
 ### Fixed
 

@@ -189,6 +189,7 @@ static bool cubql_copy_native_order_bvh(
     bvh.num_nodes = int(num_nodes);
     bvh.num_leaf_nodes = 0;
     bvh.max_depth = 0;
+    bvh.max_depth_ptr = nullptr;
     bvh.max_nodes = int(num_nodes);
 
     bvh.node_lowers
@@ -250,7 +251,8 @@ static bool cubql_copy_native_order_bvh(
         depth_stack.pop_back();
         depths.pop_back();
 
-        bvh.max_depth = std_max(bvh.max_depth, depth);
+        // Record the deepest node, counting the root as depth 1.
+        bvh.max_depth = std_max(bvh.max_depth, depth + 1);
 
         if (!bvh.node_lowers[node_index].b) {
             depth_stack.push_back(uint32_t(bvh.node_lowers[node_index].i));
@@ -339,6 +341,7 @@ static bool cubql_copy_to_native_host_bvh(BVH& bvh, const cuBQL::bvh3f& native)
     bvh.num_nodes = 0;
     bvh.num_leaf_nodes = 0;
     bvh.max_depth = 0;
+    bvh.max_depth_ptr = nullptr;
     bvh.max_nodes = 0;
 
     if (native.numNodes == 0 || native.numPrims == 0) {
@@ -377,7 +380,7 @@ static bool cubql_copy_to_native_host_bvh(BVH& bvh, const cuBQL::bvh3f& native)
 
     bvh.num_nodes = int(build.node_lowers.size());
     bvh.num_leaf_nodes = build.num_leaf_nodes;
-    bvh.max_depth = build.max_depth;
+    bvh.max_depth = build.max_depth + 1;  // build.max_depth counts the root as 0
     bvh.max_nodes = bvh.num_nodes;
 
     bvh.node_lowers = static_cast<BVHPackedNodeHalf*>(

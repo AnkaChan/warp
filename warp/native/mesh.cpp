@@ -115,7 +115,7 @@ void bvh_refit_with_solid_angle_recursive_host(BVH& bvh, int index, Mesh& mesh)
 
 void bvh_refit_with_solid_angle_host(BVH& bvh, Mesh& mesh) { bvh_refit_with_solid_angle_recursive_host(bvh, 0, mesh); }
 
-uint64_t wp_mesh_create_host(
+uint64_t wp_mesh_create_host_ex(
     array_t<wp::vec3> points,
     array_t<wp::vec3> velocities,
     array_t<int> indices,
@@ -124,13 +124,12 @@ uint64_t wp_mesh_create_host(
     int support_winding_number,
     int constructor_type,
     int* groups,
-    int bvh_leaf_size
+    int bvh_leaf_size,
+    int enable_exclusive
 )
 {
     Mesh* m
         = new (wp_alloc_host(sizeof(Mesh), "(native:mesh)")) Mesh(points, velocities, indices, num_points, num_tris);
-    const bool use_cubql = (constructor_type == BVH_CONSTRUCTOR_CUBQL);
-
     m->lowers = static_cast<vec3*>(wp_alloc_host(sizeof(vec3) * num_tris, "(native:mesh)"));
     m->uppers = static_cast<vec3*>(wp_alloc_host(sizeof(vec3) * num_tris, "(native:mesh)"));
 
@@ -154,23 +153,9 @@ uint64_t wp_mesh_create_host(
     }
     m->average_edge_length = sum / (num_tris * 3);
 
-#ifndef WP_DISABLE_CUBQL
-    if (use_cubql) {
-        wp::cubql_bvh_create_host(m->lowers, m->uppers, num_tris, bvh_leaf_size, m->bvh);
-    } else
-#else
-    if (use_cubql) {
-        wp::set_error_string("Warp error: cuBQL support disabled (WP_DISABLE_CUBQL)");
-        wp_free_host(m->lowers);
-        wp_free_host(m->uppers);
-        m->~Mesh();
-        wp_free_host(m);
-        return 0;
-    }
-#endif
-    {
-        wp::bvh_create_host(m->lowers, m->uppers, num_tris, constructor_type, groups, bvh_leaf_size, m->bvh);
-    }
+    wp::bvh_create_host(
+        m->lowers, m->uppers, num_tris, constructor_type, groups, bvh_leaf_size, enable_exclusive != 0, m->bvh
+    );
 
     if (!m->bvh.node_lowers && num_tris > 0) {
         wp_free_host(m->lowers);
@@ -185,9 +170,28 @@ uint64_t wp_mesh_create_host(
         m->solid_angle_props
             = static_cast<SolidAngleProps*>(wp_alloc_host(sizeof(SolidAngleProps) * num_bvh_nodes, "(native:mesh)"));
         bvh_refit_with_solid_angle_host(m->bvh, *m);
+        bvh_refit_exclusive_host(m->bvh);
     }
 
     return (uint64_t)m;
+}
+
+uint64_t wp_mesh_create_host(
+    array_t<wp::vec3> points,
+    array_t<wp::vec3> velocities,
+    array_t<int> indices,
+    int num_points,
+    int num_tris,
+    int support_winding_number,
+    int constructor_type,
+    int* groups,
+    int bvh_leaf_size
+)
+{
+    return wp_mesh_create_host_ex(
+        points, velocities, indices, num_points, num_tris, support_winding_number, constructor_type, groups,
+        bvh_leaf_size, 0
+    );
 }
 
 
@@ -233,6 +237,7 @@ void wp_mesh_refit_host(uint64_t id)
     if (m->solid_angle_props) {
         // If solid angle were used, use refit solid angle
         bvh_refit_with_solid_angle_host(m->bvh, *m);
+        bvh_refit_exclusive_host(m->bvh);
     } else {
         wp::bvh_refit_host(m->bvh);
     }
@@ -272,6 +277,22 @@ void wp_mesh_set_velocities_host(uint64_t id, wp::array_t<wp::vec3> velocities)
 #if !WP_ENABLE_CUDA
 
 
+WP_API uint64_t wp_mesh_create_device_ex(
+    void* context,
+    wp::array_t<wp::vec3> points,
+    wp::array_t<wp::vec3> velocities,
+    wp::array_t<int> tris,
+    int num_points,
+    int num_tris,
+    int support_winding_number,
+    int constructor_type,
+    int* groups,
+    int bvh_leaf_size,
+    int enable_exclusive
+)
+{
+    return 0;
+}
 WP_API uint64_t wp_mesh_create_device(
     void* context,
     wp::array_t<wp::vec3> points,
@@ -285,7 +306,10 @@ WP_API uint64_t wp_mesh_create_device(
     int bvh_leaf_size
 )
 {
-    return 0;
+    return wp_mesh_create_device_ex(
+        context, points, velocities, tris, num_points, num_tris, support_winding_number, constructor_type, groups,
+        bvh_leaf_size, 0
+    );
 }
 WP_API void wp_mesh_destroy_device(uint64_t id) { }
 WP_API int wp_mesh_refit_device(uint64_t id) { return 0; }

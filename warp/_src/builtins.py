@@ -6982,6 +6982,70 @@ add_builtin(
 )
 
 add_builtin(
+    "bvh_query_aabb_exclusive",
+    input_types={"id": uint64, "low": vec3, "high": vec3, "seed_primitive": int},
+    value_type=BvhQuery,
+    group="Geometry",
+    doc="""Construct a seeded axis-aligned bounding box query against an Exclusive BVH.
+
+    The query walks from the leaf containing ``seed_primitive`` toward the root and begins top-down traversal at the
+    deepest ancestor whose exclusive bounds strictly contain the query box. Strict containment preserves the regular
+    query's inclusive overlap behavior when the query box touches an exclusive boundary. Create ``id`` with
+    ``enable_exclusive=True`` to enable this acceleration. Without Exclusive BVH metadata, or when the seed is invalid,
+    the exact query safely begins at the global root.
+
+    Args:
+        id: The BVH identifier
+        low: The lower bound of the bounding box in BVH space
+        high: The upper bound of the bounding box in BVH space
+        seed_primitive: A spatially coherent primitive index from the BVH""",
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_query_aabb_exclusive_node",
+    input_types={"id": uint64, "low": vec3, "high": vec3, "seed_primitive": int},
+    value_type=int,
+    group="Geometry",
+    doc="""Find the Exclusive BVH containment node for a seeded AABB query.
+
+    The returned node is the deepest ancestor whose exclusive bounds strictly contain the query box. It can be cached
+    for spatially or temporally coherent calls to :func:`bvh_query_aabb_exclusive_cached`. Create ``id`` with
+    ``enable_exclusive=True`` to enable this acceleration. Invalid seeds and missing Exclusive BVH metadata return the
+    global root.
+
+    Args:
+        id: The BVH identifier
+        low: The lower bound of the bounding box in BVH space
+        high: The upper bound of the bounding box in BVH space
+        seed_primitive: A spatially coherent primitive index from the BVH""",
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_query_aabb_exclusive_cached",
+    input_types={"id": uint64, "low": vec3, "high": vec3, "cached_node": int},
+    value_type=BvhQuery,
+    group="Geometry",
+    doc="""Construct an AABB query from a cached Exclusive BVH containment node.
+
+    The cached node is revalidated against the current exclusive bounds. If it is no longer a strict containment
+    certificate after a refit or rebuild, the query walks its current parent chain and safely falls back to the global
+    root if necessary. Therefore, a stale or invalid cache remains exact, although recomputing cached nodes after a
+    large update may improve performance. Create ``id`` with ``enable_exclusive=True`` to enable this acceleration.
+
+    Args:
+        id: The BVH identifier
+        low: The lower bound of the bounding box in BVH space
+        high: The upper bound of the bounding box in BVH space
+        cached_node: A node returned by :func:`bvh_query_aabb_exclusive_node`""",
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
     "bvh_query_ray",
     input_types={"id": uint64, "start": vec3, "dir": vec3, "root": int},
     defaults={"root": -1},
@@ -7807,6 +7871,231 @@ add_builtin(
         id: The mesh identifier
         point: The point in space to query
         max_dist: Mesh faces above this distance will not be considered by the query.""",
+    require_original_output_arg=True,
+    export=False,
+)
+
+add_builtin(
+    "mesh_query_point_no_sign_seeded",
+    input_types={
+        "id": uint64,
+        "point": vec3,
+        "max_dist": float,
+        "seed_face": int,
+        "face": int,
+        "bary_u": float,
+        "bary_v": float,
+    },
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Compute the closest point on the :class:`warp.Mesh` using an exact warm-start face.
+
+    This method does not compute the sign of the point. It first evaluates every triangle in the packed leaf
+    containing ``seed_face``, then traverses from the root using the resulting exact distance bound. Create the mesh
+    with ``enable_exclusive=True`` to provide the primitive-to-leaf mapping needed for this acceleration. Without that
+    metadata, or when the seed is invalid, the method falls back to :func:`mesh_query_point_no_sign`. The closest
+    distance remains exact, but a different face can be returned when multiple faces are tied at that distance.
+
+    Args:
+        id: The mesh identifier
+        point: The point in space to query
+        max_dist: Mesh faces above this distance will not be considered by the query
+        seed_face: A face from a previous spatially or temporally coherent query
+        face: Returns the index of the closest face
+        bary_u: Returns the barycentric u coordinate of the closest point
+        bary_v: Returns the barycentric v coordinate of the closest point
+
+    Returns:
+        ``True`` if a point < ``max_dist`` is found.""",
+    export=False,
+    hidden=True,
+)
+
+add_builtin(
+    "mesh_query_point_no_sign_seeded",
+    input_types={
+        "id": uint64,
+        "point": vec3,
+        "max_dist": float,
+        "seed_face": int,
+    },
+    value_type=MeshQueryPoint,
+    group="Geometry",
+    doc="""Compute the closest point on the :class:`warp.Mesh` using an exact warm-start face.
+
+    This method does not compute the sign of the point. It first evaluates every triangle in the packed leaf
+    containing ``seed_face``, then traverses from the root using the resulting exact distance bound. Create the mesh
+    with ``enable_exclusive=True`` to provide the primitive-to-leaf mapping needed for this acceleration. Without that
+    metadata, or when the seed is invalid, the method falls back to :func:`mesh_query_point_no_sign`. The closest
+    distance remains exact, but a different face can be returned when multiple faces are tied at that distance.
+
+    Args:
+        id: The mesh identifier
+        point: The point in space to query
+        max_dist: Mesh faces above this distance will not be considered by the query
+        seed_face: A face from a previous spatially or temporally coherent query""",
+    require_original_output_arg=True,
+    export=False,
+)
+
+add_builtin(
+    "mesh_query_point_no_sign_exclusive",
+    input_types={
+        "id": uint64,
+        "point": vec3,
+        "max_dist": float,
+        "seed_face": int,
+        "face": int,
+        "bary_u": float,
+        "bary_v": float,
+    },
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Compute the closest point on the :class:`warp.Mesh` using an Exclusive BVH warm start.
+
+    This method does not compute the sign of the point. It evaluates every triangle in the packed leaf containing
+    ``seed_face`` to define an exact distance sphere, walks toward the root until an exclusive box strictly contains
+    that sphere, then traverses from the certified node with a shrinking distance bound. Create the mesh with
+    ``enable_exclusive=True`` to enable this acceleration. Without Exclusive BVH metadata, or when the seed is invalid,
+    the method falls back to :func:`mesh_query_point_no_sign`. The closest distance remains exact, but a different face
+    can be returned when multiple faces are tied at that distance.
+
+    Args:
+        id: The mesh identifier
+        point: The point in space to query
+        max_dist: Mesh faces above this distance will not be considered by the query
+        seed_face: A face from a previous spatially or temporally coherent query
+        face: Returns the index of the closest face
+        bary_u: Returns the barycentric u coordinate of the closest point
+        bary_v: Returns the barycentric v coordinate of the closest point
+
+    Returns:
+        ``True`` if a point < ``max_dist`` is found.""",
+    export=False,
+    hidden=True,
+)
+
+add_builtin(
+    "mesh_query_point_no_sign_exclusive",
+    input_types={
+        "id": uint64,
+        "point": vec3,
+        "max_dist": float,
+        "seed_face": int,
+    },
+    value_type=MeshQueryPoint,
+    group="Geometry",
+    doc="""Compute the closest point on the :class:`warp.Mesh` using an Exclusive BVH warm start.
+
+    This method does not compute the sign of the point. It evaluates every triangle in the packed leaf containing
+    ``seed_face`` to define an exact distance sphere, walks toward the root until an exclusive box strictly contains
+    that sphere, then traverses from the certified node with a shrinking distance bound. Create the mesh with
+    ``enable_exclusive=True`` to enable this acceleration. Without Exclusive BVH metadata, or when the seed is invalid,
+    the method falls back to :func:`mesh_query_point_no_sign`. The closest distance remains exact, but a different face
+    can be returned when multiple faces are tied at that distance.
+
+    Args:
+        id: The mesh identifier
+        point: The point in space to query
+        max_dist: Mesh faces above this distance will not be considered by the query
+        seed_face: A face from a previous spatially or temporally coherent query""",
+    require_original_output_arg=True,
+    export=False,
+)
+
+add_builtin(
+    "mesh_query_point_no_sign_exclusive_node",
+    input_types={
+        "id": uint64,
+        "point": vec3,
+        "max_dist": float,
+        "seed_face": int,
+    },
+    value_type=int,
+    group="Geometry",
+    doc="""Find the Exclusive BVH containment node for a closest-point query.
+
+    The exact triangles in the packed leaf containing ``seed_face`` define a distance sphere. The returned node's
+    current exclusive bounds strictly contain that sphere, and the node can be passed to
+    :func:`mesh_query_point_no_sign_exclusive_cached`. Create the mesh with ``enable_exclusive=True`` to enable this
+    acceleration. Invalid seeds and missing Exclusive BVH metadata return the global root.
+
+    Args:
+        id: The mesh identifier
+        point: The point in space to query
+        max_dist: Mesh faces above this distance will not be considered by the query
+        seed_face: A spatially or temporally coherent face index""",
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "mesh_query_point_no_sign_exclusive_cached",
+    input_types={
+        "id": uint64,
+        "point": vec3,
+        "max_dist": float,
+        "seed_face": int,
+        "cached_node": int,
+        "face": int,
+        "bary_u": float,
+        "bary_v": float,
+    },
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Compute the closest point on the :class:`warp.Mesh` from a cached Exclusive BVH node.
+
+    Every triangle in the packed leaf containing ``seed_face`` is evaluated exactly. ``cached_node`` is then
+    revalidated against the current exclusive bounds, and its current parent chain is searched if needed after a refit
+    or rebuild. A stale or invalid cache therefore remains exact, although recomputing cached nodes after a large
+    update may improve performance. Create the mesh with ``enable_exclusive=True`` to enable this acceleration. Without
+    Exclusive BVH metadata, or when the seed is invalid, the method falls back to
+    :func:`mesh_query_point_no_sign`. The closest distance remains exact, but a different face can be returned when
+    multiple faces are tied at that distance.
+
+    Args:
+        id: The mesh identifier
+        point: The point in space to query
+        max_dist: Mesh faces above this distance will not be considered by the query
+        seed_face: A face from a previous spatially or temporally coherent query
+        cached_node: A node returned by :func:`mesh_query_point_no_sign_exclusive_node`
+        face: Returns the index of the closest face
+        bary_u: Returns the barycentric u coordinate of the closest point
+        bary_v: Returns the barycentric v coordinate of the closest point
+
+    Returns:
+        ``True`` if a point < ``max_dist`` is found.""",
+    export=False,
+    hidden=True,
+)
+
+add_builtin(
+    "mesh_query_point_no_sign_exclusive_cached",
+    input_types={
+        "id": uint64,
+        "point": vec3,
+        "max_dist": float,
+        "seed_face": int,
+        "cached_node": int,
+    },
+    value_type=MeshQueryPoint,
+    group="Geometry",
+    doc="""Compute the closest point on the :class:`warp.Mesh` from a cached Exclusive BVH node.
+
+    Every triangle in the packed leaf containing ``seed_face`` is evaluated exactly. ``cached_node`` is then
+    revalidated against the current exclusive bounds, and its current parent chain is searched if needed after a refit
+    or rebuild. A stale or invalid cache therefore remains exact, although recomputing cached nodes after a large
+    update may improve performance. Create the mesh with ``enable_exclusive=True`` to enable this acceleration. Without
+    Exclusive BVH metadata, or when the seed is invalid, the method falls back to
+    :func:`mesh_query_point_no_sign`. The closest distance remains exact, but a different face can be returned when
+    multiple faces are tied at that distance.
+
+    Args:
+        id: The mesh identifier
+        point: The point in space to query
+        max_dist: Mesh faces above this distance will not be considered by the query
+        seed_face: A face from a previous spatially or temporally coherent query
+        cached_node: A node returned by :func:`mesh_query_point_no_sign_exclusive_node`""",
     require_original_output_arg=True,
     export=False,
 )

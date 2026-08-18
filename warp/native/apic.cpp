@@ -853,7 +853,10 @@ void apic_register_cpu_mesh(APICState* state, uint64_t mesh_id)
     APICMeshRecord rec = {};
     rec.num_points = mesh.num_points;
     rec.num_tris = mesh.num_tris;
-    rec.support_winding_number = mesh.solid_angle_props ? 1 : 0;
+    if (mesh.solid_angle_props)
+        rec.flags |= APIC_MESH_FLAG_SUPPORT_WINDING_NUMBER;
+    if (mesh.bvh.exclusive_enabled)
+        rec.flags |= APIC_MESH_FLAG_ENABLE_EXCLUSIVE;
     rec.bvh_constructor = 0;
     rec.bvh_leaf_size = 1;
     rec.points_region_id = points_region_id;
@@ -1132,16 +1135,18 @@ bool apic_create_meshes(APICGraph* graph)
             }
         }
 
+        const int support_winding_number = (rec.flags & APIC_MESH_FLAG_SUPPORT_WINDING_NUMBER) != 0;
+        const int enable_exclusive = (rec.flags & APIC_MESH_FLAG_ENABLE_EXCLUSIVE) != 0;
         uint64_t new_mesh_id;
         if (graph->device_type == APIC_DEVICE_CPU) {
-            new_mesh_id = wp_mesh_create_host(
-                points, velocities, indices, rec.num_points, rec.num_tris, rec.support_winding_number,
-                rec.bvh_constructor, nullptr, rec.bvh_leaf_size
+            new_mesh_id = wp_mesh_create_host_ex(
+                points, velocities, indices, rec.num_points, rec.num_tris, support_winding_number, rec.bvh_constructor,
+                nullptr, rec.bvh_leaf_size, enable_exclusive
             );
         } else {
-            new_mesh_id = wp_mesh_create_device(
-                graph->cuda_context, points, velocities, indices, rec.num_points, rec.num_tris,
-                rec.support_winding_number, rec.bvh_constructor, nullptr, rec.bvh_leaf_size
+            new_mesh_id = wp_mesh_create_device_ex(
+                graph->cuda_context, points, velocities, indices, rec.num_points, rec.num_tris, support_winding_number,
+                rec.bvh_constructor, nullptr, rec.bvh_leaf_size, enable_exclusive
             );
         }
 
