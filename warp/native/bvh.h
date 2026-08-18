@@ -520,6 +520,7 @@ struct bvh_query_t {
         , last_query_valid(true)
         , radius(0.0f)
         , radius_sq(0.0f)
+        , ray_parallel_axes(0)
     {
     }
 
@@ -528,8 +529,8 @@ struct bvh_query_t {
 
     BVH bvh;
 
-    // BVH traversal stack of node indices; every entry passed its AABB/ray
-    // test before being pushed.
+    // BVH traversal stack. Volume queries push pre-tested payloads; capsule
+    // queries push node indices and test them when popped.
     // On CUDA the stack lives in shared memory: keeping an array out of this
     // struct lets the compiler keep the remaining members in registers.
 #if BVH_SHARED_STACK
@@ -573,6 +574,7 @@ struct bvh_query_t {
     // Minkowski-offset: sphere radius, or ray inflation radius (0 => plain ray / aabb).
     float radius;
     float radius_sq;  // pre-computed radius*radius for sphere/capsule node tests
+    int ray_parallel_axes;
 };
 
 // Node/primitive overlap test, specialized per query kind at compile time: `if constexpr`
@@ -591,10 +593,9 @@ bvh_query_test(const bvh_query_t& query, const vec3& node_lower, const vec3& nod
         if constexpr (HAS_RADIUS) {
             // Capsule: inflate bounds by radius and use the robust slab test so axis-aligned
             // directions (rcp_dir = +-inf) correctly handle tangent slabs instead of 0*inf = NaN.
-            bool hit = intersect_ray_aabb_robust(
-                query.input_lower,
-                vec3(1.0f / query.input_upper[0], 1.0f / query.input_upper[1], 1.0f / query.input_upper[2]),
-                query.input_upper, node_lower - vec3(query.radius), node_upper + vec3(query.radius), t
+            bool hit = intersect_ray_aabb_robust_masked(
+                query.input_lower, query.input_upper, query.ray_parallel_axes, node_lower - vec3(query.radius),
+                node_upper + vec3(query.radius), t
             );
             return hit && !(t > max_dist);
         } else {
@@ -684,11 +685,12 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, c
 CUDA_CALLABLE inline bvh_query_t
 bvh_query_capsule(uint64_t id, const vec3& start, const vec3& dir, float radius, int root)
 {
-    // Like the plain ray, input_upper stores the reciprocal direction;
-    // bvh_query_test<RAY, true> derives the raw direction from it.
-    bvh_query_t query = bvh_query_common(id, start, 1.0f / dir);
+    // Like the plain ray, input_upper stores the reciprocal direction.
+    const vec3 rcp_dir = 1.0f / dir;
+    bvh_query_t query = bvh_query_common(id, start, rcp_dir);
     query.radius = max(radius, 0.0f);
     query.radius_sq = query.radius * query.radius;
+    query.ray_parallel_axes = (isinf(rcp_dir[0]) ? 1 : 0) | (isinf(rcp_dir[1]) ? 2 : 0) | (isinf(rcp_dir[2]) ? 4 : 0);
     bvh_query_alloc_stack(query);
     query.stack[0] = root == -1 ? *query.bvh.root : root;
     query.count = 1;

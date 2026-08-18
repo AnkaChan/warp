@@ -180,6 +180,35 @@ CUDA_CALLABLE inline bool intersect_ray_aabb_robust(
     return hit;
 }
 
+// Robust ray-AABB intersection with parallel axes classified once per query.
+CUDA_CALLABLE inline bool intersect_ray_aabb_robust_masked(
+    const vec3& pos, const vec3& rcp_dir, int parallel_axes, const vec3& lower, const vec3& upper, float& t
+)
+{
+    if (parallel_axes == 0)
+        return intersect_ray_aabb(pos, rcp_dir, lower, upper, t);
+
+    float lmin = -FLT_MAX;
+    float lmax = FLT_MAX;
+
+    for (int i = 0; i < 3; ++i) {
+        if (parallel_axes & (1 << i)) {
+            if (pos[i] < lower[i] || pos[i] > upper[i])
+                return false;
+        } else {
+            float l1 = (lower[i] - pos[i]) * rcp_dir[i];
+            float l2 = (upper[i] - pos[i]) * rcp_dir[i];
+            lmin = max(min(l1, l2), lmin);
+            lmax = min(max(l1, l2), lmax);
+        }
+    }
+
+    bool hit = ((lmax >= 0.f) & (lmax >= lmin));
+    if (hit)
+        t = lmin;
+    return hit;
+}
+
 CUDA_CALLABLE inline bool
 intersect_aabb_aabb(const vec3& a_lower, const vec3& a_upper, const vec3& b_lower, const vec3& b_upper)
 {
