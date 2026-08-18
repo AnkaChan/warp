@@ -2442,12 +2442,22 @@ struct mesh_query_ray_hit_state_t {
     bool ambiguous_tie;
 };
 
+enum MeshQueryRayPeelingStatus {
+    MESH_QUERY_RAY_PEEL_NONE = 0,
+    MESH_QUERY_RAY_PEEL_TERMINAL = 1 << 0,
+    MESH_QUERY_RAY_PEEL_PREFIX = 1 << 1,
+    MESH_QUERY_RAY_PEEL_SUFFIX = 1 << 2,
+    MESH_QUERY_RAY_PEEL_MIDDLE_DECLINED = 1 << 3,
+    MESH_QUERY_RAY_PEEL_INVALID = 1 << 4,
+};
+
 CUDA_CALLABLE inline void mesh_query_ray_update_primitive(
     const Mesh& mesh,
     int primitive_index,
     const vec3& start,
     const vec3& dir,
     float interval_min,
+    float interval_max,
     mesh_query_ray_hit_state_t& state
 )
 {
@@ -2461,7 +2471,8 @@ CUDA_CALLABLE inline void mesh_query_ray_update_primitive(
 
     float tri_t, tri_u, tri_v, tri_sign;
     vec3 n;
-    if (!intersect_ray_tri_woop(start, dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &n) || tri_t < interval_min) {
+    if (!intersect_ray_tri_woop(start, dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, &n) || tri_t < interval_min
+        || (tri_t >= interval_max && !(state.hit && interval_max == state.min_t && tri_t == state.min_t))) {
         return;
     }
 
@@ -2524,12 +2535,13 @@ CUDA_CALLABLE inline void mesh_query_ray_update_leaf(
     const vec3& start,
     const vec3& dir,
     float interval_min,
+    float interval_max,
     mesh_query_ray_hit_state_t& state
 )
 {
     for (int pc = primitive_begin; pc < primitive_end; ++pc) {
         const int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, pc);
-        mesh_query_ray_update_primitive(mesh, primitive_index, start, dir, interval_min, state);
+        mesh_query_ray_update_primitive(mesh, primitive_index, start, dir, interval_min, interval_max, state);
     }
 }
 
@@ -2583,7 +2595,7 @@ CUDA_CALLABLE inline void mesh_query_ray_traverse_seeded(
         if (bvh_query_node_is_leaf(cur_node)) {
             mesh_query_ray_update_leaf(
                 mesh, bvh_query_node_lower_payload(cur_node), bvh_query_node_upper_payload(cur_node), start, dir,
-                interval_min, state
+                interval_min, state.min_t, state
             );
             if (stack_size == 0)
                 break;
@@ -2635,11 +2647,118 @@ CUDA_CALLABLE inline void mesh_query_ray_traverse_seeded(
     }
 }
 
+// Traverse a disjoint bottom-up frontier subtree over a residual ray
+// interval. The already evaluated packed seed leaf is omitted wherever it
+// occurs in that frontier. Proper complement nodes are disjoint from every
+// peeled E-box interior, so peeling cannot remove one of their AABB tests;
+// retaining the stock node test avoids paying exit-distance arithmetic for a
+// cull that the Exclusive BVH invariant proves impossible. The residual is
+// still applied to exact primitive candidates and can terminate the ascent.
+CUDA_CALLABLE inline void mesh_query_ray_traverse_interval(
+    const Mesh& mesh,
+    int start_node,
+    int skip_leaf,
+    const vec3& start,
+    const vec3& dir,
+    const vec3& rcp_dir,
+    bool fast_aabb,
+    float interval_min,
+    float interval_max,
+    mesh_query_ray_hit_state_t& state
+)
+{
+    if (start_node < 0 || start_node >= mesh.bvh.num_nodes || start_node == skip_leaf)
+        return;
+
+    const BVHPackedNodeHalf start_lower = bvh_load_node(mesh.bvh.node_lowers, start_node);
+    const BVHPackedNodeHalf start_upper = bvh_load_node(mesh.bvh.node_uppers, start_node);
+    if (start_node != *mesh.bvh.root) {
+        float start_t = FLT_MAX;
+        if (!mesh_query_ray_intersect_aabb(
+                start, dir, rcp_dir, fast_aabb, reinterpret_cast<const vec3&>(start_lower),
+                reinterpret_cast<const vec3&>(start_upper), start_t
+            )
+            || !mesh_query_ray_node_before_limit(start_t, state)) {
+            return;
+        }
+    }
+
+    uint64_t stack[BVH_QUERY_STACK_SIZE];
+    int stack_size = 0;
+    uint64_t cur_node = bvh_query_node_pack(start_lower, start_upper);
+    while (true) {
+        if (bvh_query_node_is_leaf(cur_node)) {
+            mesh_query_ray_update_leaf(
+                mesh, bvh_query_node_lower_payload(cur_node), bvh_query_node_upper_payload(cur_node), start, dir,
+                interval_min, interval_max, state
+            );
+            if (stack_size == 0)
+                break;
+            cur_node = stack[--stack_size];
+            continue;
+        }
+
+        const int left_index = bvh_query_node_lower_payload(cur_node);
+        const int right_index = bvh_query_node_upper_payload(cur_node);
+        const BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
+        const BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
+        const BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
+        const BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
+
+        float left_t = FLT_MAX;
+        float right_t = FLT_MAX;
+        const bool hit_left = left_index != skip_leaf
+            && mesh_query_ray_intersect_aabb(
+                                  start, dir, rcp_dir, fast_aabb, reinterpret_cast<const vec3&>(left_lower),
+                                  reinterpret_cast<const vec3&>(left_upper), left_t
+            )
+            && mesh_query_ray_node_before_limit(left_t, state);
+        const bool hit_right = right_index != skip_leaf
+            && mesh_query_ray_intersect_aabb(
+                                   start, dir, rcp_dir, fast_aabb, reinterpret_cast<const vec3&>(right_lower),
+                                   reinterpret_cast<const vec3&>(right_upper), right_t
+            )
+            && mesh_query_ray_node_before_limit(right_t, state);
+
+        if (hit_left && hit_right) {
+            if (stack_size >= BVH_QUERY_STACK_SIZE) {
+                state.ambiguous_tie = true;
+                break;
+            }
+            const bool near_left = left_t < right_t;
+            const uint64_t left_node = bvh_query_node_pack(left_lower, left_upper);
+            const uint64_t right_node = bvh_query_node_pack(right_lower, right_upper);
+            stack[stack_size++] = near_left ? right_node : left_node;
+            cur_node = near_left ? left_node : right_node;
+        } else if (hit_left) {
+            cur_node = bvh_query_node_pack(left_lower, left_upper);
+        } else if (hit_right) {
+            cur_node = bvh_query_node_pack(right_lower, right_upper);
+        } else {
+            if (stack_size == 0)
+                break;
+            cur_node = stack[--stack_size];
+        }
+    }
+}
+
+CUDA_CALLABLE inline bool mesh_query_ray_seed_direction_matches_stock(const vec3& dir)
+{
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!isfinite(dir[axis]))
+            return false;
+        if (dir[axis] != 0.0f && !isfinite(1.0f / dir[axis]))
+            return false;
+    }
+    return true;
+}
+
 CUDA_CALLABLE inline int mesh_query_ray_initialize_seed_leaf(
     const Mesh& mesh, int seed_face, const vec3& start, const vec3& dir, mesh_query_ray_hit_state_t& state
 )
 {
-    if (seed_face < 0 || seed_face >= mesh.num_tris || !bvh_has_exclusive(mesh.bvh))
+    if (seed_face < 0 || seed_face >= mesh.num_tris || !bvh_has_exclusive(mesh.bvh)
+        || !mesh_query_ray_seed_direction_matches_stock(dir))
         return -1;
 
     const int seed_leaf = bvh_get_primitive_leaf(mesh.bvh, seed_face);
@@ -2650,7 +2769,7 @@ CUDA_CALLABLE inline int mesh_query_ray_initialize_seed_leaf(
     if (!lower.b)
         return -1;
     const BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, seed_leaf);
-    mesh_query_ray_update_leaf(mesh, int(lower.i), int(upper.i), start, dir, 0.0f, state);
+    mesh_query_ray_update_leaf(mesh, int(lower.i), int(upper.i), start, dir, 0.0f, state.min_t, state);
     return seed_leaf;
 }
 
@@ -2681,6 +2800,110 @@ CUDA_CALLABLE inline bool mesh_query_ray_active_segment_bounds(
         segment_upper[axis] = mesh_query_ray_next_float_up(upper);
     }
     return true;
+}
+
+CUDA_CALLABLE inline bool mesh_query_ray_active_endpoint_bounds(
+    const vec3& start,
+    const vec3& dir,
+    float max_t,
+    const mesh_query_ray_hit_state_t& state,
+    vec3& endpoint_lower,
+    vec3& endpoint_upper
+)
+{
+    const float endpoint_t = state.hit ? state.min_t : max_t;
+    if (!isfinite(start) || !isfinite(dir) || !isfinite(endpoint_t) || endpoint_t < 0.0f)
+        return false;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        const float endpoint = fmaf(dir[axis], endpoint_t, start[axis]);
+        if (!isfinite(endpoint))
+            return false;
+        endpoint_lower[axis] = mesh_query_ray_next_float_down(endpoint);
+        endpoint_upper[axis] = mesh_query_ray_next_float_up(endpoint);
+    }
+    return true;
+}
+
+CUDA_CALLABLE inline bool mesh_query_ray_point_strictly_inside_exclusive(
+    const vec3& start, const vec3& dir, float ray_t, const BVHExclusiveNode& node, bool& valid
+)
+{
+    valid = true;
+    for (int axis = 0; axis < 3; ++axis) {
+        const float point = fmaf(dir[axis], ray_t, start[axis]);
+        if (!isfinite(point)) {
+            valid = false;
+            return false;
+        }
+        const float point_lower = mesh_query_ray_next_float_down(point);
+        const float point_upper = mesh_query_ray_next_float_up(point);
+        const float box_lower = axis == 0 ? node.lower_x : (axis == 1 ? node.lower_y : node.lower_z);
+        const float box_upper = axis == 0 ? node.upper_x : (axis == 1 ? node.upper_y : node.upper_z);
+        if (!(point_lower > box_lower && point_upper < box_upper))
+            return false;
+    }
+    return true;
+}
+
+// Classify one prefix or suffix covered by an exclusive box. Along the
+// bottom-up path E(child) is contained by E(parent), and every proper
+// complement subtree is disjoint from the peeled interior. Materializing the
+// slab cut therefore cannot change a remaining node or primitive test; only
+// the terminal case can remove work. Keep the residual endpoints unchanged
+// and use this implicit peel to avoid division-heavy slab arithmetic on the
+// common prefix/suffix path. A middle intersection is only diagnosed and is
+// deliberately declined because its complement is two ray intervals.
+CUDA_CALLABLE inline int mesh_query_ray_peel_exclusive_interval(
+    const vec3& start, const vec3& dir, const BVHExclusiveNode& node, float& interval_min, float& interval_max
+)
+{
+    if (bvh_exclusive_node_depth(node) < 0 || !isfinite(start) || !isfinite(dir) || !isfinite(interval_min)
+        || !isfinite(interval_max) || interval_min < 0.0f || interval_max < interval_min) {
+        return MESH_QUERY_RAY_PEEL_INVALID;
+    }
+
+    const vec3 box_lower = bvh_exclusive_node_lower(node);
+    const vec3 box_upper = bvh_exclusive_node_upper(node);
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!(box_lower[axis] < box_upper[axis]))
+            return MESH_QUERY_RAY_PEEL_NONE;
+    }
+
+    bool lower_valid = false;
+    bool upper_valid = false;
+    const bool lower_inside
+        = mesh_query_ray_point_strictly_inside_exclusive(start, dir, interval_min, node, lower_valid);
+    const bool upper_inside
+        = mesh_query_ray_point_strictly_inside_exclusive(start, dir, interval_max, node, upper_valid);
+    if (!lower_valid || !upper_valid)
+        return MESH_QUERY_RAY_PEEL_INVALID;
+    if (lower_inside && upper_inside)
+        return MESH_QUERY_RAY_PEEL_TERMINAL;
+    if (lower_inside)
+        return MESH_QUERY_RAY_PEEL_PREFIX;
+    if (upper_inside)
+        return MESH_QUERY_RAY_PEEL_SUFFIX;
+
+    float box_entry = -FLT_MAX;
+    float box_exit = FLT_MAX;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (dir[axis] == 0.0f) {
+            if (start[axis] <= box_lower[axis] || start[axis] >= box_upper[axis])
+                return MESH_QUERY_RAY_PEEL_NONE;
+        } else {
+            const float t0 = (box_lower[axis] - start[axis]) / dir[axis];
+            const float t1 = (box_upper[axis] - start[axis]) / dir[axis];
+            box_entry = max(box_entry, min(t0, t1));
+            box_exit = min(box_exit, max(t0, t1));
+        }
+    }
+
+    if (!(box_entry < box_exit))
+        return MESH_QUERY_RAY_PEEL_NONE;
+    if (!(box_exit > interval_min && box_entry < interval_max))
+        return MESH_QUERY_RAY_PEEL_NONE;
+    return MESH_QUERY_RAY_PEEL_MIDDLE_DECLINED;
 }
 
 CUDA_CALLABLE inline int mesh_query_ray_find_exclusive_segment(
@@ -2776,6 +2999,202 @@ mesh_query_ray_exclusive_node(uint64_t id, const vec3& start, const vec3& dir, f
     if (!mesh_query_ray_active_segment_bounds(start, dir, max_t, state, segment_lower, segment_upper))
         return root;
     return mesh_query_ray_find_exclusive_segment(mesh, segment_lower, segment_upper, seed_leaf);
+}
+
+CUDA_CALLABLE inline int
+mesh_query_ray_exclusive_endpoint_node(uint64_t id, const vec3& start, const vec3& dir, float max_t, int seed_face)
+{
+    const Mesh mesh = mesh_get(id);
+    const int root = *mesh.bvh.root;
+    mesh_query_ray_hit_state_t state(max_t);
+    const int seed_leaf = mesh_query_ray_initialize_seed_leaf(mesh, seed_face, start, dir, state);
+    if (seed_leaf == -1)
+        return root;
+
+    vec3 endpoint_lower;
+    vec3 endpoint_upper;
+    if (!mesh_query_ray_active_endpoint_bounds(start, dir, max_t, state, endpoint_lower, endpoint_upper))
+        return root;
+    return mesh_query_ray_find_exclusive_segment(mesh, endpoint_lower, endpoint_upper, seed_leaf);
+}
+
+// Search a cached subtree and the disjoint sibling frontier to the root. With
+// Peel enabled, each completed subtree classifies an implicit prefix/suffix
+// peel and terminates once an ancestor E-box strictly contains both active
+// endpoints. The no-peel specialization is the identical-topology control.
+template <bool Peel>
+CUDA_CALLABLE inline bool mesh_query_ray_exclusive_cached_bottom_up_impl(
+    uint64_t id,
+    const vec3& start,
+    const vec3& dir,
+    float max_t,
+    int seed_face,
+    int cached_node,
+    int& peeling_status,
+    float& t,
+    float& u,
+    float& v,
+    float& sign,
+    vec3& normal,
+    int& face
+)
+{
+    peeling_status = MESH_QUERY_RAY_PEEL_NONE;
+    const Mesh mesh = mesh_get(id);
+    const int root = *mesh.bvh.root;
+    if (!bvh_has_exclusive(mesh.bvh) || root < 0 || root >= mesh.bvh.num_nodes || cached_node < 0
+        || cached_node >= mesh.bvh.num_nodes || !isfinite(start) || !isfinite(dir) || !isfinite(max_t)
+        || max_t < 0.0f) {
+        peeling_status = MESH_QUERY_RAY_PEEL_INVALID;
+        return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+    }
+
+    mesh_query_ray_hit_state_t state(max_t);
+    const int seed_leaf = mesh_query_ray_initialize_seed_leaf(mesh, seed_face, start, dir, state);
+    BVHExclusiveNode current_exclusive = bvh_get_exclusive_node(mesh.bvh, cached_node);
+    if (seed_leaf == -1 || bvh_exclusive_node_depth(current_exclusive) < 0) {
+        peeling_status = MESH_QUERY_RAY_PEEL_INVALID;
+        return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+    }
+
+    float interval_min = 0.0f;
+    float interval_max = state.min_t;
+    const vec3 ray_dir = mesh_query_ray_safe_dir(dir);
+    const vec3 rcp_dir(1.0f / ray_dir[0], 1.0f / ray_dir[1], 1.0f / ray_dir[2]);
+    const bool fast_aabb = mesh_query_ray_use_fast_aabb(dir);
+    int current = cached_node;
+    mesh_query_ray_traverse_interval(
+        mesh, current, seed_leaf, start, dir, rcp_dir, fast_aabb, interval_min, interval_max, state
+    );
+    if (state.ambiguous_tie) {
+        peeling_status = MESH_QUERY_RAY_PEEL_INVALID;
+        return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+    }
+    interval_max = min(interval_max, state.min_t);
+
+    if (Peel && current != root) {
+        const int status
+            = mesh_query_ray_peel_exclusive_interval(start, dir, current_exclusive, interval_min, interval_max);
+        peeling_status |= status;
+        if (status & MESH_QUERY_RAY_PEEL_INVALID)
+            return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+        if ((status & MESH_QUERY_RAY_PEEL_TERMINAL) || interval_min > interval_max)
+            return mesh_query_ray_finish_seeded(id, start, dir, max_t, state, t, u, v, sign, normal, face);
+    }
+
+    for (int iteration = 0; current != root; ++iteration) {
+        if (iteration >= mesh.bvh.num_nodes) {
+            peeling_status |= MESH_QUERY_RAY_PEEL_INVALID;
+            return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+        }
+
+        const int parent = bvh_exclusive_node_parent(current_exclusive);
+        if (parent < 0 || parent >= mesh.bvh.num_nodes) {
+            peeling_status |= MESH_QUERY_RAY_PEEL_INVALID;
+            return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+        }
+        const BVHPackedNodeHalf parent_lower = bvh_load_node(mesh.bvh.node_lowers, parent);
+        const BVHPackedNodeHalf parent_upper = bvh_load_node(mesh.bvh.node_uppers, parent);
+        if (parent_lower.b) {
+            peeling_status |= MESH_QUERY_RAY_PEEL_INVALID;
+            return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+        }
+
+        const int left = int(parent_lower.i);
+        const int right = int(parent_upper.i);
+        int sibling = -1;
+        if (left == current && right != current)
+            sibling = right;
+        else if (right == current && left != current)
+            sibling = left;
+        if (sibling < 0 || sibling >= mesh.bvh.num_nodes) {
+            peeling_status |= MESH_QUERY_RAY_PEEL_INVALID;
+            return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+        }
+
+        mesh_query_ray_traverse_interval(
+            mesh, sibling, seed_leaf, start, dir, rcp_dir, fast_aabb, interval_min, interval_max, state
+        );
+        if (state.ambiguous_tie) {
+            peeling_status |= MESH_QUERY_RAY_PEEL_INVALID;
+            return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+        }
+        interval_max = min(interval_max, state.min_t);
+        current = parent;
+        current_exclusive = bvh_get_exclusive_node(mesh.bvh, current);
+        if (bvh_exclusive_node_depth(current_exclusive) < 0) {
+            peeling_status |= MESH_QUERY_RAY_PEEL_INVALID;
+            return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+        }
+
+        if (Peel && current != root) {
+            const int status
+                = mesh_query_ray_peel_exclusive_interval(start, dir, current_exclusive, interval_min, interval_max);
+            peeling_status |= status;
+            if (status & MESH_QUERY_RAY_PEEL_INVALID)
+                return mesh_query_ray(id, start, dir, max_t, t, u, v, sign, normal, face);
+            if ((status & MESH_QUERY_RAY_PEEL_TERMINAL) || interval_min > interval_max)
+                return mesh_query_ray_finish_seeded(id, start, dir, max_t, state, t, u, v, sign, normal, face);
+        }
+    }
+
+    return mesh_query_ray_finish_seeded(id, start, dir, max_t, state, t, u, v, sign, normal, face);
+}
+
+CUDA_CALLABLE inline bool mesh_query_ray_exclusive_cached_bottom_up(
+    uint64_t id,
+    const vec3& start,
+    const vec3& dir,
+    float max_t,
+    int seed_face,
+    int cached_node,
+    float& t,
+    float& u,
+    float& v,
+    float& sign,
+    vec3& normal,
+    int& face
+)
+{
+    int peeling_status;
+    return mesh_query_ray_exclusive_cached_bottom_up_impl<false>(
+        id, start, dir, max_t, seed_face, cached_node, peeling_status, t, u, v, sign, normal, face
+    );
+}
+
+CUDA_CALLABLE inline bool mesh_query_ray_exclusive_cached_peeling(
+    uint64_t id,
+    const vec3& start,
+    const vec3& dir,
+    float max_t,
+    int seed_face,
+    int cached_node,
+    float& t,
+    float& u,
+    float& v,
+    float& sign,
+    vec3& normal,
+    int& face
+)
+{
+    int peeling_status;
+    return mesh_query_ray_exclusive_cached_bottom_up_impl<true>(
+        id, start, dir, max_t, seed_face, cached_node, peeling_status, t, u, v, sign, normal, face
+    );
+}
+
+CUDA_CALLABLE inline int mesh_query_ray_exclusive_cached_peeling_status(
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, int seed_face, int cached_node
+)
+{
+    int peeling_status;
+    float t, u, v, sign;
+    vec3 normal;
+    int face;
+    mesh_query_ray_exclusive_cached_bottom_up_impl<true>(
+        id, start, dir, max_t, seed_face, cached_node, peeling_status, t, u, v, sign, normal, face
+    );
+    return peeling_status;
 }
 
 CUDA_CALLABLE inline int mesh_query_ray_exclusive_node_depth(uint64_t id, int node)
@@ -3241,6 +3660,28 @@ CUDA_CALLABLE inline mesh_query_ray_t mesh_query_ray_exclusive_cached(
 {
     mesh_query_ray_t query;
     query.result = mesh_query_ray_exclusive_cached(
+        id, start, dir, max_t, seed_face, cached_node, query.t, query.u, query.v, query.sign, query.normal, query.face
+    );
+    return query;
+}
+
+CUDA_CALLABLE inline mesh_query_ray_t mesh_query_ray_exclusive_cached_bottom_up(
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, int seed_face, int cached_node
+)
+{
+    mesh_query_ray_t query;
+    query.result = mesh_query_ray_exclusive_cached_bottom_up(
+        id, start, dir, max_t, seed_face, cached_node, query.t, query.u, query.v, query.sign, query.normal, query.face
+    );
+    return query;
+}
+
+CUDA_CALLABLE inline mesh_query_ray_t mesh_query_ray_exclusive_cached_peeling(
+    uint64_t id, const vec3& start, const vec3& dir, float max_t, int seed_face, int cached_node
+)
+{
+    mesh_query_ray_t query;
+    query.result = mesh_query_ray_exclusive_cached_peeling(
         id, start, dir, max_t, seed_face, cached_node, query.t, query.u, query.v, query.sign, query.normal, query.face
     );
     return query;
