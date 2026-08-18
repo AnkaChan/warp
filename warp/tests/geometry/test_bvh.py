@@ -70,14 +70,16 @@ def bvh_capsule_query_decreasing_max_dist(
     direction: wp.vec3,
     initial_max_dist: float,
     reduced_max_dist: float,
-    first_hit_count: wp.array[int],
+    initial_hit_limit: int,
+    initial_hit_count: wp.array[int],
     later_hits: wp.array[int],
 ):
     query = wp.bvh_query_capsule(bvh_id, start, direction, 0.0)
     bounds_nr = int(0)
 
-    if wp.bvh_query_next(query, bounds_nr, initial_max_dist):
-        first_hit_count[0] = 1
+    for _ in range(initial_hit_limit):
+        if wp.bvh_query_next(query, bounds_nr, initial_max_dist):
+            initial_hit_count[0] += 1
 
     while wp.bvh_query_next(query, bounds_nr, reduced_max_dist):
         later_hits[bounds_nr] = 1
@@ -375,6 +377,7 @@ def test_bvh_query_capsule(test, device):
                 wp.vec3(1.0, 0.0, 0.0),
                 1.0,
                 0.0,
+                1,
                 first_hit_count,
                 later_hits,
             ],
@@ -395,6 +398,7 @@ def assert_bvh_capsule_query_guarded(
     constructor,
     groups=None,
     leaf_size=1,
+    block_dim=None,
 ):
     """Assert that a capsule query returns every bound once without touching guards."""
     num_bounds = len(lowers)
@@ -419,6 +423,7 @@ def assert_bvh_capsule_query_guarded(
     initial[-1] = right_canary
     guarded_hits = wp.array(initial, dtype=int, device=device)
 
+    launch_options = {} if block_dim is None else {"block_dim": block_dim}
     wp.launch(
         bvh_capsule_query_guarded,
         dim=1,
@@ -432,13 +437,14 @@ def assert_bvh_capsule_query_guarded(
             guarded_hits,
         ],
         device=device,
+        **launch_options,
     )
 
     np.testing.assert_array_equal(guarded_hits.numpy(), expected)
 
 
 def test_bvh_query_capsule_max_depth(test, device):
-    """Preserve capsule results at the maximum ungrouped BVH depth."""
+    """Preserve capsule results and distance updates at maximum BVH depth."""
     num_bounds = 33
     exponents = 4 * np.arange(num_bounds - 1, -1, -1, dtype=np.float32) - 32
     x = -np.exp2(exponents)
@@ -448,15 +454,48 @@ def test_bvh_query_capsule_max_depth(test, device):
     # Power-of-two spacing makes SAH repeatedly split off the lowest item. The
     # right-first capsule traversal therefore reaches the fixed-stack limit
     # while all deferred siblings remain live.
-    assert_bvh_capsule_query_guarded(
-        device,
-        lowers,
-        uppers,
-        (1.0, 0.0, 0.0),
-        (-1.0, 0.0, 0.0),
-        float(2**97),
-        constructor="sah",
-    )
+    block_dims = (8, 256) if device.is_cuda else (None,)
+    for block_dim in block_dims:
+        with test.subTest(block_dim=block_dim):
+            assert_bvh_capsule_query_guarded(
+                device,
+                lowers,
+                uppers,
+                (1.0, 0.0, 0.0),
+                (-1.0, 0.0, 0.0),
+                float(2**97),
+                constructor="sah",
+                block_dim=block_dim,
+            )
+
+    # At block size 256 the first hit is returned from the overflow subtree.
+    # Tightening the distance before resuming must apply to both its skip-link
+    # walk and the siblings still pending on the fixed stack.
+    device_lowers = wp.array(lowers, dtype=wp.vec3, device=device)
+    device_uppers = wp.array(uppers, dtype=wp.vec3, device=device)
+    bvh = wp.Bvh(device_lowers, device_uppers, constructor="sah")
+    for block_dim in block_dims:
+        first_hit_count = wp.zeros(1, dtype=int, device=device)
+        later_hits = wp.zeros(num_bounds, dtype=int, device=device)
+        launch_options = {} if block_dim is None else {"block_dim": block_dim}
+        wp.launch(
+            bvh_capsule_query_decreasing_max_dist,
+            dim=1,
+            inputs=[
+                bvh.id,
+                wp.vec3(1.0, 0.0, 0.0),
+                wp.vec3(-1.0, 0.0, 0.0),
+                float(2**97),
+                0.0,
+                1,
+                first_hit_count,
+                later_hits,
+            ],
+            device=device,
+            **launch_options,
+        )
+        test.assertEqual(first_hit_count.numpy()[0], 1)
+        test.assertEqual(later_hits.numpy().sum(), 0)
 
 
 def test_bvh_query_capsule_grouped_max_depth(test, device):
@@ -509,6 +548,41 @@ def test_bvh_query_capsule_grouped_max_depth(test, device):
                 groups=lbvh_group_bits.view(np.int32),
                 leaf_size=leaf_size,
             )
+
+            if packed_leaf:
+                # The first fallback leaf is a singleton and the second hit
+                # begins the packed leaf. Its remaining items must use the
+                # reduced distance when the iterator resumes.
+                device_lowers = wp.array(lbvh_lowers, dtype=wp.vec3, device=device)
+                device_uppers = wp.array(lbvh_uppers, dtype=wp.vec3, device=device)
+                device_groups = wp.array(lbvh_group_bits.view(np.int32), dtype=int, device=device)
+                bvh = wp.Bvh(
+                    device_lowers,
+                    device_uppers,
+                    constructor="lbvh",
+                    groups=device_groups,
+                    leaf_size=leaf_size,
+                )
+                initial_hit_count = wp.zeros(1, dtype=int, device=device)
+                later_hits = wp.zeros(lbvh_num_bounds, dtype=int, device=device)
+                wp.launch(
+                    bvh_capsule_query_decreasing_max_dist,
+                    dim=1,
+                    inputs=[
+                        bvh.id,
+                        wp.vec3(-1.0, 0.0, 0.0),
+                        wp.vec3(1.0, 0.0, 0.0),
+                        2.0,
+                        0.0,
+                        2,
+                        initial_hit_count,
+                        later_hits,
+                    ],
+                    device=device,
+                    block_dim=256,
+                )
+                test.assertEqual(initial_hit_count.numpy()[0], 2)
+                test.assertEqual(later_hits.numpy().sum(), 0)
 
 
 def test_bvh_cubql_constructor(test, device):

@@ -19,7 +19,16 @@
 // A grouped host tree can combine 31 balanced group ancestors with the
 // 32-level per-group subtree bound. Capsule traversal pushes both children,
 // so it needs the resulting maximum of 64 live entries.
-#define BVH_CAPSULE_QUERY_STACK_SIZE (64)
+#define BVH_CAPSULE_QUERY_MAX_STACK_SIZE (64)
+#if BVH_SHARED_STACK && WP_TILE_BLOCK_DIM > 128
+#define BVH_CAPSULE_QUERY_STACK_SIZE BVH_QUERY_STACK_SIZE
+#define BVH_CAPSULE_QUERY_USE_SKIP_LINKS 1
+#else
+// CUDA emits a module variant for each block dimension. Sixty-four entries
+// fit within the 48 KiB per-block shared-memory floor through block size 128.
+#define BVH_CAPSULE_QUERY_STACK_SIZE BVH_CAPSULE_QUERY_MAX_STACK_SIZE
+#define BVH_CAPSULE_QUERY_USE_SKIP_LINKS 0
+#endif
 
 #define BVH_CONSTRUCTOR_SAH (0)
 #define BVH_CONSTRUCTOR_MEDIAN (1)
@@ -936,7 +945,12 @@ CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_capsule_t& query, int
     BVH bvh = query.bvh;
 
     while (query.count) {
+#if BVH_CAPSULE_QUERY_USE_SKIP_LINKS
+        const bool skip_links = query.count < 0;
+        const int node_index = skip_links ? ~query.count : query.stack[--query.count];
+#else
         const int node_index = query.stack[--query.count];
+#endif
         const BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
         const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
 
@@ -945,6 +959,12 @@ CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_capsule_t& query, int
                     query, reinterpret_cast<const vec3&>(node_lower), reinterpret_cast<const vec3&>(node_upper),
                     max_dist
                 )) {
+#if BVH_CAPSULE_QUERY_USE_SKIP_LINKS
+                if (skip_links) {
+                    const int next = bvh_load_int(bvh.node_escapes, node_index);
+                    query.count = next == query.stack[BVH_QUERY_STACK_SIZE - 1] ? BVH_QUERY_STACK_SIZE - 1 : ~next;
+                }
+#endif
                 continue;
             }
         }
@@ -954,6 +974,12 @@ CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_capsule_t& query, int
             const int end = node_upper.i;
             if (end - start == 1) {
                 const int primitive_index = bvh_load_int(bvh.primitive_indices, start);
+#if BVH_CAPSULE_QUERY_USE_SKIP_LINKS
+                if (skip_links) {
+                    const int next = bvh_load_int(bvh.node_escapes, node_index);
+                    query.count = next == query.stack[BVH_QUERY_STACK_SIZE - 1] ? BVH_QUERY_STACK_SIZE - 1 : ~next;
+                }
+#endif
                 index = primitive_index;
                 query.bounds_nr = primitive_index;
                 return true;
@@ -961,9 +987,20 @@ CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_capsule_t& query, int
 
             const int primitive_index = bvh_load_int(bvh.primitive_indices, start + query.primitive_counter++);
             if (start + query.primitive_counter != end) {
+#if BVH_CAPSULE_QUERY_USE_SKIP_LINKS
+                if (!skip_links)
+                    query.stack[query.count++] = node_index;
+#else
                 query.stack[query.count++] = node_index;
+#endif
             } else {
                 query.primitive_counter = 0;
+#if BVH_CAPSULE_QUERY_USE_SKIP_LINKS
+                if (skip_links) {
+                    const int next = bvh_load_int(bvh.node_escapes, node_index);
+                    query.count = next == query.stack[BVH_QUERY_STACK_SIZE - 1] ? BVH_QUERY_STACK_SIZE - 1 : ~next;
+                }
+#endif
             }
 
             const vec3 item_lower = bvh_load_vec3(bvh.item_lowers, primitive_index);
@@ -977,8 +1014,20 @@ CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_capsule_t& query, int
         }
 
         query.primitive_counter = 0;
+#if BVH_CAPSULE_QUERY_USE_SKIP_LINKS
+        if (skip_links) {
+            query.count = ~int(node_lower.i);
+        } else if (query.count <= BVH_QUERY_STACK_SIZE - 2) {
+            query.stack[query.count++] = node_lower.i;
+            query.stack[query.count++] = node_upper.i;
+        } else {
+            query.stack[BVH_QUERY_STACK_SIZE - 1] = bvh_load_int(bvh.node_escapes, node_index);
+            query.count = ~int(node_lower.i);
+        }
+#else
         query.stack[query.count++] = node_lower.i;
         query.stack[query.count++] = node_upper.i;
+#endif
     }
     return false;
 }
