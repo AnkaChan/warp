@@ -16,6 +16,10 @@
 #define SAH_NUM_BUCKETS (16)
 #define USE_LOAD4
 #define BVH_QUERY_STACK_SIZE (32)
+// A grouped host tree can combine 31 balanced group ancestors with the
+// 32-level per-group subtree bound. Capsule traversal pushes both children,
+// so it needs the resulting maximum of 64 live entries.
+#define BVH_CAPSULE_QUERY_STACK_SIZE (64)
 
 #define BVH_CONSTRUCTOR_SAH (0)
 #define BVH_CONSTRUCTOR_MEDIAN (1)
@@ -597,7 +601,7 @@ struct bvh_query_capsule_t {
 #if BVH_SHARED_STACK
     bvh_stack_t stack;
 #else
-    int stack[BVH_QUERY_STACK_SIZE];
+    int stack[BVH_CAPSULE_QUERY_STACK_SIZE];
 #endif
     int count;
     int primitive_counter;
@@ -664,7 +668,7 @@ CUDA_CALLABLE inline void bvh_query_alloc_stack(bvh_query_t& query)
 CUDA_CALLABLE inline void bvh_query_alloc_stack(bvh_query_capsule_t& query)
 {
 #if BVH_SHARED_STACK
-    __shared__ int stack[BVH_QUERY_STACK_SIZE * WP_TILE_BLOCK_DIM];
+    __shared__ int stack[BVH_CAPSULE_QUERY_STACK_SIZE * WP_TILE_BLOCK_DIM];
     query.stack.ptr = &stack[threadIdx.x];
 #endif
 }

@@ -82,6 +82,26 @@ def bvh_capsule_query_decreasing_max_dist(
         later_hits[bounds_nr] = 1
 
 
+@wp.kernel
+def bvh_capsule_query_guarded(
+    bvh_id: wp.uint64,
+    start: wp.vec3,
+    direction: wp.vec3,
+    radius: float,
+    max_dist: float,
+    num_bounds: int,
+    guarded_hits: wp.array[int],
+):
+    query = wp.bvh_query_capsule(bvh_id, start, direction, radius)
+    bounds_nr = int(0)
+
+    while wp.bvh_query_next(query, bounds_nr, max_dist):
+        if bounds_nr < 0 or bounds_nr >= num_bounds:
+            guarded_hits[num_bounds + 1] = 0
+        else:
+            wp.atomic_add(guarded_hits, bounds_nr + 1, 1)
+
+
 def aabb_overlap(a_lower, a_upper, b_lower, b_upper):
     if (
         a_lower[0] > b_upper[0]
@@ -361,6 +381,133 @@ def test_bvh_query_capsule(test, device):
         )
         test.assertEqual(first_hit_count.numpy()[0], 1)
         test.assertEqual(later_hits.numpy().sum(), 0)
+
+
+def assert_bvh_capsule_query_guarded(
+    device,
+    lowers,
+    uppers,
+    start,
+    direction,
+    max_dist,
+    *,
+    constructor,
+    groups=None,
+    leaf_size=1,
+):
+    """Assert that a capsule query returns every bound once without touching guards."""
+    num_bounds = len(lowers)
+    device_lowers = wp.array(lowers, dtype=wp.vec3, device=device)
+    device_uppers = wp.array(uppers, dtype=wp.vec3, device=device)
+    device_groups = None if groups is None else wp.array(groups, dtype=int, device=device)
+    bvh = wp.Bvh(
+        device_lowers,
+        device_uppers,
+        constructor=constructor,
+        groups=device_groups,
+        leaf_size=leaf_size,
+    )
+
+    left_canary = np.int32(0x13579BDF)
+    right_canary = np.int32(0x2468ACE)
+    expected = np.ones(num_bounds + 2, dtype=np.int32)
+    expected[0] = left_canary
+    expected[-1] = right_canary
+    initial = np.zeros(num_bounds + 2, dtype=np.int32)
+    initial[0] = left_canary
+    initial[-1] = right_canary
+    guarded_hits = wp.array(initial, dtype=int, device=device)
+
+    wp.launch(
+        bvh_capsule_query_guarded,
+        dim=1,
+        inputs=[
+            bvh.id,
+            wp.vec3(*start),
+            wp.vec3(*direction),
+            0.0,
+            max_dist,
+            num_bounds,
+            guarded_hits,
+        ],
+        device=device,
+    )
+
+    np.testing.assert_array_equal(guarded_hits.numpy(), expected)
+
+
+def test_bvh_query_capsule_max_depth(test, device):
+    """Preserve capsule results at the maximum ungrouped BVH depth."""
+    num_bounds = 33
+    exponents = 4 * np.arange(num_bounds - 1, -1, -1, dtype=np.float32) - 32
+    x = -np.exp2(exponents)
+    lowers = np.column_stack((x, np.full(num_bounds, -0.1), np.full(num_bounds, -0.1))).astype(np.float32)
+    uppers = np.column_stack((x, np.full(num_bounds, 0.1), np.full(num_bounds, 0.1))).astype(np.float32)
+
+    # Power-of-two spacing makes SAH repeatedly split off the lowest item. The
+    # right-first capsule traversal therefore reaches the fixed-stack limit
+    # while all deferred siblings remain live.
+    assert_bvh_capsule_query_guarded(
+        device,
+        lowers,
+        uppers,
+        (1.0, 0.0, 0.0),
+        (-1.0, 0.0, 0.0),
+        float(2**97),
+        constructor="sah",
+    )
+
+
+def test_bvh_query_capsule_grouped_max_depth(test, device):
+    """Preserve full-root capsule results for maximum-depth grouped BVHs."""
+    num_deep_bounds = 33
+    exponents = 4 * np.arange(num_deep_bounds - 1, -1, -1, dtype=np.float32) - 32
+    x = np.concatenate((np.array([-float(2**100)], dtype=np.float32), -np.exp2(exponents)))
+    num_bounds = len(x)
+    lowers = np.column_stack((x, np.full(num_bounds, -0.1), np.full(num_bounds, -0.1))).astype(np.float32)
+    uppers = np.column_stack((x, np.full(num_bounds, 0.1), np.full(num_bounds, 0.1))).astype(np.float32)
+    groups = np.concatenate((np.zeros(1, dtype=np.int32), np.ones(num_deep_bounds, dtype=np.int32)))
+
+    # The right group adds an ancestor to the same SAH ladder used above.
+    assert_bvh_capsule_query_guarded(
+        device,
+        lowers,
+        uppers,
+        (1.0, 0.0, 0.0),
+        (-1.0, 0.0, 0.0),
+        float(2**101),
+        constructor="sah",
+        groups=groups,
+    )
+
+    if device.is_cuda:
+        group_bits = np.empty(33, dtype=np.uint32)
+        group_bits[0] = 0
+        for bit_count in range(1, len(group_bits)):
+            group_bits[bit_count] = ((1 << bit_count) - 1) << (32 - bit_count)
+
+        for packed_leaf in (False, True):
+            if packed_leaf:
+                lbvh_group_bits = np.concatenate((group_bits[:-1], np.repeat(group_bits[-1:], 4)))
+                leaf_size = 4
+            else:
+                lbvh_group_bits = group_bits
+                leaf_size = 1
+
+            lbvh_num_bounds = len(lbvh_group_bits)
+            lbvh_lowers = np.tile(np.array([[-0.5, -0.1, -0.1]], dtype=np.float32), (lbvh_num_bounds, 1))
+            lbvh_uppers = np.tile(np.array([[0.5, 0.1, 0.1]], dtype=np.float32), (lbvh_num_bounds, 1))
+            assert_bvh_capsule_query_guarded(
+                device,
+                lbvh_lowers,
+                lbvh_uppers,
+                (-1.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                2.0,
+                constructor="lbvh",
+                groups=lbvh_group_bits.view(np.int32),
+                leaf_size=leaf_size,
+            )
 
 
 def test_bvh_cubql_constructor(test, device):
@@ -1116,6 +1263,13 @@ add_function_test(TestBvh, "test_bvh_degenerate_deep_tree", test_bvh_degenerate_
 add_function_test(TestBvh, "test_bvh_ray", test_bvh_query_ray, devices=devices)
 add_function_test(TestBvh, "test_bvh_sphere", test_bvh_query_sphere, devices=devices)
 add_function_test(TestBvh, "test_bvh_capsule", test_bvh_query_capsule, devices=devices)
+add_function_test(TestBvh, "test_bvh_capsule_max_depth", test_bvh_query_capsule_max_depth, devices=devices)
+add_function_test(
+    TestBvh,
+    "test_bvh_capsule_grouped_max_depth",
+    test_bvh_query_capsule_grouped_max_depth,
+    devices=devices,
+)
 add_function_test(TestBvh, "test_bvh_cubql_constructor", test_bvh_cubql_constructor, devices=devices)
 add_function_test(
     TestBvh,
