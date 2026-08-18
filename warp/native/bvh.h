@@ -520,7 +520,6 @@ struct bvh_query_t {
         , last_query_valid(true)
         , radius(0.0f)
         , radius_sq(0.0f)
-        , ray_parallel_axes(0)
     {
     }
 
@@ -574,6 +573,39 @@ struct bvh_query_t {
     // Minkowski-offset: sphere radius, or ray inflation radius (0 => plain ray / aabb).
     float radius;
     float radius_sq;  // pre-computed radius*radius for sphere/capsule node tests
+};
+
+// Capsule queries keep only the state needed by their test-on-pop stack.
+struct bvh_query_capsule_t {
+    CUDA_CALLABLE bvh_query_capsule_t()
+        : bvh()
+        , stack()
+        , count(0)
+        , primitive_counter(0)
+        , input_lower()
+        , input_upper()
+        , bounds_nr(0)
+        , last_query_valid(true)
+        , radius(0.0f)
+        , ray_parallel_axes(0)
+    {
+    }
+
+    CUDA_CALLABLE inline bvh_query_capsule_t& operator+=(const bvh_query_capsule_t& other) { return *this; }
+
+    BVH bvh;
+#if BVH_SHARED_STACK
+    bvh_stack_t stack;
+#else
+    int stack[BVH_QUERY_STACK_SIZE];
+#endif
+    int count;
+    int primitive_counter;
+    vec3 input_lower;
+    vec3 input_upper;
+    int bounds_nr;
+    bool last_query_valid;
+    float radius;
     int ray_parallel_axes;
 };
 
@@ -581,9 +613,9 @@ struct bvh_query_t {
 // discards the untaken branches, so each instantiation folds to a dispatch-free test.
 // The ray variants also apply the max_dist predicate (closed endpoint for capsules,
 // half-open for plain rays, matching the original behavior of each).
-template <BvhQueryKind QUERY_KIND, bool HAS_RADIUS>
+template <BvhQueryKind QUERY_KIND, bool HAS_RADIUS, typename Query>
 CUDA_CALLABLE inline bool
-bvh_query_test(const bvh_query_t& query, const vec3& node_lower, const vec3& node_upper, const float& max_dist)
+bvh_query_test(const Query& query, const vec3& node_lower, const vec3& node_upper, const float& max_dist)
 {
     if constexpr (QUERY_KIND == BvhQueryKind::SPHERE) {
         // exact sphere-AABB node test using pre-computed radius_sq
@@ -622,6 +654,14 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_common(uint64_t id, const vec3& lower
 // plain ray queries remain stackless. Kept in a single non-template function
 // so every stack-based query shares one block-wide allocation.
 CUDA_CALLABLE inline void bvh_query_alloc_stack(bvh_query_t& query)
+{
+#if BVH_SHARED_STACK
+    __shared__ int stack[BVH_QUERY_STACK_SIZE * WP_TILE_BLOCK_DIM];
+    query.stack.ptr = &stack[threadIdx.x];
+#endif
+}
+
+CUDA_CALLABLE inline void bvh_query_alloc_stack(bvh_query_capsule_t& query)
 {
 #if BVH_SHARED_STACK
     __shared__ int stack[BVH_QUERY_STACK_SIZE * WP_TILE_BLOCK_DIM];
@@ -682,14 +722,17 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, c
     return query;
 }
 
-CUDA_CALLABLE inline bvh_query_t
+CUDA_CALLABLE inline bvh_query_capsule_t
 bvh_query_capsule(uint64_t id, const vec3& start, const vec3& dir, float radius, int root)
 {
     // Like the plain ray, input_upper stores the reciprocal direction.
     const vec3 rcp_dir = 1.0f / dir;
-    bvh_query_t query = bvh_query_common(id, start, rcp_dir);
+    bvh_query_capsule_t query;
+    query.bounds_nr = -1;
+    query.bvh = bvh_get(id);
+    query.input_lower = start;
+    query.input_upper = rcp_dir;
     query.radius = max(radius, 0.0f);
-    query.radius_sq = query.radius * query.radius;
     query.ray_parallel_axes = (isinf(rcp_dir[0]) ? 1 : 0) | (isinf(rcp_dir[1]) ? 2 : 0) | (isinf(rcp_dir[2]) ? 4 : 0);
     bvh_query_alloc_stack(query);
     query.stack[0] = root == -1 ? *query.bvh.root : root;
@@ -884,35 +927,22 @@ CUDA_CALLABLE inline bool bvh_query_next_directed(bvh_query_t& query, int& index
 
 // Capsule queries use a test-on-pop stack so a caller may tighten max_dist
 // between iterator calls. Packed-leaf items are still tested individually.
-CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_t& query, int& index, const float& max_dist)
+CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_capsule_t& query, int& index, const float& max_dist)
 {
     BVH bvh = query.bvh;
 
-    for (;;) {
-        if (query.prim_cur < query.prim_end) {
-            const int primitive_index = bvh_load_int(bvh.primitive_indices, query.prim_cur++);
-            const vec3 item_lower = bvh_load_vec3(bvh.item_lowers, primitive_index);
-            const vec3 item_upper = bvh_load_vec3(bvh.item_uppers, primitive_index);
-
-            if (bvh_query_test<BvhQueryKind::RAY, true>(query, item_lower, item_upper, max_dist)) {
-                index = primitive_index;
-                query.bounds_nr = primitive_index;
-                return true;
-            }
-            continue;
-        }
-
-        if (!query.count)
-            return false;
-
+    while (query.count) {
         const int node_index = query.stack[--query.count];
         const BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
         const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
 
-        if (!bvh_query_test<BvhQueryKind::RAY, true>(
-                query, reinterpret_cast<const vec3&>(node_lower), reinterpret_cast<const vec3&>(node_upper), max_dist
-            )) {
-            continue;
+        if (query.primitive_counter == 0) {
+            if (!bvh_query_test<BvhQueryKind::RAY, true>(
+                    query, reinterpret_cast<const vec3&>(node_lower), reinterpret_cast<const vec3&>(node_upper),
+                    max_dist
+                )) {
+                continue;
+            }
         }
 
         if (node_lower.b) {
@@ -925,14 +955,28 @@ CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_t& query, int& index,
                 return true;
             }
 
-            query.prim_cur = start;
-            query.prim_end = end;
-            continue;
+            const int primitive_index = bvh_load_int(bvh.primitive_indices, start + query.primitive_counter++);
+            if (start + query.primitive_counter != end) {
+                query.stack[query.count++] = node_index;
+            } else {
+                query.primitive_counter = 0;
+            }
+
+            const vec3 item_lower = bvh_load_vec3(bvh.item_lowers, primitive_index);
+            const vec3 item_upper = bvh_load_vec3(bvh.item_uppers, primitive_index);
+            if (!bvh_query_test<BvhQueryKind::RAY, true>(query, item_lower, item_upper, max_dist))
+                continue;
+
+            index = primitive_index;
+            query.bounds_nr = primitive_index;
+            return true;
         }
 
+        query.primitive_counter = 0;
         query.stack[query.count++] = node_lower.i;
         query.stack[query.count++] = node_upper.i;
     }
+    return false;
 }
 
 // Per-kind public iterators. Each is a thin wrapper around the shared template
@@ -952,7 +996,7 @@ CUDA_CALLABLE inline bool bvh_query_ray_next(bvh_query_t& query, int& index, con
 }
 
 // Capsule iterator (BvhQueryCapsule type)
-CUDA_CALLABLE inline bool bvh_query_capsule_next(bvh_query_t& query, int& index, const float& max_dist)
+CUDA_CALLABLE inline bool bvh_query_capsule_next(bvh_query_capsule_t& query, int& index, const float& max_dist)
 {
     return bvh_query_next_capsule(query, index, max_dist);
 }
@@ -965,10 +1009,19 @@ CUDA_CALLABLE inline bool bvh_query_sphere_next(bvh_query_t& query, int& index, 
 
 CUDA_CALLABLE inline int iter_next(bvh_query_t& query) { return query.bounds_nr; }
 
+CUDA_CALLABLE inline int iter_next(bvh_query_capsule_t& query) { return query.bounds_nr; }
+
 CUDA_CALLABLE inline bool iter_cmp(bvh_query_t& query)
 {
     float max_dist = FLT_MAX;
     bool finished = bvh_query_next(query, query.bounds_nr, max_dist);
+    return finished;
+}
+
+CUDA_CALLABLE inline bool iter_cmp(bvh_query_capsule_t& query)
+{
+    float max_dist = FLT_MAX;
+    bool finished = bvh_query_capsule_next(query, query.bounds_nr, max_dist);
     return finished;
 }
 
@@ -977,6 +1030,8 @@ CUDA_CALLABLE inline bvh_query_t iter_reverse(const bvh_query_t& query)
     // can't reverse BVH queries, users should not rely on traversal ordering
     return query;
 }
+
+CUDA_CALLABLE inline bvh_query_capsule_t iter_reverse(const bvh_query_capsule_t& query) { return query; }
 
 CUDA_CALLABLE bool bvh_get_descriptor(uint64_t id, BVH& bvh);
 CUDA_CALLABLE void bvh_add_descriptor(uint64_t id, const BVH& bvh);

@@ -2148,6 +2148,8 @@ class BvhQueryRay(BvhQuery):
 class BvhQueryCapsule(BvhQuery):
     """Query object returned by :func:`warp.bvh_query_capsule`. Advance with :func:`warp.bvh_query_next`."""
 
+    _wp_native_name_ = "bvh_query_capsule_t"
+
 
 class BvhQuerySphere(BvhQuery):
     """Query object returned by :func:`warp.bvh_query_sphere`. Advance with :func:`warp.bvh_query_next`."""
