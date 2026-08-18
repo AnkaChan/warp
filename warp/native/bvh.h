@@ -928,8 +928,8 @@ CUDA_CALLABLE inline bool bvh_query_next_capsule(bvh_query_t& query, int& index,
             continue;
         }
 
-        query.stack[query.count++] = node_upper.i;
         query.stack[query.count++] = node_lower.i;
+        query.stack[query.count++] = node_upper.i;
     }
 }
 
