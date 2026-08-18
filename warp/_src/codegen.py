@@ -25,6 +25,8 @@ from copy import copy as shallowcopy
 from dataclasses import dataclass
 from typing import Any, ClassVar, Literal, NamedTuple, get_args, get_origin
 
+import numpy as np
+
 import warp.config
 from warp._src.deterministic import DeterministicCodegen
 from warp._src.logger import log_debug, log_warning
@@ -448,13 +450,21 @@ def _make_struct_field_setter(cls, field: str, var_type: type):
         elif type(value) is var_type:
             setattr(inst._ctype, field, value)
         else:
-            if is_scalar(value):
+            if isinstance(value, (builtins.bool, warp.bool, np.bool_, np.integer, np.floating)):
                 log_warning(
-                    f"Implicit conversion from a scalar type to the composite type "
+                    f"Implicit conversion from a value of type `{type(value).__name__}` to the composite type "
                     f"`{type_repr(var_type)}` for struct field '{field}' is deprecated. "
-                    f"Use an explicit conversion, e.g.: `{type_repr(var_type)}(...)`.",
+                    f"Construct the value explicitly, e.g.: `{type_repr(var_type)}(...)`.",
                     category=DeprecationWarning,
                     stacklevel=3,
+                )
+                # Normalize values so transformations broadcast like the other composite types.
+                value = float(value) if isinstance(value, np.floating) else int(value)
+            elif not hasattr(value, "__len__"):
+                raise TypeError(
+                    f"Struct field '{field}' expects {type_repr(var_type)} but got a single "
+                    f"value of type {type(value).__name__}. Construct the value explicitly, "
+                    f"e.g.: {type_repr(var_type)}(...)."
                 )
             # conversion from list/tuple, ndarray, etc.
             setattr(inst._ctype, field, var_type(value))
@@ -1769,14 +1779,6 @@ class Adjoint:
         # key "values[i]" but a different value per iteration.
         adj.deferred_static_expressions: list[tuple[str, Any]] = []
 
-        # There are cases where a same module might be rebuilt multiple times,
-        # for example when kernels are nested inside of functions, or when
-        # a kernel's launch raises an exception. Ideally we'd always want to
-        # avoid rebuilding kernels but some corner cases seem to depend on it,
-        # so we only avoid rebuilding kernels that errored out to give a chance
-        # for unit testing errors being spit out from kernels.
-        adj.skip_build = False
-
         # Feature-specific deterministic lowering state.  Keep its policy and
         # helper metadata behind a small integration object so the core codegen
         # paths do not need to coordinate deterministic internals directly.
@@ -1952,13 +1954,10 @@ class Adjoint:
     # generate function ssa form and adjoint
     @synchronized(_codegen_lock)
     def build(adj, builder, default_builder_options=None, callable_arg_values=None):
-        # arg Var read/write flags are held during module rebuilds, so we reset here even when skipping a build
+        # arg Var read/write flags are held during module rebuilds, so we reset here before rebuilding
         for arg in adj.args:
             arg.is_read = False
             arg.is_write = False
-
-        if adj.skip_build:
-            return
 
         if callable_arg_values is None:
             callable_arg_values = getattr(adj, "callable_arg_values", None)
@@ -2005,7 +2004,7 @@ class Adjoint:
         adj.max_required_extra_shared_memory_backward = 0
 
         # recorded at call sites for ModuleBuilder's post-build propagation passes
-        adj.called_user_functions = set()
+        adj.called_user_functions = {}
 
         # wp.ref[T] callees lacking a manual adjoint; rejected post-build, once used_by_backward_kernel is final
         adj.unvalidated_ref_calls = []
@@ -2041,7 +2040,6 @@ class Adjoint:
                 # 'from None' is used to suppress Python's chained exceptions for a cleaner error output.
                 raise type(original_exc)(*new_args).with_traceback(original_exc.__traceback__) from None
             finally:
-                adj.skip_build = True
                 adj.builder = None
 
         if builder is not None:
@@ -2059,9 +2057,9 @@ class Adjoint:
     def _validate_return_type(adj):
         """Validate function return type annotation against actual return values.
 
-        This validation happens during build() (before C++ code generation) to catch
-        errors early and prevent module contamination. If validation fails here,
-        the function is marked as skip_build and won't emit any C++ code.
+        This validation happens during build() (before C++ code generation) so the
+        error names the annotation that is wrong, rather than surfacing later as a
+        C++ reference to a function the module never emitted.
         """
         if adj.return_var is not None and "return" in adj.arg_types:
             if get_origin(adj.arg_types["return"]) is tuple:
@@ -2602,7 +2600,7 @@ class Adjoint:
         # if it is a user-function then build it recursively
         if not func.is_builtin():
             # record the call-graph edge for the post-build propagation passes
-            adj.called_user_functions.add(func)
+            adj.called_user_functions.setdefault(func, None)
             # If the function called is a user function,
             # we need to ensure its adjoint is also being generated.
             if adj.used_by_backward_kernel:
@@ -2735,7 +2733,7 @@ class Adjoint:
             # if the argument is a function (and not a builtin), then build it recursively
             if isinstance(func_arg_var, warp._src.context.Function) and not func_arg_var.is_builtin():
                 # a function-valued argument is a call-graph edge too
-                adj.called_user_functions.add(func_arg_var)
+                adj.called_user_functions.setdefault(func_arg_var, None)
                 if adj.used_by_backward_kernel:
                     func_arg_var.adj.used_by_backward_kernel = True
                 if adj.force_adjoint_codegen:
@@ -3285,14 +3283,19 @@ class Adjoint:
         if cond.constant is not None:
             return adj.eval(node.body) if cond.constant else adj.eval(node.orelse)
 
+        def load_ifexp_branch(var):
+            if is_reference(var.type):
+                return adj.add_builtin_call("copy", [var])
+            return adj.load(var)
+
         adj.begin_if(cond)
         body = adj.eval(node.body)
-        body = adj.load(body)
+        body = load_ifexp_branch(body)
         adj.end_if(cond)
 
         adj.begin_else(cond)
         orelse = adj.eval(node.orelse)
-        orelse = adj.load(orelse)
+        orelse = load_ifexp_branch(orelse)
         adj.end_else(cond)
 
         return adj.add_builtin_call("where", [cond, body, orelse])
@@ -4353,26 +4356,7 @@ class Adjoint:
                     target.mark_read()
 
             else:
-                # Keep the original source-level indices for deterministic view
-                # tracking before the plain array path rewrites integer indices
-                # into slice arguments for the native view builtin.
                 view_indices = tuple(indices)
-
-                if warp._src.types.matches_array_class(target_type, warp._src.types.array):
-                    # In order to reduce the number of overloads needed in the C
-                    # implementation to support combinations of int/slice indices,
-                    # we convert all integer indices into slices, and set their
-                    # step to 0 if they are representing an integer index.
-                    new_indices = []
-                    for idx in indices:
-                        if not warp._src.types.is_slice(strip_reference(idx.type)):
-                            new_idx = adj.add_builtin_call("slice", (idx, idx, 0))
-                            new_indices.append(new_idx)
-                        else:
-                            new_indices.append(idx)
-
-                    indices = new_indices
-
                 # handles array views (fewer indices than dimensions)
                 out = adj.add_builtin_call("view", [target, *indices])
                 adj.deterministic.track_view(out, target, view_indices)
@@ -4839,6 +4823,8 @@ class Adjoint:
         start = SLICE_BEGIN if node.lower is None else adj.eval(node.lower)
         stop = SLICE_END if node.upper is None else adj.eval(node.upper)
         step = 1 if node.step is None else adj.eval(node.step)
+        if isinstance(step, Var) and step.constant == 0:
+            raise WarpCodegenValueError("Slice step cannot be zero.")
         return adj.add_builtin_call("slice", (start, stop, step))
 
     def store_ref_param_value(adj, name, value, *, augmented=False):

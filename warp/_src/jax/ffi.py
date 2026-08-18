@@ -1373,6 +1373,9 @@ def jax_kernel(
     else:
         hashable_launch_dims = launch_dims
 
+    # Empty selections normalize to None because the constructors treat them identically.
+    hashable_in_out_argnames = tuple(in_out_argnames) if in_out_argnames else None
+
     if not enable_backward:
         key = (
             kernel.func,
@@ -1381,6 +1384,7 @@ def jax_kernel(
             vmap_method,
             hashable_launch_dims,
             hashable_output_dims,
+            hashable_in_out_argnames,
             module_preload_mode,
             has_side_effect,
             block_dim,
@@ -1395,7 +1399,7 @@ def jax_kernel(
                     launch_dims,
                     block_dim,
                     output_dims,
-                    in_out_argnames,
+                    hashable_in_out_argnames,
                     module_preload_mode,
                     has_side_effect=has_side_effect,
                 )
@@ -1719,11 +1723,25 @@ def jax_callable(
         num_outputs: Specify the number of output arguments if greater than 1.
             This must include the number of ``in_out_arguments``.
         graph_mode: CUDA graph capture mode.
-            ``JaxCallableGraphMode.JAX`` (default): Let JAX capture the graph, which may be used as a subgraph in an enclosing JAX capture.
-            ``JaxCallableGraphMode.WARP``: Let Warp capture the graph. Use this mode when the callable cannot be used as a subgraph,
-            such as when the callable uses conditional graph nodes.
-            ``JaxCallableGraphMode.NONE``: Disable graph capture. Use when the callable performs operations that are not legal in a graph,
-            such as host synchronization.
+            ``JaxCallableGraphMode.JAX`` (default): Let JAX capture the graph,
+            which may be used as a subgraph in an enclosing JAX capture.
+            ``JaxCallableGraphMode.WARP``: Let Warp capture the graph. For a
+            given compiled call, Warp reuses it when the input and output
+            buffer addresses match those of an earlier invocation. Use this
+            mode when the callable cannot be used as a subgraph, such as when
+            it uses conditional graph nodes.
+            ``JaxCallableGraphMode.WARP_STAGED``: Capture a Warp graph against
+            stable staging buffers, with input and output copies inside the
+            graph. The graph can be reused when JAX supplies different buffer
+            addresses for a compiled call.
+            ``JaxCallableGraphMode.WARP_STAGED_EX``: Capture against stable
+            staging buffers, but submit the input and output copies outside the
+            graph.
+            ``JaxCallableGraphMode.NONE``: Disable graph capture. Use when the
+            callable performs operations that are not legal in a graph, such
+            as host synchronization.
+            Staged modes use extra device memory and copy staged arguments on
+            each call. Benchmark both staged modes for the target workload.
             On CPU, ``JaxCallableGraphMode.NONE`` and ``JaxCallableGraphMode.JAX``
             both execute without graph capture. The ``WARP``, ``WARP_STAGED``, and
             ``WARP_STAGED_EX`` modes require CUDA.
@@ -1735,10 +1753,15 @@ def jax_callable(
         in_out_argnames: Names of arguments that are both inputs and outputs (aliased buffers).
             These must be array arguments that appear before any pure output arguments in the
             function signature. The number of in-out arguments is included in ``num_outputs``.
-        stage_in_argnames: Names of input arguments that need to be copied with ``JaxCallableGraphMode.WARP_STAGED*``.
-            If ``None``, copy all input arguments.
-        stage_out_argnames: Names of output arguments that need to be copied with ``JaxCallableGraphMode.WARP_STAGED*``.
-            If ``None``, copy all output arguments.
+        stage_in_argnames: Names of non-empty array inputs to copy into staging
+            buffers on each call in ``WARP_STAGED`` or ``WARP_STAGED_EX`` mode.
+            If ``None``, copy every non-empty array input. When specific names
+            are provided, other array inputs keep the values copied during
+            graph setup.
+        stage_out_argnames: Names of non-empty array outputs to copy from staging
+            buffers on each call in ``WARP_STAGED`` or ``WARP_STAGED_EX`` mode.
+            If ``None``, copy every non-empty array output. When specific names
+            are provided, other array outputs are not copied back.
         graph_cache_max: Maximum number of cached graphs captured using ``JaxCallableGraphMode.WARP``.
             If ``None``, the graph cache is unlimited.
         module_preload_mode: Specify the devices where the module should be preloaded.
@@ -1769,6 +1792,14 @@ def jax_callable(
     else:
         hashable_output_dims = output_dims
 
+    # Empty selections normalize to None to mirror the constructors: an empty or missing
+    # in_out selection aliases nothing, and an empty or missing staging selection stages
+    # every argument. Distinguishing them here would only split the cache between two
+    # identically behaving wrappers.
+    hashable_in_out_argnames = tuple(in_out_argnames) if in_out_argnames else None
+    hashable_stage_in_argnames = tuple(stage_in_argnames) if stage_in_argnames else None
+    hashable_stage_out_argnames = tuple(stage_out_argnames) if stage_out_argnames else None
+
     # Note: we don't include graph_cache_max in the key, it is applied below.
     key = (
         func,
@@ -1776,6 +1807,9 @@ def jax_callable(
         graph_mode,
         vmap_method,
         hashable_output_dims,
+        hashable_in_out_argnames,
+        hashable_stage_in_argnames,
+        hashable_stage_out_argnames,
         module_preload_mode,
         has_side_effect,
     )
@@ -1789,9 +1823,9 @@ def jax_callable(
                 graph_mode,
                 vmap_method,
                 output_dims,
-                in_out_argnames,
-                stage_in_argnames,
-                stage_out_argnames,
+                hashable_in_out_argnames,
+                hashable_stage_in_argnames,
+                hashable_stage_out_argnames,
                 graph_cache_max,
                 module_preload_mode,
                 has_side_effect,

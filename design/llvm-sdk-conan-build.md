@@ -13,14 +13,17 @@ The distribution plan linked above moves these prebuilt SDKs to GitHub Releases 
 but its build phase left open how the SDKs get built: a public Conan recipe, or container-based
 Python/CMake scripts like `docker/warp-builder` and `build_llvm.py`.
 
-Three overlapping build definitions exist today:
+Two overlapping build definitions exist today:
 
 1. `build_llvm.py`: plain CMake driver, used by `build_lib.py --build-llvm` as a user-facing fallback.
-2. `docker/warp-builder/Dockerfile`: mirrors those flags inside manylinux containers to bake `/opt/llvm`
-   into builder images.
-3. An NVIDIA-internal Conan recipe (`clang-warp`): the most complete of the three, with per-platform
+2. An NVIDIA-internal Conan recipe (`clang-warp`): the more complete of the two, with per-platform
    profiles, a two-pass native-tablegen cross build for windows-aarch64, size optimization,
    and library pruning.
+
+`docker/warp-builder/Dockerfile` was a third: it mirrored those flags inside manylinux containers to
+bake `/opt/llvm` into the builder images, because publishing prebuilt SDKs was impractical at the time.
+Publishing to GitHub Releases removed that constraint, so the image no longer ships Clang/LLVM and
+builds inside it fetch the SDK through Packman like any other consumer.
 
 This document specifies the build side of the distribution plan: a public, standalone Conan recipe
 under `tools/llvm/` executed entirely on GitHub Actions runners.
@@ -181,8 +184,10 @@ Every job has the same shape:
    `test_package` compiles, links, and (except when cross-compiling) runs automatically.
 3. Deployer produces the normalized SDK tree; deterministic `tar.xz` with the distribution plan's
    asset naming.
-4. Emit a build-info JSON fragment (recipe git SHA, resolved profile, container image digest,
-   toolchain and Conan versions) for the promotion job to merge.
+4. Emit a build-info JSON fragment with the recipe git SHA, resolved profile, container image digest,
+   toolchain and Conan versions, and an optional typed `build_environment`. Linux records the pinned
+   manylinux digest; native jobs record the runner label plus GitHub's `ImageOS` and `ImageVersion`.
+   The existing schema version and container-only `image_digest` field remain unchanged.
 5. Upload as a job artifact for the release pipeline.
    On `platforms=all` dispatches, a fully green build+smoke matrix automatically assembles the
    draft release: the archives, a `SHA256SUMS` file, and the merged build-info document,
@@ -205,7 +210,29 @@ larger GitHub-hosted runners, not a return to internal CI.
 
 The deployer (`deployers/llvm_sdk.py`, a standard Conan `deploy()` hook) copies the package into a
 normalized tree: `include/llvm`, `include/clang`, flat `lib/` with static libraries only,
-and `licenses/` with LLVM's LICENSE.TXT and third-party notices.
+and the following fixed ten-file license and attribution bundle:
+
+```text
+licenses/
+├── LLVM-ATTRIBUTION.txt                              # generated for the pinned LLVM release
+├── clang/LICENSE.TXT                                 # clang/LICENSE.TXT
+├── llvm/LICENSE.TXT                                  # llvm/LICENSE.TXT
+└── third-party/
+    ├── BLAKE3/LICENSE                                # llvm/lib/Support/BLAKE3/LICENSE
+    ├── MD5/NOTICE.txt                                # comment in llvm/lib/Support/MD5.cpp
+    ├── Unicode/ConvertUTF-NOTICE.txt                 # comment in llvm/lib/Support/ConvertUTF.cpp
+    ├── Unicode/UnicodeData-NOTICE.txt                # comment in llvm/lib/Support/UnicodeNameToCodepointGenerated.cpp
+    ├── regex/COPYRIGHT                               # llvm/lib/Support/COPYRIGHT.regex
+    ├── strlcpy/NOTICE.txt                            # comment in llvm/lib/Support/regstrlcpy.c
+    └── xxhash/NOTICE.txt                             # comment in llvm/lib/Support/xxhash.cpp
+```
+
+Copied license files must exist, and each extracted notice marker must remain unique. Markers name the
+upstream project or its license rather than quoting copyright years or maintainer emails, so a routine
+re-sync of a vendored source does not fail the build. Missing sources or ambiguous markers fail packaging;
+the fixed manifest must be re-audited whenever LLVM is bumped.
+This bundle is the archive's license contract; it is not a complete software bill of materials. SBOM
+generation remains a separate promotion-stage requirement.
 Conan artifacts are stripped.
 The tree shape matches what `build_llvm.py:fetch_prebuilt_libraries` and `WarpDependencies.cmake`
 already expect, so consumer code needs no changes when the download source moves.
@@ -261,6 +288,27 @@ then run the cold-cache Packman pull against the published assets.
 That check cannot run pre-publish because draft assets require authentication;
 the full consumption path (redirect chain, checksum rejection of corrupted archives, cache reuse,
 `@` surviving in asset names) was validated end-to-end against a temporary fork release.
+
+Publish by re-asserting the tag in the same call, and check the tag first:
+
+```bash
+gh api repos/NVIDIA/warp/releases/<id> --jq .tag_name          # expect llvm-sdk-<version>-warp.<revision>
+gh api -X PATCH repos/NVIDIA/warp/releases/<id> \
+  -f tag_name='llvm-sdk-<version>-warp.<revision>' -F draft=false -f make_latest=false
+```
+
+A draft's `tag_name` is only a stored string; no git ref exists until the release is published.
+Any edit of a draft that omits `tag_name` silently replaces it with an `untagged-<hash>` placeholder,
+and publishing then creates a git tag carrying that placeholder name.
+This is not specific to the web UI: `gh release edit <tag> --notes ...` without `--tag` resets it too,
+and pre-creating the git tag beforehand does not prevent it.
+Only re-sending `tag_name` on each edit preserves it, which also restores it after a reset.
+The `publish-draft` job asserts the tag after creating the draft and prints the publish command
+in the job summary, but it cannot police edits made afterwards.
+
+The consequence is not cosmetic. Publishing under a placeholder produces a tag that looks like debris,
+inviting deletion, and deleting the tag of a published release reverts it to a draft,
+which takes every consumer offline at once. That sequence has already happened once.
 
 **5. Consumer migration (distribution plan Phase 2).**
 A checked-in Packman manifest pins the release tag, per-platform package versions,

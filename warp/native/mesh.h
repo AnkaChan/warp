@@ -124,63 +124,64 @@ CUDA_CALLABLE inline float mesh_query_inside_ray_tracing(uint64_t id, const vec3
 CUDA_CALLABLE inline float
 mesh_query_inside_parity(uint64_t id, const vec3& p, const vec3 base_dir, int n_sample, float perturbation_scale);
 
-// returns true if there is a point (strictly) < distance max_dist
-CUDA_CALLABLE inline bool
-mesh_query_point(uint64_t id, const vec3& point, float max_dist, float& inside, int& face, float& u, float& v)
+// Shared shrinking-radius closest-point traversal used by the mesh_query_point* variants.
+// Nearest-child-first descent with the child distances computed at the parent and carried
+// on the stack, so each node is loaded exactly once and pops pruned by the shrunken
+// radius touch no memory. Returns the squared distance to the closest (non-sliver)
+// triangle, or ``max_dist_sq`` when none is closer; outputs are only valid in the
+// former case.
+CUDA_CALLABLE inline float mesh_query_point_core(
+    const Mesh& mesh, const vec3& point, const float max_dist_sq, int& min_face, float& min_v, float& min_w
+)
 {
-    Mesh mesh = mesh_get(id);
+    float min_dist_sq = max_dist_sq;
 
-    int stack[BVH_QUERY_STACK_SIZE];
-    stack[0] = *mesh.bvh.root;
+    uint64_t node_stack[BVH_QUERY_STACK_SIZE];
+    float dist_stack[BVH_QUERY_STACK_SIZE];
+    int count = 0;
 
-    int count = 1;
+    uint64_t node = 0;
+    bool have_node = false;
 
-    float min_dist_sq = max_dist * max_dist;
-    int min_face;
-    float min_v;
-    float min_w;
-
-#if BVH_DEBUG
-    int tests = 0;
-    int secondary_culls = 0;
-
-    std::vector<int> test_history;
-    std::vector<vec3> test_centers;
-    std::vector<vec3> test_extents;
-#endif
-
-    while (count) {
-        const int nodeIndex = stack[--count];
-
-        BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
-        BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
-
-        // re-test distance
-        float node_dist_sq
-            = distance_to_aabb_sq(point, vec3(lower.x, lower.y, lower.z), vec3(upper.x, upper.y, upper.z));
-        if (node_dist_sq > min_dist_sq) {
-#if BVH_DEBUG
-            secondary_culls++;
-#endif
-            continue;
+    {
+        const int root_index = *mesh.bvh.root;
+        const BVHPackedNodeHalf root_lower = bvh_load_node(mesh.bvh.node_lowers, root_index);
+        const BVHPackedNodeHalf root_upper = bvh_load_node(mesh.bvh.node_uppers, root_index);
+        const float root_dist_sq = distance_to_aabb_sq(
+            point, reinterpret_cast<const vec3&>(root_lower), reinterpret_cast<const vec3&>(root_upper)
+        );
+        if (root_dist_sq <= min_dist_sq) {
+            node = bvh_query_node_pack(root_lower, root_upper);
+            have_node = true;
         }
+    }
 
-        const int left_index = lower.i;
-        const int right_index = upper.i;
+    // a single flat loop; every iteration processes the node carried over in
+    // registers from the previous iteration (the near child), or pops one.
+    // Only far children go through the stack.
+    while (have_node || count) {
+        if (!have_node) {
+            --count;
+            // the radius may have shrunk since this entry was pushed
+            if (dist_stack[count] > min_dist_sq)
+                continue;
+            node = node_stack[count];
+        }
+        have_node = false;
 
-        if (lower.b) {
-            const int start = left_index;
-            const int end = right_index;
+        if (bvh_query_node_is_leaf(node)) {
+            const int start = bvh_query_node_lower_payload(node);
+            const int end = bvh_query_node_upper_payload(node);
             // loops through primitives in the leaf
             for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
-                int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                int i = mesh.indices[primitive_index * 3 + 0];
-                int j = mesh.indices[primitive_index * 3 + 1];
-                int k = mesh.indices[primitive_index * 3 + 2];
+                int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
+                int i = bvh_load_int(mesh.indices, primitive_index * 3 + 0);
+                int j = bvh_load_int(mesh.indices, primitive_index * 3 + 1);
+                int k = bvh_load_int(mesh.indices, primitive_index * 3 + 2);
 
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
+                vec3 p = bvh_load_vec3(mesh.points, i);
+                vec3 q = bvh_load_vec3(mesh.points, j);
+                vec3 r = bvh_load_vec3(mesh.points, k);
 
                 vec3 e0 = q - p;
                 vec3 e1 = r - p;
@@ -206,90 +207,58 @@ mesh_query_point(uint64_t id, const vec3& point, float max_dist, float& inside, 
                     min_face = primitive_index;
                 }
             }
-
-#if BVH_DEBUG
-
-            tests++;
-
-            bounds3 b;
-            b = bounds_union(b, p);
-            b = bounds_union(b, q);
-            b = bounds_union(b, r);
-
-            if (distance_to_aabb_sq(point, b.lower, b.upper) < max_dist * max_dist) {
-                // if (dist_sq < max_dist*max_dist)
-                test_history.push_back(left_index);
-                test_centers.push_back(b.center());
-                test_extents.push_back(b.edges());
-            }
-#endif
-
         } else {
-            BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
-            BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
+            const int left_index = bvh_query_node_lower_payload(node);
+            const int right_index = bvh_query_node_upper_payload(node);
 
-            BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
-            BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
+            const BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
+            const BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
+            const BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
+            const BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
 
-            float left_dist_sq = distance_to_aabb_sq(
-                point, vec3(left_lower.x, left_lower.y, left_lower.z), vec3(left_upper.x, left_upper.y, left_upper.z)
+            const float left_dist_sq = distance_to_aabb_sq(
+                point, reinterpret_cast<const vec3&>(left_lower), reinterpret_cast<const vec3&>(left_upper)
             );
-            float right_dist_sq = distance_to_aabb_sq(
-                point, vec3(right_lower.x, right_lower.y, right_lower.z),
-                vec3(right_upper.x, right_upper.y, right_upper.z)
+            const float right_dist_sq = distance_to_aabb_sq(
+                point, reinterpret_cast<const vec3&>(right_lower), reinterpret_cast<const vec3&>(right_upper)
             );
 
-            wp::vec2i child_indices;
-            wp::vec2 child_dist;
-            if (left_dist_sq < right_dist_sq) {
-                child_indices = wp::vec2i(right_index, left_index);
-                child_dist = wp::vec2(right_dist_sq, left_dist_sq);
-            } else {
-                child_indices = wp::vec2i(left_index, right_index);
-                child_dist = wp::vec2(left_dist_sq, right_dist_sq);
+            // visit the nearer child first (ties go right, matching the previous traversal)
+            const bool near_is_left = (left_dist_sq < right_dist_sq);
+            const float near_dist_sq = near_is_left ? left_dist_sq : right_dist_sq;
+            const float far_dist_sq = near_is_left ? right_dist_sq : left_dist_sq;
+
+            // if the stack is full the far child is dropped; the previous
+            // fixed-size-stack traversal overflowed instead
+            if (far_dist_sq < min_dist_sq && count < BVH_QUERY_STACK_SIZE) {
+                node_stack[count] = near_is_left ? bvh_query_node_pack(right_lower, right_upper)
+                                                 : bvh_query_node_pack(left_lower, left_upper);
+                dist_stack[count] = far_dist_sq;
+                count++;
             }
 
-            if (child_dist[0] < min_dist_sq)
-                stack[count++] = child_indices[0];
-
-            if (child_dist[1] < min_dist_sq)
-                stack[count++] = child_indices[1];
+            if (near_dist_sq < min_dist_sq) {
+                node = near_is_left ? bvh_query_node_pack(left_lower, left_upper)
+                                    : bvh_query_node_pack(right_lower, right_upper);
+                have_node = true;
+            }
         }
     }
 
+    return min_dist_sq;
+}
 
-#if BVH_DEBUG
-    printf("%d\n", tests);
+// returns true if there is a point (strictly) < distance max_dist
+CUDA_CALLABLE inline bool
+mesh_query_point(uint64_t id, const vec3& point, float max_dist, float& inside, int& face, float& u, float& v)
+{
+    Mesh mesh = mesh_get(id);
 
-    static int max_tests = 0;
-    static vec3 max_point;
-    static float max_point_dist = 0.0f;
-    static int max_secondary_culls = 0;
+    int min_face;
+    float min_v;
+    float min_w;
 
-    if (secondary_culls > max_secondary_culls)
-        max_secondary_culls = secondary_culls;
-
-    if (tests > max_tests) {
-        max_tests = tests;
-        max_point = point;
-        max_point_dist = sqrtf(min_dist_sq);
-
-        printf(
-            "max_tests: %d max_point: %f %f %f max_point_dist: %f max_second_culls: %d\n", max_tests, max_point[0],
-            max_point[1], max_point[2], max_point_dist, max_secondary_culls
-        );
-
-        FILE* f = fopen("test_history.txt", "w");
-        for (int i = 0; i < test_history.size(); ++i) {
-            fprintf(
-                f, "%d, %f, %f, %f, %f, %f, %f\n", test_history[i], test_centers[i][0], test_centers[i][1],
-                test_centers[i][2], test_extents[i][0], test_extents[i][1], test_extents[i][2]
-            );
-        }
-
-        fclose(f);
-    }
-#endif
+    const float min_dist_sq = mesh_query_point_core(mesh, point, max_dist * max_dist, min_face, min_v, min_w);
 
     // check if we found a point, and write outputs
     if (min_dist_sq < max_dist * max_dist) {
@@ -321,166 +290,11 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_parity(
 {
     Mesh mesh = mesh_get(id);
 
-    int stack[BVH_QUERY_STACK_SIZE];
-    stack[0] = *mesh.bvh.root;
-
-    int count = 1;
-
-    float min_dist_sq = max_dist * max_dist;
     int min_face;
     float min_v;
     float min_w;
 
-#if BVH_DEBUG
-    int tests = 0;
-    int secondary_culls = 0;
-
-    std::vector<int> test_history;
-    std::vector<vec3> test_centers;
-    std::vector<vec3> test_extents;
-#endif
-
-    while (count) {
-        const int nodeIndex = stack[--count];
-
-        BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
-        BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
-
-        // re-test distance
-        float node_dist_sq
-            = distance_to_aabb_sq(point, vec3(lower.x, lower.y, lower.z), vec3(upper.x, upper.y, upper.z));
-        if (node_dist_sq > min_dist_sq) {
-#if BVH_DEBUG
-            secondary_culls++;
-#endif
-            continue;
-        }
-
-        const int left_index = lower.i;
-        const int right_index = upper.i;
-
-        if (lower.b) {
-            const int start = left_index;
-            const int end = right_index;
-            // loops through primitives in the leaf
-            for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
-                int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                int i = mesh.indices[primitive_index * 3 + 0];
-                int j = mesh.indices[primitive_index * 3 + 1];
-                int k = mesh.indices[primitive_index * 3 + 2];
-
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
-
-                vec3 e0 = q - p;
-                vec3 e1 = r - p;
-                vec3 e2 = r - q;
-                vec3 normal = cross(e0, e1);
-
-                // sliver detection
-                if (length(normal) / (dot(e0, e0) + dot(e1, e1) + dot(e2, e2)) < 1.e-6f)
-                    continue;
-
-                vec2 barycentric = closest_point_to_triangle(p, q, r, point);
-                float u = barycentric[0];
-                float v = barycentric[1];
-                float w = 1.f - u - v;
-                vec3 c = u * p + v * q + w * r;
-
-                float dist_sq = length_sq(c - point);
-
-                if (dist_sq < min_dist_sq) {
-                    min_dist_sq = dist_sq;
-                    min_v = v;
-                    min_w = w;
-                    min_face = primitive_index;
-                }
-            }
-
-#if BVH_DEBUG
-
-            tests++;
-
-            bounds3 b;
-            b = bounds_union(b, p);
-            b = bounds_union(b, q);
-            b = bounds_union(b, r);
-
-            if (distance_to_aabb_sq(point, b.lower, b.upper) < max_dist * max_dist) {
-                // if (dist_sq < max_dist*max_dist)
-                test_history.push_back(left_index);
-                test_centers.push_back(b.center());
-                test_extents.push_back(b.edges());
-            }
-#endif
-
-        } else {
-            BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
-            BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
-
-            BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
-            BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
-
-            float left_dist_sq = distance_to_aabb_sq(
-                point, vec3(left_lower.x, left_lower.y, left_lower.z), vec3(left_upper.x, left_upper.y, left_upper.z)
-            );
-            float right_dist_sq = distance_to_aabb_sq(
-                point, vec3(right_lower.x, right_lower.y, right_lower.z),
-                vec3(right_upper.x, right_upper.y, right_upper.z)
-            );
-
-            wp::vec2i child_indices;
-            wp::vec2 child_dist;
-            if (left_dist_sq < right_dist_sq) {
-                child_indices = wp::vec2i(right_index, left_index);
-                child_dist = wp::vec2(right_dist_sq, left_dist_sq);
-            } else {
-                child_indices = wp::vec2i(left_index, right_index);
-                child_dist = wp::vec2(left_dist_sq, right_dist_sq);
-            }
-
-            if (child_dist[0] < min_dist_sq)
-                stack[count++] = child_indices[0];
-
-            if (child_dist[1] < min_dist_sq)
-                stack[count++] = child_indices[1];
-        }
-    }
-
-
-#if BVH_DEBUG
-    printf("%d\n", tests);
-
-    static int max_tests = 0;
-    static vec3 max_point;
-    static float max_point_dist = 0.0f;
-    static int max_secondary_culls = 0;
-
-    if (secondary_culls > max_secondary_culls)
-        max_secondary_culls = secondary_culls;
-
-    if (tests > max_tests) {
-        max_tests = tests;
-        max_point = point;
-        max_point_dist = sqrtf(min_dist_sq);
-
-        printf(
-            "max_tests: %d max_point: %f %f %f max_point_dist: %f max_second_culls: %d\n", max_tests, max_point[0],
-            max_point[1], max_point[2], max_point_dist, max_secondary_culls
-        );
-
-        FILE* f = fopen("test_history.txt", "w");
-        for (int i = 0; i < test_history.size(); ++i) {
-            fprintf(
-                f, "%d, %f, %f, %f, %f, %f, %f\n", test_history[i], test_centers[i][0], test_centers[i][1],
-                test_centers[i][2], test_extents[i][0], test_extents[i][1], test_extents[i][2]
-            );
-        }
-
-        fclose(f);
-    }
-#endif
+    const float min_dist_sq = mesh_query_point_core(mesh, point, max_dist * max_dist, min_face, min_v, min_w);
 
     // check if we found a point, and write outputs
     if (min_dist_sq < max_dist * max_dist) {
@@ -503,165 +317,11 @@ mesh_query_point_no_sign(uint64_t id, const vec3& point, float max_dist, int& fa
 {
     Mesh mesh = mesh_get(id);
 
-    int stack[BVH_QUERY_STACK_SIZE];
-    stack[0] = *mesh.bvh.root;
-
-    int count = 1;
-
-    float min_dist_sq = max_dist * max_dist;
     int min_face;
     float min_v;
     float min_w;
 
-#if BVH_DEBUG
-    int tests = 0;
-    int secondary_culls = 0;
-
-    std::vector<int> test_history;
-    std::vector<vec3> test_centers;
-    std::vector<vec3> test_extents;
-#endif
-
-    while (count) {
-        const int nodeIndex = stack[--count];
-
-        BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
-        BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
-
-        // re-test distance
-        float node_dist_sq
-            = distance_to_aabb_sq(point, vec3(lower.x, lower.y, lower.z), vec3(upper.x, upper.y, upper.z));
-        if (node_dist_sq > min_dist_sq) {
-#if BVH_DEBUG
-            secondary_culls++;
-#endif
-            continue;
-        }
-
-        const int left_index = lower.i;
-        const int right_index = upper.i;
-
-        if (lower.b) {
-            const int start = left_index;
-            const int end = right_index;
-            // loops through primitives in the leaf
-            for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
-                int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                int i = mesh.indices[primitive_index * 3 + 0];
-                int j = mesh.indices[primitive_index * 3 + 1];
-                int k = mesh.indices[primitive_index * 3 + 2];
-
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
-                vec3 e0 = q - p;
-                vec3 e1 = r - p;
-                vec3 e2 = r - q;
-                vec3 normal = cross(e0, e1);
-
-                // sliver detection
-                if (length(normal) / (dot(e0, e0) + dot(e1, e1) + dot(e2, e2)) < 1.e-6f)
-                    continue;
-
-                vec2 barycentric = closest_point_to_triangle(p, q, r, point);
-                float u = barycentric[0];
-                float v = barycentric[1];
-                float w = 1.f - u - v;
-                vec3 c = u * p + v * q + w * r;
-
-                float dist_sq = length_sq(c - point);
-
-                if (dist_sq < min_dist_sq) {
-                    min_dist_sq = dist_sq;
-                    min_v = v;
-                    min_w = w;
-                    min_face = primitive_index;
-                }
-            }
-
-#if BVH_DEBUG
-
-            tests++;
-
-            bounds3 b;
-            b = bounds_union(b, p);
-            b = bounds_union(b, q);
-            b = bounds_union(b, r);
-
-            if (distance_to_aabb_sq(point, b.lower, b.upper) < max_dist * max_dist) {
-                // if (dist_sq < max_dist*max_dist)
-                test_history.push_back(left_index);
-                test_centers.push_back(b.center());
-                test_extents.push_back(b.edges());
-            }
-#endif
-
-        } else {
-            BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
-            BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
-
-            BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
-            BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
-
-            float left_dist_sq = distance_to_aabb_sq(
-                point, vec3(left_lower.x, left_lower.y, left_lower.z), vec3(left_upper.x, left_upper.y, left_upper.z)
-            );
-            float right_dist_sq = distance_to_aabb_sq(
-                point, vec3(right_lower.x, right_lower.y, right_lower.z),
-                vec3(right_upper.x, right_upper.y, right_upper.z)
-            );
-
-            wp::vec2i child_indices;
-            wp::vec2 child_dist;
-            if (left_dist_sq < right_dist_sq) {
-                child_indices = wp::vec2i(right_index, left_index);
-                child_dist = wp::vec2(right_dist_sq, left_dist_sq);
-            } else {
-                child_indices = wp::vec2i(left_index, right_index);
-                child_dist = wp::vec2(left_dist_sq, right_dist_sq);
-            }
-
-            if (child_dist[0] < min_dist_sq)
-                stack[count++] = child_indices[0];
-
-            if (child_dist[1] < min_dist_sq)
-                stack[count++] = child_indices[1];
-        }
-    }
-
-
-#if BVH_DEBUG
-    printf("%d\n", tests);
-
-    static int max_tests = 0;
-    static vec3 max_point;
-    static float max_point_dist = 0.0f;
-    static int max_secondary_culls = 0;
-
-    if (secondary_culls > max_secondary_culls)
-        max_secondary_culls = secondary_culls;
-
-    if (tests > max_tests) {
-        max_tests = tests;
-        max_point = point;
-        max_point_dist = sqrtf(min_dist_sq);
-
-        printf(
-            "max_tests: %d max_point: %f %f %f max_point_dist: %f max_second_culls: %d\n", max_tests, max_point[0],
-            max_point[1], max_point[2], max_point_dist, max_secondary_culls
-        );
-
-        FILE* f = fopen("test_history.txt", "w");
-        for (int i = 0; i < test_history.size(); ++i) {
-            fprintf(
-                f, "%d, %f, %f, %f, %f, %f, %f\n", test_history[i], test_centers[i][0], test_centers[i][1],
-                test_centers[i][2], test_extents[i][0], test_extents[i][1], test_extents[i][2]
-            );
-        }
-
-        fclose(f);
-    }
-#endif
+    const float min_dist_sq = mesh_query_point_core(mesh, point, max_dist * max_dist, min_face, min_v, min_w);
 
     // check if we found a point, and write outputs
     if (min_dist_sq < max_dist * max_dist) {
@@ -726,14 +386,14 @@ mesh_query_furthest_point_no_sign(uint64_t id, const vec3& point, float min_dist
             const int end = right_index;
             // loops through primitives in the leaf
             for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
-                int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                int i = mesh.indices[primitive_index * 3 + 0];
-                int j = mesh.indices[primitive_index * 3 + 1];
-                int k = mesh.indices[primitive_index * 3 + 2];
+                int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
+                int i = bvh_load_int(mesh.indices, primitive_index * 3 + 0);
+                int j = bvh_load_int(mesh.indices, primitive_index * 3 + 1);
+                int k = bvh_load_int(mesh.indices, primitive_index * 3 + 2);
 
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
+                vec3 p = bvh_load_vec3(mesh.points, i);
+                vec3 q = bvh_load_vec3(mesh.points, j);
+                vec3 r = bvh_load_vec3(mesh.points, k);
 
                 vec3 e0 = q - p;
                 vec3 e1 = r - p;
@@ -912,14 +572,14 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_normal(
             const int end = right_index;
             // loops through primitives in the leaf
             for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
-                int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                int i = mesh.indices[primitive_index * 3 + 0];
-                int j = mesh.indices[primitive_index * 3 + 1];
-                int k = mesh.indices[primitive_index * 3 + 2];
+                int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, primitive_counter);
+                int i = bvh_load_int(mesh.indices, primitive_index * 3 + 0);
+                int j = bvh_load_int(mesh.indices, primitive_index * 3 + 1);
+                int k = bvh_load_int(mesh.indices, primitive_index * 3 + 2);
 
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
+                vec3 p = bvh_load_vec3(mesh.points, i);
+                vec3 q = bvh_load_vec3(mesh.points, j);
+                vec3 r = bvh_load_vec3(mesh.points, k);
 
                 vec3 e0 = q - p;
                 vec3 e1 = r - p;
@@ -1182,165 +842,11 @@ CUDA_CALLABLE inline bool mesh_query_point_sign_winding_number(
 {
     Mesh mesh = mesh_get(id);
 
-    int stack[BVH_QUERY_STACK_SIZE];
-    stack[0] = *mesh.bvh.root;
-
-    int count = 1;
-
-    float min_dist_sq = max_dist * max_dist;
     int min_face;
     float min_v;
     float min_w;
 
-#if BVH_DEBUG
-    int tests = 0;
-    int secondary_culls = 0;
-
-    std::vector<int> test_history;
-    std::vector<vec3> test_centers;
-    std::vector<vec3> test_extents;
-#endif
-
-    while (count) {
-        const int nodeIndex = stack[--count];
-
-        BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
-        BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
-
-        // re-test distance
-        float node_dist_sq
-            = distance_to_aabb_sq(point, vec3(lower.x, lower.y, lower.z), vec3(upper.x, upper.y, upper.z));
-        if (node_dist_sq > min_dist_sq) {
-#if BVH_DEBUG
-            secondary_culls++;
-#endif
-            continue;
-        }
-
-        const int left_index = lower.i;
-        const int right_index = upper.i;
-
-        if (lower.b) {
-            const int start = left_index;
-            const int end = right_index;
-            // loops through primitives in the leaf
-            for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
-                int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                int i = mesh.indices[primitive_index * 3 + 0];
-                int j = mesh.indices[primitive_index * 3 + 1];
-                int k = mesh.indices[primitive_index * 3 + 2];
-
-                vec3 p = mesh.points[i];
-                vec3 q = mesh.points[j];
-                vec3 r = mesh.points[k];
-
-                vec3 e0 = q - p;
-                vec3 e1 = r - p;
-                vec3 e2 = r - q;
-                vec3 normal = cross(e0, e1);
-
-                // sliver detection
-                if (length(normal) / (dot(e0, e0) + dot(e1, e1) + dot(e2, e2)) < 1.e-6f)
-                    continue;
-
-                vec2 barycentric = closest_point_to_triangle(p, q, r, point);
-                float u = barycentric[0];
-                float v = barycentric[1];
-                float w = 1.f - u - v;
-                vec3 c = u * p + v * q + w * r;
-
-                float dist_sq = length_sq(c - point);
-
-                if (dist_sq < min_dist_sq) {
-                    min_dist_sq = dist_sq;
-                    min_v = v;
-                    min_w = w;
-                    min_face = primitive_index;
-                }
-            }
-#if BVH_DEBUG
-
-            tests++;
-
-            bounds3 b;
-            b = bounds_union(b, p);
-            b = bounds_union(b, q);
-            b = bounds_union(b, r);
-
-            if (distance_to_aabb_sq(point, b.lower, b.upper) < max_dist * max_dist) {
-                // if (dist_sq < max_dist*max_dist)
-                test_history.push_back(left_index);
-                test_centers.push_back(b.center());
-                test_extents.push_back(b.edges());
-            }
-#endif
-
-        } else {
-            BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
-            BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
-
-            BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
-            BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
-
-            float left_dist_sq = distance_to_aabb_sq(
-                point, vec3(left_lower.x, left_lower.y, left_lower.z), vec3(left_upper.x, left_upper.y, left_upper.z)
-            );
-            float right_dist_sq = distance_to_aabb_sq(
-                point, vec3(right_lower.x, right_lower.y, right_lower.z),
-                vec3(right_upper.x, right_upper.y, right_upper.z)
-            );
-
-            wp::vec2i child_indices;
-            wp::vec2 child_dist;
-            if (left_dist_sq < right_dist_sq) {
-                child_indices = wp::vec2i(right_index, left_index);
-                child_dist = wp::vec2(right_dist_sq, left_dist_sq);
-            } else {
-                child_indices = wp::vec2i(left_index, right_index);
-                child_dist = wp::vec2(left_dist_sq, right_dist_sq);
-            }
-
-            if (child_dist[0] < min_dist_sq)
-                stack[count++] = child_indices[0];
-
-            if (child_dist[1] < min_dist_sq)
-                stack[count++] = child_indices[1];
-        }
-    }
-
-
-#if BVH_DEBUG
-    printf("%d\n", tests);
-
-    static int max_tests = 0;
-    static vec3 max_point;
-    static float max_point_dist = 0.0f;
-    static int max_secondary_culls = 0;
-
-    if (secondary_culls > max_secondary_culls)
-        max_secondary_culls = secondary_culls;
-
-    if (tests > max_tests) {
-        max_tests = tests;
-        max_point = point;
-        max_point_dist = sqrtf(min_dist_sq);
-
-        printf(
-            "max_tests: %d max_point: %f %f %f max_point_dist: %f max_second_culls: %d\n", max_tests, max_point[0],
-            max_point[1], max_point[2], max_point_dist, max_secondary_culls
-        );
-
-        FILE* f = fopen("test_history.txt", "w");
-        for (int i = 0; i < test_history.size(); ++i) {
-            fprintf(
-                f, "%d, %f, %f, %f, %f, %f, %f\n", test_history[i], test_centers[i][0], test_centers[i][1],
-                test_centers[i][2], test_extents[i][0], test_extents[i][1], test_extents[i][2]
-            );
-        }
-
-        fclose(f);
-    }
-#endif
+    const float min_dist_sq = mesh_query_point_core(mesh, point, max_dist * max_dist, min_face, min_v, min_w);
 
     // check if we found a point, and write outputs
     if (min_dist_sq < max_dist * max_dist) {
@@ -2401,7 +1907,11 @@ struct mesh_query_aabb_t {
         , input_lower()
         , input_upper()
         , face(0)
-        , primitive_counter(-1)
+        , prim_cur(0)
+        , prim_end(0)
+        , cur_node(0)
+        , have_node(false)
+        , pair_limit(-1)
         , last_query_valid(true)
         , radius(0.0f)
         , radius_sq(0.0f)
@@ -2413,7 +1923,11 @@ struct mesh_query_aabb_t {
 
     // Mesh Id
     Mesh mesh;
-    // BVH traversal stack:
+
+    // BVH traversal stack of node indices; every entry passed its AABB test
+    // before being pushed.
+    // On CUDA the stack lives in shared memory: keeping an array out of this
+    // struct lets the compiler keep the remaining members in registers.
 #if BVH_SHARED_STACK
     bvh_stack_t stack;
 #else
@@ -2426,8 +1940,20 @@ struct mesh_query_aabb_t {
     wp::vec3 input_lower;
     wp::vec3 input_upper;
 
-    // >= 0 if currently in a packed leaf node
-    int primitive_counter;
+    // primitive range of the packed leaf currently being enumerated;
+    // when prim_cur < prim_end the query resumes mid-leaf on the next
+    // mesh_query_aabb_next() call
+    int prim_cur;
+    int prim_end;
+
+    // packed payload (see bvh_query_node_pack()) of the node to process next,
+    // valid when have_node is set; it already passed its AABB test
+    uint64_t cur_node;
+    bool have_node;
+
+    // stack occupancy up to which far children may be pushed as two-slot
+    // payload pairs (see bvh_query_pair_limit())
+    int pair_limit;
 
     // Face
     int face;
@@ -2436,7 +1962,8 @@ struct mesh_query_aabb_t {
     // call produced a valid face index. Seeded to true so an initial tile_query_valid()
     // check (before any next() call) reports valid.
     bool last_query_valid;
-    float radius;  // sphere radius (0 for plain aabb)
+    // Minkowski-offset: sphere radius (0 => plain aabb).
+    float radius;
     float radius_sq;  // pre-computed radius*radius for sphere node/prim tests
 };
 
@@ -2454,54 +1981,15 @@ mesh_query_node_test(const mesh_query_aabb_t& query, const vec3& node_lower, con
     }
 }
 
-// Init-time descent to the first overlapping leaf node, which is left on the stack for
-// the iterator. IsSphere=false is shared by both AABB flavors (precise does not
-// affect the node test).
-template <bool IsSphere> CUDA_CALLABLE inline void mesh_query_descend_impl(mesh_query_aabb_t& query)
-{
-    Mesh& mesh = query.mesh;
-
-    while (query.count) {
-        const int nodeIndex = query.stack[--query.count];
-        BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, nodeIndex);
-        BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, nodeIndex);
-
-        if (query.primitive_counter == 0) {
-            if (!mesh_query_node_test<IsSphere>(
-                    query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper)
-                )) {
-                // Skip this box, it doesn't overlap with our query volume.
-                continue;
-            }
-        }
-
-        const int left_index = node_lower.i;
-        const int right_index = node_upper.i;
-
-        // Make bounds from this AABB
-        if (node_lower.b) {
-            // Reached a leaf node, point to its first primitive
-            // Back up one level and return
-            query.primitive_counter = 0;
-            query.stack[query.count++] = nodeIndex;
-            return;
-        } else {
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
-        }
-    }
-}
-
-CUDA_CALLABLE inline void mesh_query_descend_sphere(mesh_query_aabb_t& query) { mesh_query_descend_impl<true>(query); }
-
-// Shared factory for all mesh query kinds. IsSphere selects the init-time descent
-// strategy; the iterator function is selected at Warp codegen time via the Python
-// return type, so neither query_type nor precise need to be stored in the struct.
+// Shared factory for all mesh query kinds. IsSphere selects the node test used on the
+// root; the iterator function is selected at Warp codegen time via the Python return
+// type, so neither query_type nor precise need to be stored in the struct.
 template <bool IsSphere>
 CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_impl(uint64_t id, const vec3& a, const vec3& b, float radius)
 {
     mesh_query_aabb_t query;
     query.face = -1;
+    // the radius must be set before the root test below
     query.radius = max(radius, 0.0f);
     query.radius_sq = query.radius * query.radius;
 
@@ -2513,19 +2001,24 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_impl(uint64_t id, const vec3& 
     query.stack.ptr = &stack[threadIdx.x];
 #endif
 
-    query.stack[0] = *mesh.bvh.root;
-    query.count = 1;
-    query.primitive_counter = 0;
     query.input_lower = a;
     query.input_upper = b;
 
-    // The AABB descent inlines here (CPU and CUDA); the sphere descent runs
-    // its own specialized loop out of line on CPU.
-    if constexpr (IsSphere) {
-        mesh_query_descend_sphere(query);
-    } else {
-        mesh_query_descend_impl<false>(query);
+    query.pair_limit = bvh_query_pair_limit(mesh.bvh);
+
+    // both stack entries and cur_node must have passed their node test
+    // already, so test the root here
+    const int root_index = *mesh.bvh.root;
+    const BVHPackedNodeHalf root_lower = bvh_load_node(mesh.bvh.node_lowers, root_index);
+    const BVHPackedNodeHalf root_upper = bvh_load_node(mesh.bvh.node_uppers, root_index);
+
+    if (mesh_query_node_test<IsSphere>(
+            query, reinterpret_cast<const vec3&>(root_lower), reinterpret_cast<const vec3&>(root_upper)
+        )) {
+        query.cur_node = bvh_query_node_pack(root_lower, root_upper);
+        query.have_node = true;
     }
+
     return query;
 }
 
@@ -2551,7 +2044,11 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_sphere(uint64_t id, const vec3
 template <bool IsSphere, bool Precise>
 CUDA_CALLABLE inline bool mesh_query_prim_test(const mesh_query_aabb_t& query, const Mesh& mesh, int primitive_index)
 {
-    if (!mesh_query_node_test<IsSphere>(query, mesh.lowers[primitive_index], mesh.uppers[primitive_index]))
+    // load the face bounds eagerly (read-only path) so the test compiles to
+    // one predicate chain instead of a branch per component
+    const vec3 face_lower = bvh_load_vec3(mesh.lowers, primitive_index);
+    const vec3 face_upper = bvh_load_vec3(mesh.uppers, primitive_index);
+    if (!mesh_query_node_test<IsSphere>(query, face_lower, face_upper))
         return false;
     if constexpr (!Precise)
         return true;
@@ -2607,7 +2104,6 @@ adj_mesh_query_aabb(uint64_t id, const vec3& lower, const vec3& upper, uint64_t,
 {
 }
 
-
 // ---------------------------------------------------------------------------
 // Mesh query traversal skeleton and per-kind iterators
 //
@@ -2637,7 +2133,7 @@ struct SphereNodeTest {
 struct AabbPrimitiveTest {
     CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const Mesh& m, int pi) const
     {
-        return intersect_aabb_aabb(q.input_lower, q.input_upper, m.lowers[pi], m.uppers[pi]);
+        return mesh_query_prim_test<false, false>(q, m, pi);
     }
 };
 
@@ -2645,10 +2141,7 @@ struct AabbPrimitiveTest {
 struct AabbPrecisePrimitiveTest {
     CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const Mesh& m, int pi) const
     {
-        if (!intersect_aabb_aabb(q.input_lower, q.input_upper, m.lowers[pi], m.uppers[pi]))
-            return false;
-        const int i = m.indices[pi * 3 + 0], j = m.indices[pi * 3 + 1], k = m.indices[pi * 3 + 2];
-        return intersect_tri_aabb(m.points[i], m.points[j], m.points[k], q.input_lower, q.input_upper);
+        return mesh_query_prim_test<false, true>(q, m, pi);
     }
 };
 
@@ -2667,27 +2160,56 @@ struct SpherePrimitiveTest {
 // costs two extra dependent global loads per visited singleton leaf (measured +9-21%
 // on singleton-leaf trees, e.g. the cuBQL mesh default). Sphere and precise-AABB
 // iterators keep the test - it is their narrow phase.
+//
+// The traversal itself is a single flat loop; every iteration either emits one
+// primitive from the packed leaf currently being enumerated, or processes the node
+// carried over in registers / popped from the shared stack. Children are tested at
+// the parent; the near child rides in registers and far children go on the stack as
+// tagged payload pairs while the tree depth proves they fit (see
+// bvh_query_pair_limit), so pops need no memory access.
 template <typename NodeTest, typename PrimitiveTest, bool TEST_SINGLETON = true>
 CUDA_CALLABLE inline bool mesh_query_next_impl(mesh_query_aabb_t& query, int& index)
 {
     Mesh mesh = query.mesh;
-    while (query.count) {
-        const int node_index = query.stack[--query.count];
-        BVHPackedNodeHalf node_lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
-        BVHPackedNodeHalf node_upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
 
-        if (!NodeTest {}(query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper)))
+    for (;;) {
+        if (query.prim_cur < query.prim_end) {
+            const int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, query.prim_cur++);
+
+            if (PrimitiveTest {}(query, mesh, primitive_index)) {
+                index = primitive_index;
+                query.face = primitive_index;
+                return true;
+            }
             continue;
+        }
 
-        const int left_index = node_lower.i;
-        const int right_index = node_upper.i;
+        if (!query.have_node) {
+            if (!query.count)
+                return false;
 
-        if (node_lower.b) {
-            const int start = left_index;
-            const int end = right_index;
+            const unsigned top = unsigned(query.stack[--query.count]);
+            if (top & 0x80000000u) {
+                // payload pair: the node is reconstructed without any memory access
+                query.cur_node = bvh_query_stack_unpack(unsigned(query.stack[--query.count]), top);
+            } else {
+                // index entry: it already passed its node test, so the AABB
+                // part of this load is unused and no re-test is needed
+                query.cur_node = bvh_query_node_load(mesh.bvh, int(top));
+            }
+        }
 
+        const uint64_t node = query.cur_node;
+        query.have_node = false;
+
+        if (bvh_query_node_is_leaf(node)) {
+            const int start = bvh_query_node_lower_payload(node);
+            const int end = bvh_query_node_upper_payload(node);
+
+            // fast path when the leaf contains exactly one primitive: its
+            // AABB is the leaf node's AABB, which already passed its node test
             if (end - start == 1) {
-                int primitive_index = mesh.bvh.primitive_indices[start];
+                const int primitive_index = bvh_load_int(mesh.bvh.primitive_indices, start);
                 bool singleton_hit = true;
                 if constexpr (TEST_SINGLETON)
                     singleton_hit = PrimitiveTest {}(query, mesh, primitive_index);
@@ -2696,32 +2218,55 @@ CUDA_CALLABLE inline bool mesh_query_next_impl(mesh_query_aabb_t& query, int& in
                     query.face = primitive_index;
                     return true;
                 }
-            } else {
-                int primitive_index = mesh.bvh.primitive_indices[start + (query.primitive_counter++)];
-                if (start + query.primitive_counter == end) {
-                    query.primitive_counter = 0;
-                } else {
-                    query.count++;
-                }
-                if (PrimitiveTest {}(query, mesh, primitive_index)) {
-                    index = primitive_index;
-                    query.face = primitive_index;
-                    return true;
+                continue;
+            }
+
+            // packed leaf: enumerate its primitives one per loop iteration,
+            // without re-loading the leaf node
+            query.prim_cur = start;
+            query.prim_end = end;
+            continue;
+        }
+
+        const int left_index = bvh_query_node_lower_payload(node);
+        const int right_index = bvh_query_node_upper_payload(node);
+
+        const BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_index);
+        const BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_index);
+        const BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_index);
+        const BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_index);
+
+        const bool hit_left
+            = NodeTest {}(query, reinterpret_cast<const vec3&>(left_lower), reinterpret_cast<const vec3&>(left_upper));
+        const bool hit_right = NodeTest {}(
+            query, reinterpret_cast<const vec3&>(right_lower), reinterpret_cast<const vec3&>(right_upper)
+        );
+
+        if (hit_left) {
+            query.cur_node = bvh_query_node_pack(left_lower, left_upper);
+            query.have_node = true;
+            if (hit_right) {
+                // pair pushes stop at pair_limit so that slot usage can never
+                // exceed the stack for constructor-produced trees; the final
+                // guard only matters for depths beyond the construction bound
+                if (query.count <= query.pair_limit) {
+                    query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
+                    query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
+                } else if (query.count < BVH_QUERY_STACK_SIZE) {
+                    query.stack[query.count++] = right_index;
                 }
             }
-        } else {
-            query.primitive_counter = 0;
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
+        } else if (hit_right) {
+            query.cur_node = bvh_query_node_pack(right_lower, right_upper);
+            query.have_node = true;
         }
     }
-    return false;
 }
 
-// Backward-compatible broad-phase AABB iterator. Called by mesh_query_aabb_next
-// (the alias) and by mesh_query_next when the query object is MeshQueryAABB.
-// AabbPrimitiveTest always passes after AabbNodeTest on singleton leaves
-// (leaf AABB == primitive AABB), so the compiler folds it to a single test.
+// Backward-compatible broad-phase AABB iterator. Called by iter_cmp and by the
+// MeshQueryAABB Python type. TEST_SINGLETON is off: AabbPrimitiveTest always passes
+// after the node test on singleton leaves (leaf AABB == primitive AABB), so the
+// unconditional return avoids two dependent global loads per singleton leaf.
 CUDA_CALLABLE inline bool mesh_query_aabb_next(mesh_query_aabb_t& query, int& index)
 {
     return mesh_query_next_impl<AabbNodeTest, AabbPrimitiveTest, false>(query, index);

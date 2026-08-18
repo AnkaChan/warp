@@ -3,6 +3,7 @@
 
 import ctypes
 import ctypes.util
+import functools
 import gc
 import importlib.util
 import io
@@ -42,6 +43,23 @@ import warp as wp  # noqa: E402
 
 pxr = importlib.util.find_spec("pxr")
 USD_AVAILABLE = pxr is not None
+
+
+def make_isolated_kernel(func, **kwargs):
+    """Build a :class:`warp.Kernel` in a module of its own.
+
+    A kernel that fails to build fails its whole module, so a test that builds a
+    deliberately broken kernel has to keep it out of the test file's module.
+    ``@wp.kernel(module="unique")`` covers the decorator form; this covers the
+    kernels tests construct directly, and the cases where ``module="unique"``
+    would surface the failure too early (it hashes, and so builds, the kernel at
+    decoration time). The module name is keyed on the definition site rather than
+    the qualified name alone, so a test that rebinds the same name to several
+    broken kernels still gets one module each.
+    """
+    key = f"{func.__module__}.{func.__qualname__}:{func.__code__.co_firstlineno}"
+    return wp.Kernel(func=func, module=wp.get_module(key), **kwargs)
+
 
 # default test mode (see get_test_devices())
 #   "basic" - only run on CPU and first GPU device
@@ -343,6 +361,7 @@ def assert_np_equal(result: np.ndarray, expect: np.ndarray, tol=0.0):
 # if check_output is True any output to stdout will be treated as an error
 def create_test_func(func, device, check_output, device_check=None, **kwargs):
     # pass args to func
+    @functools.wraps(func)
     def test_func(self):
         if device_check is not None:
             device_check(self, device)
@@ -352,10 +371,6 @@ def create_test_func(func, device, check_output, device_check=None, **kwargs):
                 func(self, device, **kwargs)
         else:
             func(self, device, **kwargs)
-
-    # Copy the __unittest_expecting_failure__ attribute from func to test_func
-    if hasattr(func, "__unittest_expecting_failure__"):
-        test_func.__unittest_expecting_failure__ = func.__unittest_expecting_failure__
 
     return test_func
 
@@ -414,8 +429,11 @@ def add_kernel_test(cls, kernel, dim, name=None, expect=None, inputs=None, devic
 
             args.append(output)
 
-        # force load so that we don't generate any log output during launch
-        kernel.module.load(device)
+        # Force-load the same module variant that wp.launch() will use so that
+        # we don't generate any log output during launch. CPU launches always
+        # use a block dimension of 1, regardless of the launch default.
+        load_block_dim = 1 if wp.get_device(device).is_cpu else None
+        kernel.module.load(device, block_dim=load_block_dim)
 
         with CheckOutput(self):
             wp.launch(kernel, dim=dim, inputs=args, device=device)

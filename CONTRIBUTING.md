@@ -14,7 +14,7 @@ Some ways to contribute to the development of Warp include:
 
 ## Contents
 
-* [Before You Start](#before-you-start)
+* [Planning a Contribution](#planning-a-contribution)
 * [Code Contributions](#code-contributions)
 * [Quality Expectations](#quality-expectations)
 * [Coding Guidelines](#coding-guidelines)
@@ -24,26 +24,21 @@ Some ways to contribute to the development of Warp include:
 * [Testing Warp](#testing-warp)
 * [Benchmarks](#benchmarks)
 
-## Before You Start
+## Planning a Contribution
 
-For small fixes such as typos, broken links, or minor documentation improvements,
-feel free to open a pull request directly.
+Before opening a pull request, search [GitHub Issues](https://github.com/NVIDIA/warp/issues)
+and [Discussions](https://github.com/NVIDIA/warp/discussions) for earlier reports
+and relevant context. Report bugs in an issue first. For other substantial
+changes, start an issue or discussion.
 
-For bug fixes, feature contributions, or any non-trivial change:
+Explain what the change would address and why it matters. If it affects an
+application, library, research project, or production system that uses Warp,
+describe the impact. Include a reproduction when possible. If you already have a
+fix, mention it and briefly explain your approach.
 
-* **Check existing issues first.** Search [GitHub Issues](https://github.com/NVIDIA/warp/issues)
-  to see if someone is already working on it. If an issue is already assigned to
-  someone else, coordinate in the issue thread before starting your own implementation.
-* **Propose new features before implementing them.** Open a
-  [GitHub Issue](https://github.com/NVIDIA/warp/issues/new) or
-  [Discussion](https://github.com/NVIDIA/warp/discussions) to describe what you
-  want to build and get feedback. Not all features are a good fit for Warp, and
-  early discussion avoids wasted effort.
-* **Gauge the complexity of what you're picking up.** Some areas of the codebase
-  (e.g. JAX/PyTorch interop, code generation, CUDA runtime internals) involve subtle
-  interactions that may not be apparent from a GitHub issue description alone. If you
-  are not already familiar with the subsystem, comment on the issue to ask for context
-  before investing time in a pull request.
+Issues track bugs, requests, and project plans. They are not a task list for
+contributors. An open or unassigned issue does not mean maintainers are looking
+for someone to implement it.
 
 ## Code Contributions
 
@@ -142,6 +137,11 @@ By making a contribution to this project, I certify that:
    Work with reviewers to ensure the pull request is in a state suitable for merging.
 
 ## Quality Expectations
+
+Review time is limited, and we cannot review every pull request. We are more
+likely to review a contribution when it solves a problem in a project that uses
+Warp and fits the project's direction. Focused changes with thorough validation
+are easier to review.
 
 To keep the review process efficient and the codebase healthy, please ensure your
 contribution meets these expectations:
@@ -381,6 +381,17 @@ defined in `default_suite()` (in `warp/tests/unittest_suites.py`) are run. To ru
 using [test discovery](https://docs.python.org/3/library/unittest.html#test-discovery), use
 `uv run --extra dev -m warp.tests -s autodetect`, which will discover tests in modules matching the path
 `warp/tests/test*.py`.
+
+> The runner uses up to eight test processes, capped further by the detected CPU count and the 
+> number of selected test classes. On systems with sufficient CPU and GPU resources, the limit can be raised
+> with ``--maxjobs N``. Performance gains depend on the workload and hardware and generally diminish at higher
+> process counts. Additional workers running CUDA tests can also increase peak GPU memory usage.
+
+> The native libraries in ``warp/bin`` are not rebuilt automatically. After merging or rebasing
+> on ``main``, or otherwise pulling changes to ``warp/native/``, rebuild with
+> ``uv run build_lib.py`` (or ``uv run build_lib.py --quick`` when the installed CUDA driver is at
+> least as new as the CUDA Toolkit). Running against stale binaries can crash or corrupt
+> JIT-compiled kernels in confusing ways, such as when a merge changed a native struct layout.
 
 #### Running a Subset of Tests
 
