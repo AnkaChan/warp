@@ -46,6 +46,42 @@ def bvh_capsule_query(bvh_id: wp.uint64, p0: wp.vec3, p1: wp.vec3, radius: float
         bounds_intersected[bounds_nr] = 1
 
 
+@wp.kernel
+def bvh_capsule_query_max_dist(
+    bvh_id: wp.uint64,
+    start: wp.vec3,
+    direction: wp.vec3,
+    radius: float,
+    max_dist: float,
+    bounds_intersected: wp.array[int],
+):
+    query = wp.bvh_query_capsule(bvh_id, start, direction, radius)
+    bounds_nr = int(0)
+
+    while wp.bvh_query_next(query, bounds_nr, max_dist):
+        bounds_intersected[bounds_nr] = 1
+
+
+@wp.kernel
+def bvh_capsule_query_decreasing_max_dist(
+    bvh_id: wp.uint64,
+    start: wp.vec3,
+    direction: wp.vec3,
+    initial_max_dist: float,
+    reduced_max_dist: float,
+    first_hit_count: wp.array[int],
+    later_hits: wp.array[int],
+):
+    query = wp.bvh_query_capsule(bvh_id, start, direction, 0.0)
+    bounds_nr = int(0)
+
+    if wp.bvh_query_next(query, bounds_nr, initial_max_dist):
+        first_hit_count[0] = 1
+
+    while wp.bvh_query_next(query, bounds_nr, reduced_max_dist):
+        later_hits[bounds_nr] = 1
+
+
 def aabb_overlap(a_lower, a_upper, b_lower, b_upper):
     if (
         a_lower[0] > b_upper[0]
@@ -228,11 +264,103 @@ def test_bvh_query_sphere(test, device):
 
 
 def test_bvh_query_capsule(test, device):
+    """Validate conservative capsule queries and distance boundary semantics."""
     # The broad-phase inflates node AABBs by radius as an axis-aligned box, not a true sphere,
     # so it is conservative: it never misses a primitive within radius of the segment but may
     # return extra candidates near box corners. Tests validate this conservative semantics.
     for leaf_size in [1, 2, 4]:
         test_bvh(test, "capsule", device, leaf_size)
+
+    def query_hits(lowers, uppers, start, direction, radius, max_dist, leaf_size=1):
+        device_lowers = wp.array(lowers, dtype=wp.vec3, device=device)
+        device_uppers = wp.array(uppers, dtype=wp.vec3, device=device)
+        bvh = wp.Bvh(device_lowers, device_uppers, leaf_size=leaf_size)
+        hits = wp.zeros(len(lowers), dtype=int, device=device)
+        wp.launch(
+            bvh_capsule_query_max_dist,
+            dim=1,
+            inputs=[bvh.id, wp.vec3(*start), wp.vec3(*direction), radius, max_dist, hits],
+            device=device,
+        )
+        return hits.numpy()
+
+    float32_one = np.float32(1.0)
+    after_one = np.nextafter(float32_one, np.float32(np.inf))
+    endpoint_hits = query_hits(
+        [(float32_one, -0.1, -0.1), (after_one, -0.1, -0.1)],
+        [(1.1, 0.1, 0.1), (1.1, 0.1, 0.1)],
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        0.0,
+        1.0,
+    )
+    np.testing.assert_array_equal(endpoint_hits, [1, 0])
+
+    tangent_y = np.float32(0.1)
+    outside_y = np.nextafter(tangent_y, np.float32(np.inf))
+    parallel_hits = query_hits(
+        [(0.25, tangent_y, -0.1), (0.25, outside_y, -0.1)],
+        [(0.5, 0.2, 0.1), (0.5, 0.2, 0.1)],
+        (0.0, 0.0, 0.0),
+        (1.0, -0.0, 0.0),
+        0.1,
+        1.0,
+    )
+    np.testing.assert_array_equal(parallel_hits, [1, 0])
+
+    before_zero = np.nextafter(np.float32(0.0), np.float32(-np.inf))
+    start_hits = query_hits(
+        [(-0.1, -0.1, -0.1), (-0.1, -0.1, -0.1)],
+        [(0.0, 0.1, 0.1), (before_zero, 0.1, 0.1)],
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        0.0,
+        1.0,
+    )
+    np.testing.assert_array_equal(start_hits, [1, 0])
+
+    after_zero = np.nextafter(np.float32(0.0), np.float32(np.inf))
+    max_dist_zero_hits = query_hits(
+        [(-0.1, -0.1, -0.1), (after_zero, -0.1, -0.1)],
+        [(0.1, 0.1, 0.1), (0.1, 0.1, 0.1)],
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        0.0,
+        0.0,
+    )
+    np.testing.assert_array_equal(max_dist_zero_hits, [1, 0])
+    negative_radius_hits = query_hits(
+        [(-0.1, -0.1, -0.1), (after_zero, -0.1, -0.1)],
+        [(0.1, 0.1, 0.1), (0.1, 0.1, 0.1)],
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        -0.5,
+        0.0,
+    )
+    np.testing.assert_array_equal(negative_radius_hits, max_dist_zero_hits)
+
+    decreasing_lowers = wp.array([(0.25, -0.1, -0.1), (0.75, -0.1, -0.1)], dtype=wp.vec3, device=device)
+    decreasing_uppers = wp.array([(0.3, 0.1, 0.1), (0.8, 0.1, 0.1)], dtype=wp.vec3, device=device)
+    for leaf_size in (1, 4):
+        bvh = wp.Bvh(decreasing_lowers, decreasing_uppers, leaf_size=leaf_size)
+        first_hit_count = wp.zeros(1, dtype=int, device=device)
+        later_hits = wp.zeros(2, dtype=int, device=device)
+        wp.launch(
+            bvh_capsule_query_decreasing_max_dist,
+            dim=1,
+            inputs=[
+                bvh.id,
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(1.0, 0.0, 0.0),
+                1.0,
+                0.0,
+                first_hit_count,
+                later_hits,
+            ],
+            device=device,
+        )
+        test.assertEqual(first_hit_count.numpy()[0], 1)
+        test.assertEqual(later_hits.numpy().sum(), 0)
 
 
 def test_bvh_cubql_constructor(test, device):
