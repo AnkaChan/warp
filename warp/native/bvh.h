@@ -182,6 +182,11 @@ struct BVH {
     int* node_counts;
     // reordered primitive indices corresponds to the ordering of leaf nodes
     int* primitive_indices;
+    // skip links for the stackless ray traversal: node_escapes[i] is the node
+    // to continue at once node i's subtree is finished or culled (the right
+    // sibling of the nearest ancestor, including i itself, that is a left
+    // child; -1 past the root). Recomputed whenever topology changes.
+    int* node_escapes;
 
     int max_depth;
     int max_nodes;
@@ -259,6 +264,31 @@ inline int bvh_load_int(const int* data, int index) { return data[index]; }
 
 inline vec3 bvh_load_vec3(const vec3* data, int index) { return data[index]; }
 #endif  // __CUDACC__
+
+// escape target of `node`: walk up until we are a left child, then jump to
+// the right sibling; -1 when the walk exits the root. Parents of reachable
+// nodes are always internal, so their lower.i is a child index; the bounds
+// and step guards keep the walk robust for uninitialized or muted nodes,
+// whose escapes are never read by a traversal.
+CUDA_CALLABLE inline int bvh_compute_node_escape(
+    const BVHPackedNodeHalf* node_lowers,
+    const BVHPackedNodeHalf* node_uppers,
+    const int* node_parents,
+    int node,
+    int num_nodes
+)
+{
+    int cur = node;
+    for (int step = 0; step < num_nodes; ++step) {
+        const int parent = node_parents[cur];
+        if (parent < 0 || parent >= num_nodes)
+            return -1;
+        if (!node_lowers[parent].b && int(node_lowers[parent].i) == cur)
+            return int(node_uppers[parent].i);
+        cur = parent;
+    }
+    return -1;
+}
 
 CUDA_CALLABLE inline int clz(int x)
 {
@@ -433,6 +463,8 @@ struct bvh_query_t {
         , input_lower()
         , input_upper()
         , bounds_nr(0)
+        , cursor(-1)
+        , end_cursor(-1)
         , last_query_valid(true)
         , kind(BvhQueryKind::AABB)
         , radius(0.0f)
@@ -460,6 +492,11 @@ struct bvh_query_t {
     // bvh_query_next() call, without re-visiting the leaf node
     int prim_cur;
     int prim_end;
+
+    // stackless directed (ray/capsule) traversal: next node to visit; finished
+    // when cursor == end_cursor (the escape target of the query root's subtree)
+    int cursor;
+    int end_cursor;
 
     // inputs
     wp::vec3 input_lower;  // start for ray
@@ -512,26 +549,34 @@ bvh_query_test(const bvh_query_t& query, const vec3& node_lower, const vec3& nod
 }
 
 
-CUDA_CALLABLE inline bvh_query_t bvh_query(uint64_t id, const vec3& lower, const vec3& upper, int root)
+CUDA_CALLABLE inline bvh_query_t bvh_query_common(uint64_t id, const vec3& lower, const vec3& upper)
 {
-    // initialize empty
     bvh_query_t query;
+    query.bounds_nr = -1;
+    query.bvh = bvh_get(id);
+    query.input_lower = lower;
+    query.input_upper = upper;
+    return query;
+}
 
+// The shared-memory traversal stack is used (and allocated) only by the
+// stack-based AABB/sphere traversal below; ray and capsule kernels are
+// stackless, so they never claim the per-block slab.
+CUDA_CALLABLE inline void bvh_query_alloc_stack(bvh_query_t& query)
+{
 #if BVH_SHARED_STACK
     __shared__ int stack[BVH_QUERY_STACK_SIZE * WP_TILE_BLOCK_DIM];
     query.stack.ptr = &stack[threadIdx.x];
 #endif
+}
 
-    query.bounds_nr = -1;
+CUDA_CALLABLE inline bvh_query_t bvh_query(uint64_t id, const vec3& lower, const vec3& upper, int root)
+{
+    bvh_query_t query = bvh_query_common(id, lower, upper);
+    bvh_query_alloc_stack(query);
 
-    BVH bvh = bvh_get(id);
-
-    query.bvh = bvh;
-
-    query.stack[0] = root == -1 ? *bvh.root : root;
+    query.stack[0] = root == -1 ? *query.bvh.root : root;
     query.count = 1;
-    query.input_lower = lower;
-    query.input_upper = upper;
 
     return query;
 }
@@ -541,25 +586,38 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_aabb(uint64_t id, const vec3& lower, 
     return bvh_query(id, lower, upper, root);
 }
 
+// Directed queries (ray, capsule) traverse stackless via the skip links.
+CUDA_CALLABLE inline void bvh_query_init_directed(bvh_query_t& query, int root)
+{
+    const BVH& bvh = query.bvh;
+    const int root_index = (root == -1) ? *bvh.root : root;
+    query.cursor = root_index;
+    // the traversal ends once the cursor escapes the query root's subtree
+    // (-1 when the query root is the tree root)
+    query.end_cursor = bvh_load_int(bvh.node_escapes, root_index);
+}
+
 CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir, int root)
 {
-    bvh_query_t query = bvh_query(id, start, 1.0f / dir, root);
+    bvh_query_t query = bvh_query_common(id, start, 1.0f / dir);
     query.kind = BvhQueryKind::RAY;
+    bvh_query_init_directed(query, root);
     return query;
 }
 
 CUDA_CALLABLE inline bvh_query_t
 bvh_query_capsule(uint64_t id, const vec3& start, const vec3& dir, float radius, int root)
 {
-    bvh_query_t query = bvh_query(id, start, 1.0f / dir, root);
+    bvh_query_t query = bvh_query_common(id, start, 1.0f / dir);
     query.kind = BvhQueryKind::CAPSULE;
     query.radius = max(radius, 0.0f);
     query.radius_sq = query.radius * query.radius;
+    bvh_query_init_directed(query, root);
     return query;
 }
 
 // Sphere query: returns all bounds within `radius` of `center` using an exact sphere-AABB
-// node test. Reuses the shared bvh_query_next() iterator.
+// node test. Reuses the shared stack-based bvh_query_next() iterator.
 CUDA_CALLABLE inline bvh_query_t bvh_query_sphere(uint64_t id, const vec3& center, float radius, int root)
 {
     bvh_query_t query = bvh_query(id, center, center, root);
@@ -644,6 +702,73 @@ CUDA_CALLABLE inline bool bvh_query_next_impl(bvh_query_t& query, int& index, co
     }
 }
 
+// Stackless skip-link traversal for the directed query kinds (ray, capsule):
+// every visited node is loaded and tested exactly once; a culled or finished
+// subtree jumps to its precomputed escape node, an overlapped internal node
+// descends to its left child. State is two scalar cursors, so directed
+// queries need no traversal stack, no shared memory, and have no depth limit.
+template <BvhQueryKind QUERY_KIND>
+CUDA_CALLABLE inline bool bvh_query_next_directed(bvh_query_t& query, int& index, const float& max_dist)
+{
+    BVH bvh = query.bvh;
+
+    for (;;) {
+        // emit remaining primitives of the current packed leaf, one per iteration
+        if (query.prim_cur < query.prim_end) {
+            const int primitive_index = bvh_load_int(bvh.primitive_indices, query.prim_cur++);
+
+            if (bvh_query_test<QUERY_KIND>(
+                    query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], max_dist
+                )) {
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            }
+            continue;
+        }
+
+        if (query.cursor == query.end_cursor)
+            return false;
+
+        const int node_index = query.cursor;
+
+        BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
+        BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+
+        if (!bvh_query_test<QUERY_KIND>(
+                query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), max_dist
+            )) {
+            // subtree culled: jump over it
+            query.cursor = bvh_load_int(bvh.node_escapes, node_index);
+            continue;
+        }
+
+        if (node_lower.b) {
+            const int start = node_lower.i;
+            const int end = node_upper.i;
+
+            // the leaf is fully handled by the emission block; move the cursor on
+            query.cursor = bvh_load_int(bvh.node_escapes, node_index);
+
+            // fast path when the leaf contains exactly one primitive: its
+            // AABB is the leaf node's AABB, which just passed the test above
+            if (end - start == 1) {
+                const int primitive_index = bvh_load_int(bvh.primitive_indices, start);
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            }
+
+            query.prim_cur = start;
+            query.prim_end = end;
+            continue;
+        }
+
+        // overlapped internal node: descend to the left child
+        query.cursor = node_lower.i;
+    }
+}
+
 // Per-kind public iterators. Each is a thin wrapper around the shared template skeleton;
 // the caller's Python type determines which one gets emitted, so NVCC sees only one
 // traversal loop per kernel — no runtime dispatch, no code bloat.
@@ -657,13 +782,13 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
 // Plain ray iterator (_BvhQueryRay type)
 CUDA_CALLABLE inline bool bvh_query_ray_next(bvh_query_t& query, int& index, const float& max_dist)
 {
-    return bvh_query_next_impl<BvhQueryKind::RAY>(query, index, max_dist);
+    return bvh_query_next_directed<BvhQueryKind::RAY>(query, index, max_dist);
 }
 
 // Capsule iterator (_BvhQueryCapsule type)
 CUDA_CALLABLE inline bool bvh_query_capsule_next(bvh_query_t& query, int& index, const float& max_dist)
 {
-    return bvh_query_next_impl<BvhQueryKind::CAPSULE>(query, index, max_dist);
+    return bvh_query_next_directed<BvhQueryKind::CAPSULE>(query, index, max_dist);
 }
 
 // Sphere iterator (_BvhQuerySphere type)
@@ -715,6 +840,8 @@ CUDA_CALLABLE void bvh_rem_descriptor(uint64_t id);
 void bvh_create_host(
     vec3* lowers, vec3* uppers, int num_items, int constructor_type, int* groups, int leaf_size, BVH& bvh
 );
+// (re)compute node_escapes for a host-resident tree, allocating it if needed
+void bvh_compute_escapes_host(BVH& bvh);
 void bvh_destroy_host(wp::BVH& bvh);
 void bvh_refit_host(wp::BVH& bvh);
 void cubql_bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int leaf_size, BVH& bvh);
