@@ -435,6 +435,8 @@ void cubql_bvh_create_host(vec3* lowers, vec3* uppers, int num_items, int leaf_s
         cuBQL::cpuBuilder(native, boxes, uint32_t(num_items), build_config);
         if (!cubql_copy_to_native_host_bvh(bvh, native))
             free_partial_bvh();
+        else
+            bvh_compute_escapes_host(bvh);
     } catch (const std::exception& e) {
         wp::set_error_string("Warp error: cuBQL BVH build failed: %s", e.what());
         free_partial_bvh();
