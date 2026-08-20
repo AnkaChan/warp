@@ -189,6 +189,10 @@ struct BVH {
     int* node_escapes;
 
     int max_depth;
+    // device-side copy of max_depth (root = 1), written by the GPU builders;
+    // lives behind a pointer so in-place (graph-captured) LBVH rebuilds can
+    // update it via atomicMax without host round trips
+    int* max_depth_ptr;
     int max_nodes;
     int num_nodes;
     // since we use packed leaf nodes, the number of them is no longer the number of items, but variable
@@ -392,6 +396,49 @@ CUDA_CALLABLE inline int bvh_query_node_lower_payload(uint64_t node) { return in
 
 CUDA_CALLABLE inline int bvh_query_node_upper_payload(uint64_t node) { return int((node >> 31) & 0x7fffffffu); }
 
+// Far children pushed onto the 32-bit traversal stack are stored as a tagged
+// pair of slots holding the node's packed payload, so popping them needs no
+// memory access: the top slot has bit 31 set and holds the upper payload, the
+// slot below it holds the lower payload and the leaf flag. When fewer than
+// two slots are free the node index is pushed instead (bit 31 clear, indices
+// are 31-bit) and the payload is re-loaded on pop.
+CUDA_CALLABLE inline int bvh_query_stack_slot_lo(const BVHPackedNodeHalf& lower)
+{
+    return int(lower.i | (unsigned(lower.b) << 31));
+}
+
+CUDA_CALLABLE inline int bvh_query_stack_slot_hi(const BVHPackedNodeHalf& upper) { return int(upper.i | 0x80000000u); }
+
+CUDA_CALLABLE inline uint64_t bvh_query_stack_unpack(unsigned slot_lo, unsigned slot_hi)
+{
+    return (uint64_t(slot_lo >> 31) << 62) | (uint64_t(slot_hi & 0x7fffffffu) << 31) | uint64_t(slot_lo & 0x7fffffffu);
+}
+
+// Largest stack occupancy at which a far child may still be pushed as a
+// two-slot payload pair. A traversal never has more pending stack entries
+// than internal nodes on a root-leaf path (max_depth - 1), and stopping pair
+// pushes above this limit bounds live pairs so that total slot usage stays
+// within BVH_QUERY_STACK_SIZE for every tree the constructors can produce
+// (they hard-terminate at the stack depth). An unknown or out-of-range depth
+// yields a negative limit, which disables pairs entirely and falls back to
+// the exactly-safe one-slot-per-entry index encoding.
+CUDA_CALLABLE inline int bvh_query_pair_limit(const BVH& bvh)
+{
+    int max_depth = bvh.max_depth;
+#ifdef __CUDA_ARCH__
+    if (bvh.max_depth_ptr)
+        max_depth = __ldg(bvh.max_depth_ptr);
+#else
+    if (bvh.max_depth_ptr)
+        max_depth = *bvh.max_depth_ptr;
+#endif
+    // grouped host builds restart the depth counter per group, so their
+    // recorded depth is not a root-leaf bound
+    if (max_depth < 1 || max_depth > BVH_QUERY_STACK_SIZE + 1 || bvh.item_groups)
+        max_depth = BVH_QUERY_STACK_SIZE + 1;
+    return std_min(64 - 2 * max_depth, BVH_QUERY_STACK_SIZE - 2);
+}
+
 CUDA_CALLABLE inline int lca(int node_a, int node_b, const int* parent)
 {
     int da = 0, db = 0;
@@ -463,6 +510,9 @@ struct bvh_query_t {
         , input_lower()
         , input_upper()
         , bounds_nr(0)
+        , cur_node(0)
+        , have_node(false)
+        , pair_limit(-1)
         , cursor(-1)
         , end_cursor(-1)
         , last_query_valid(true)
@@ -492,6 +542,16 @@ struct bvh_query_t {
     // bvh_query_next() call, without re-visiting the leaf node
     int prim_cur;
     int prim_end;
+
+    // packed payload (see bvh_query_node_pack()) of the node to process next,
+    // valid when have_node is set; it already passed its intersection test
+    // (stack-based AABB/sphere traversal only)
+    uint64_t cur_node;
+    bool have_node;
+
+    // stack occupancy up to which far children may be pushed as two-slot
+    // payload pairs (see bvh_query_pair_limit())
+    int pair_limit;
 
     // stackless directed (ray/capsule) traversal: next node to visit; finished
     // when cursor == end_cursor (the escape target of the query root's subtree)
@@ -570,14 +630,32 @@ CUDA_CALLABLE inline void bvh_query_alloc_stack(bvh_query_t& query)
 #endif
 }
 
+// Stack-based (AABB, sphere) queries traverse with pre-tested stack entries
+// and a register-carried current node, so the root is tested here.
+template <BvhQueryKind QUERY_KIND> CUDA_CALLABLE inline void bvh_query_init_volume(bvh_query_t& query, int root)
+{
+    const BVH& bvh = query.bvh;
+    bvh_query_alloc_stack(query);
+
+    const int root_index = (root == -1) ? *bvh.root : root;
+
+    const BVHPackedNodeHalf root_lower = bvh_load_node(bvh.node_lowers, root_index);
+    const BVHPackedNodeHalf root_upper = bvh_load_node(bvh.node_uppers, root_index);
+
+    query.pair_limit = bvh_query_pair_limit(bvh);
+
+    if (bvh_query_test<QUERY_KIND>(
+            query, reinterpret_cast<const vec3&>(root_lower), reinterpret_cast<const vec3&>(root_upper), FLT_MAX
+        )) {
+        query.cur_node = bvh_query_node_pack(root_lower, root_upper);
+        query.have_node = true;
+    }
+}
+
 CUDA_CALLABLE inline bvh_query_t bvh_query(uint64_t id, const vec3& lower, const vec3& upper, int root)
 {
     bvh_query_t query = bvh_query_common(id, lower, upper);
-    bvh_query_alloc_stack(query);
-
-    query.stack[0] = root == -1 ? *query.bvh.root : root;
-    query.count = 1;
-
+    bvh_query_init_volume<BvhQueryKind::AABB>(query, root);
     return query;
 }
 
@@ -620,23 +698,28 @@ bvh_query_capsule(uint64_t id, const vec3& start, const vec3& dir, float radius,
 // node test. Reuses the shared stack-based bvh_query_next() iterator.
 CUDA_CALLABLE inline bvh_query_t bvh_query_sphere(uint64_t id, const vec3& center, float radius, int root)
 {
-    bvh_query_t query = bvh_query(id, center, center, root);
+    bvh_query_t query = bvh_query_common(id, center, center);
     query.kind = BvhQueryKind::SPHERE;
+    // the radius must be set before the init tests the root
     query.radius = max(radius, 0.0f);
     query.radius_sq = query.radius * query.radius;
+    bvh_query_init_volume<BvhQueryKind::SPHERE>(query, root);
     return query;
 }
 
-// Shared traversal skeleton for all bvh query kinds, written once and instantiated per
-// query type. Each instantiation compiles to a dispatch-free loop (bvh_query_test folds
-// the query-kind branches at compile time), matching the original per-kind behavior.
+// Stack-based traversal (AABB, sphere): a single flat loop; every iteration
+// either emits one primitive from the packed leaf currently being enumerated,
+// or processes the node carried over in registers / popped from the shared
+// stack. Children are tested at the parent; the near child rides in registers
+// and far children go on the stack as tagged payload pairs while the tree
+// depth proves they fit (see bvh_query_pair_limit), so pops need no memory
+// access. Instantiated per query kind: bvh_query_test folds the kind branches
+// at compile time.
 template <BvhQueryKind QUERY_KIND>
 CUDA_CALLABLE inline bool bvh_query_next_impl(bvh_query_t& query, int& index, const float& max_dist)
 {
     BVH bvh = query.bvh;
 
-    // A single flat loop: every iteration either emits one primitive from the
-    // packed leaf currently being enumerated, or pops and processes one node.
     for (;;) {
         if (query.prim_cur < query.prim_end) {
             const int primitive_index = bvh_load_int(bvh.primitive_indices, query.prim_cur++);
@@ -645,7 +728,7 @@ CUDA_CALLABLE inline bool bvh_query_next_impl(bvh_query_t& query, int& index, co
                 // load the item bounds eagerly (read-only path) so the test
                 // compiles to one predicate chain instead of a branch per
                 // component; gated to AABB because the extra live registers
-                // measurably hurt the heavier sphere/capsule instantiations
+                // measurably hurt the heavier narrow-phase instantiations
                 const vec3 item_lower = bvh_load_vec3(bvh.item_lowers, primitive_index);
                 const vec3 item_upper = bvh_load_vec3(bvh.item_uppers, primitive_index);
                 if (!bvh_query_test<QUERY_KIND>(query, item_lower, item_upper, max_dist)) {
@@ -661,43 +744,76 @@ CUDA_CALLABLE inline bool bvh_query_next_impl(bvh_query_t& query, int& index, co
             return true;
         }
 
-        if (!query.count)
-            return false;
+        if (!query.have_node) {
+            if (!query.count)
+                return false;
 
-        const int node_index = query.stack[--query.count];
-
-        BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
-        BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
-
-        if (!bvh_query_test<QUERY_KIND>(
-                query, reinterpret_cast<vec3&>(node_lower), reinterpret_cast<vec3&>(node_upper), max_dist
-            )) {
-            continue;
+            const unsigned top = unsigned(query.stack[--query.count]);
+            if (top & 0x80000000u) {
+                // payload pair: the node is reconstructed without any memory access
+                query.cur_node = bvh_query_stack_unpack(unsigned(query.stack[--query.count]), top);
+            } else {
+                // index entry: it already passed its test, so the AABB part
+                // of this load is unused and no re-test is needed
+                query.cur_node = bvh_query_node_load(bvh, int(top));
+            }
         }
 
-        const int left_index = node_lower.i;
-        const int right_index = node_upper.i;
+        const uint64_t node = query.cur_node;
+        query.have_node = false;
 
-        if (node_lower.b) {
-            const int start = left_index;
-            const int end = right_index;
+        if (bvh_query_node_is_leaf(node)) {
+            const int start = bvh_query_node_lower_payload(node);
+            const int end = bvh_query_node_upper_payload(node);
 
-            // Fast path when the actual leaf range contains exactly one primitive:
-            // its AABB is the leaf node's AABB, which just passed the test above
+            // fast path when the leaf contains exactly one primitive: its
+            // AABB is the leaf node's AABB, which already passed its test
             if (end - start == 1) {
-                int primitive_index = bvh_load_int(bvh.primitive_indices, start);
+                const int primitive_index = bvh_load_int(bvh.primitive_indices, start);
                 index = primitive_index;
                 query.bounds_nr = primitive_index;
                 return true;
             }
 
-            // packed leaf: enumerate its primitives through the scalar cursors,
-            // one per loop iteration, without re-pushing the leaf node
+            // packed leaf: enumerate its primitives through the scalar
+            // cursors, one per loop iteration, without re-loading the leaf
             query.prim_cur = start;
             query.prim_end = end;
-        } else {
-            query.stack[query.count++] = left_index;
-            query.stack[query.count++] = right_index;
+            continue;
+        }
+
+        const int left_index = bvh_query_node_lower_payload(node);
+        const int right_index = bvh_query_node_upper_payload(node);
+
+        const BVHPackedNodeHalf left_lower = bvh_load_node(bvh.node_lowers, left_index);
+        const BVHPackedNodeHalf left_upper = bvh_load_node(bvh.node_uppers, left_index);
+        const BVHPackedNodeHalf right_lower = bvh_load_node(bvh.node_lowers, right_index);
+        const BVHPackedNodeHalf right_upper = bvh_load_node(bvh.node_uppers, right_index);
+
+        const bool hit_left = bvh_query_test<QUERY_KIND>(
+            query, reinterpret_cast<const vec3&>(left_lower), reinterpret_cast<const vec3&>(left_upper), max_dist
+        );
+        const bool hit_right = bvh_query_test<QUERY_KIND>(
+            query, reinterpret_cast<const vec3&>(right_lower), reinterpret_cast<const vec3&>(right_upper), max_dist
+        );
+
+        if (hit_left) {
+            query.cur_node = bvh_query_node_pack(left_lower, left_upper);
+            query.have_node = true;
+            if (hit_right) {
+                // pair pushes stop at pair_limit so that slot usage can never
+                // exceed the stack for constructor-produced trees; the final
+                // guard only matters for depths beyond the construction bound
+                if (query.count <= query.pair_limit) {
+                    query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
+                    query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
+                } else if (query.count < BVH_QUERY_STACK_SIZE) {
+                    query.stack[query.count++] = right_index;
+                }
+            }
+        } else if (hit_right) {
+            query.cur_node = bvh_query_node_pack(right_lower, right_upper);
+            query.have_node = true;
         }
     }
 }

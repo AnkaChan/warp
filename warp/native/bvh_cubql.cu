@@ -195,8 +195,9 @@ static bool cubql_append_subtree_primitives(
 // native traversal stack. If it does, we can copy the tree verbatim and keep
 // cuBQL's contiguous child-pair layout — which is much friendlier to ray
 // traversal cache behaviour than the warp builder's reordered layout.
-static bool
-cubql_tree_exceeds_native_stack(const CubqlNode* nodes, uint32_t num_nodes, uint32_t num_prims, bool& exceeds_stack)
+static bool cubql_tree_exceeds_native_stack(
+    const CubqlNode* nodes, uint32_t num_nodes, uint32_t num_prims, bool& exceeds_stack, int& max_depth
+)
 {
     struct StackEntry {
         uint32_t node_index;
@@ -204,6 +205,7 @@ cubql_tree_exceeds_native_stack(const CubqlNode* nodes, uint32_t num_nodes, uint
     };
 
     exceeds_stack = false;
+    max_depth = 0;
 
     std::vector<StackEntry> stack;
     stack.push_back({ 0, 0 });
@@ -218,6 +220,9 @@ cubql_tree_exceeds_native_stack(const CubqlNode* nodes, uint32_t num_nodes, uint
         if (!cubql_decode_node(nodes, num_nodes, num_prims, entry.node_index, is_leaf, offset, upper_offset)) {
             return false;
         }
+
+        // deepest node, counting the root as depth 1
+        max_depth = std_max(max_depth, entry.depth + 1);
 
         if (!is_leaf) {
             if (entry.depth >= BVH_QUERY_STACK_SIZE - 1) {
@@ -301,7 +306,8 @@ static bool cubql_copy_native_order_host_bvh(
         depth_stack.pop_back();
         depths.pop_back();
 
-        bvh.max_depth = std_max(bvh.max_depth, depth);
+        // deepest node, counting the root as depth 1
+        bvh.max_depth = std_max(bvh.max_depth, depth + 1);
 
         if (!bvh.node_lowers[node_index].b) {
             depth_stack.push_back(uint32_t(bvh.node_lowers[node_index].i));
@@ -390,11 +396,15 @@ static bool cubql_copy_to_native_host_bvh(
     }
 
     bool exceeds_stack = false;
-    if (!cubql_tree_exceeds_native_stack(nodes, num_nodes, num_prims, exceeds_stack)) {
+    int max_depth = 0;
+    if (!cubql_tree_exceeds_native_stack(nodes, num_nodes, num_prims, exceeds_stack, max_depth)) {
         return false;
     }
     if (!exceeds_stack) {
-        return cubql_copy_native_order_host_bvh(bvh, nodes, prim_ids, num_nodes, num_prims);
+        if (!cubql_copy_native_order_host_bvh(bvh, nodes, prim_ids, num_nodes, num_prims))
+            return false;
+        bvh.max_depth = max_depth;
+        return true;
     }
 
     CubqlNativeBuild build;
@@ -415,7 +425,7 @@ static bool cubql_copy_to_native_host_bvh(
 
     bvh.num_nodes = int(build.node_lowers.size());
     bvh.num_leaf_nodes = build.num_leaf_nodes;
-    bvh.max_depth = build.max_depth;
+    bvh.max_depth = build.max_depth + 1;  // build.max_depth counts the root as 0
     bvh.max_nodes = bvh.num_nodes;
 
     bvh.node_lowers = static_cast<BVHPackedNodeHalf*>(
@@ -449,12 +459,12 @@ static bool cubql_copy_to_native_host_bvh(
 // Fast-path device copy: allocate warp-layout device buffers and translate the
 // cuBQL nodes directly with a CUDA kernel, keeping cuBQL's child-pair layout.
 // Used when the tree fits within BVH_QUERY_STACK_SIZE.
-static inline bool cubql_copy_native_order_device(BVH& bvh, const cuBQL::bvh3f& native)
+static inline bool cubql_copy_native_order_device(BVH& bvh, const cuBQL::bvh3f& native, int max_depth)
 {
     bvh.num_nodes = int(native.numNodes);
     bvh.num_leaf_nodes = int(native.numNodes);  // launch refit over every node; non-leaves filter themselves
     bvh.max_nodes = int(native.numNodes);
-    bvh.max_depth = 0;
+    bvh.max_depth = max_depth;
 
     bvh.node_lowers = (BVHPackedNodeHalf*)wp_alloc_device(
         WP_CURRENT_CONTEXT, sizeof(BVHPackedNodeHalf) * native.numNodes, "(native:bvh)"
@@ -476,6 +486,11 @@ static inline bool cubql_copy_native_order_device(BVH& bvh, const cuBQL::bvh3f& 
 
     int root_index = 0;
     wp_memcpy_h2d(WP_CURRENT_CONTEXT, bvh.root, &root_index, sizeof(int));
+    // cuBQL rebuilds recreate the tree host-side, so a plain device copy of
+    // the depth (rather than a kernel-updated one) stays correct
+    bvh.max_depth_ptr = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int), "(native:bvh)");
+    if (bvh.max_depth_ptr)
+        wp_memcpy_h2d(WP_CURRENT_CONTEXT, bvh.max_depth_ptr, &bvh.max_depth, sizeof(int));
     wp_memcpy_d2d(WP_CURRENT_CONTEXT, bvh.primitive_indices, native.primIDs, sizeof(int) * native.numPrims);
     // Fill node_parents with -1 (all 0xFF bytes) — used as a sentinel for "no parent assigned"
     // before the copy kernel writes the real parent indices.
@@ -523,12 +538,15 @@ static inline bool cubql_copy_to_native_device(BVH& bvh, const cuBQL::bvh3f& nat
     wp_memcpy_d2h(WP_CURRENT_CONTEXT, nodes_host.data(), native.nodes, sizeof(CubqlNode) * native.numNodes);
 
     bool exceeds_stack = false;
-    if (!cubql_tree_exceeds_native_stack(nodes_host.data(), native.numNodes, native.numPrims, exceeds_stack)) {
+    int max_depth = 0;
+    if (!cubql_tree_exceeds_native_stack(
+            nodes_host.data(), native.numNodes, native.numPrims, exceeds_stack, max_depth
+        )) {
         return false;
     }
 
     if (!exceeds_stack) {
-        return cubql_copy_native_order_device(bvh, native);
+        return cubql_copy_native_order_device(bvh, native, max_depth);
     }
 
     std::vector<uint32_t> prim_ids_host(native.numPrims);
