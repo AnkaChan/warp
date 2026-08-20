@@ -436,7 +436,7 @@ CUDA_CALLABLE inline int bvh_query_pair_limit(const BVH& bvh)
     // recorded depth is not a root-leaf bound
     if (max_depth < 1 || max_depth > BVH_QUERY_STACK_SIZE + 1 || bvh.item_groups)
         max_depth = BVH_QUERY_STACK_SIZE + 1;
-    return std_min(64 - 2 * max_depth, BVH_QUERY_STACK_SIZE - 2);
+    return std_min(62 - 2 * max_depth, BVH_QUERY_STACK_SIZE - 2);
 }
 
 CUDA_CALLABLE inline int lca(int node_a, int node_b, const int* parent)
@@ -510,8 +510,6 @@ struct bvh_query_t {
         , input_lower()
         , input_upper()
         , bounds_nr(0)
-        , cur_node(0)
-        , have_node(false)
         , pair_limit(-1)
         , cursor(-1)
         , end_cursor(-1)
@@ -542,12 +540,6 @@ struct bvh_query_t {
     // bvh_query_next() call, without re-visiting the leaf node
     int prim_cur;
     int prim_end;
-
-    // packed payload (see bvh_query_node_pack()) of the node to process next,
-    // valid when have_node is set; it already passed its intersection test
-    // (stack-based AABB/sphere traversal only)
-    uint64_t cur_node;
-    bool have_node;
 
     // stack occupancy up to which far children may be pushed as two-slot
     // payload pairs (see bvh_query_pair_limit())
@@ -647,8 +639,8 @@ template <BvhQueryKind QUERY_KIND> CUDA_CALLABLE inline void bvh_query_init_volu
     if (bvh_query_test<QUERY_KIND>(
             query, reinterpret_cast<const vec3&>(root_lower), reinterpret_cast<const vec3&>(root_upper), FLT_MAX
         )) {
-        query.cur_node = bvh_query_node_pack(root_lower, root_upper);
-        query.have_node = true;
+        query.stack[0] = root_index;
+        query.count = 1;
     }
 }
 
@@ -744,23 +736,21 @@ CUDA_CALLABLE inline bool bvh_query_next_impl(bvh_query_t& query, int& index, co
             return true;
         }
 
-        if (!query.have_node) {
-            if (!query.count)
-                return false;
+        if (!query.count)
+            return false;
 
+        uint64_t node;
+        {
             const unsigned top = unsigned(query.stack[--query.count]);
             if (top & 0x80000000u) {
                 // payload pair: the node is reconstructed without any memory access
-                query.cur_node = bvh_query_stack_unpack(unsigned(query.stack[--query.count]), top);
+                node = bvh_query_stack_unpack(unsigned(query.stack[--query.count]), top);
             } else {
                 // index entry: it already passed its test, so the AABB part
                 // of this load is unused and no re-test is needed
-                query.cur_node = bvh_query_node_load(bvh, int(top));
+                node = bvh_query_node_load(bvh, int(top));
             }
         }
-
-        const uint64_t node = query.cur_node;
-        query.have_node = false;
 
         if (bvh_query_node_is_leaf(node)) {
             const int start = bvh_query_node_lower_payload(node);
@@ -797,23 +787,24 @@ CUDA_CALLABLE inline bool bvh_query_next_impl(bvh_query_t& query, int& index, co
             query, reinterpret_cast<const vec3&>(right_lower), reinterpret_cast<const vec3&>(right_upper), max_dist
         );
 
-        if (hit_left) {
-            query.cur_node = bvh_query_node_pack(left_lower, left_upper);
-            query.have_node = true;
-            if (hit_right) {
-                // pair pushes stop at pair_limit so that slot usage can never
-                // exceed the stack for constructor-produced trees; the final
-                // guard only matters for depths beyond the construction bound
-                if (query.count <= query.pair_limit) {
-                    query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
-                    query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
-                } else if (query.count < BVH_QUERY_STACK_SIZE) {
-                    query.stack[query.count++] = right_index;
-                }
+        // push far (right) first so the near-preferred (left) child pops first;
+        // pair pushes stop at pair_limit so that slot usage can never exceed
+        // the stack for constructor-produced trees
+        if (hit_right) {
+            if (query.count <= query.pair_limit) {
+                query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
+                query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
+            } else if (query.count < BVH_QUERY_STACK_SIZE) {
+                query.stack[query.count++] = right_index;
             }
-        } else if (hit_right) {
-            query.cur_node = bvh_query_node_pack(right_lower, right_upper);
-            query.have_node = true;
+        }
+        if (hit_left) {
+            if (query.count <= query.pair_limit) {
+                query.stack[query.count++] = bvh_query_stack_slot_lo(left_lower);
+                query.stack[query.count++] = bvh_query_stack_slot_hi(left_upper);
+            } else if (query.count < BVH_QUERY_STACK_SIZE) {
+                query.stack[query.count++] = left_index;
+            }
         }
     }
 }

@@ -1915,8 +1915,6 @@ struct mesh_query_aabb_t {
         , face(0)
         , prim_cur(0)
         , prim_end(0)
-        , cur_node(0)
-        , have_node(false)
         , pair_limit(-1)
         , last_query_valid(true)
         , kind(MeshQueryKind::AABB)
@@ -1948,11 +1946,6 @@ struct mesh_query_aabb_t {
     // mesh_query_next() call, without re-visiting the leaf node
     int prim_cur;
     int prim_end;
-
-    // packed payload (see bvh_query_node_pack()) of the node to process next,
-    // valid when have_node is set; it already passed its node test
-    uint64_t cur_node;
-    bool have_node;
 
     // stack occupancy up to which far children may be pushed as two-slot
     // payload pairs (see bvh_query_pair_limit())
@@ -2036,8 +2029,8 @@ CUDA_CALLABLE inline mesh_query_aabb_t mesh_query_impl(uint64_t id, const vec3& 
     if (mesh_query_node_test<IsSphere>(
             query, reinterpret_cast<const vec3&>(root_lower), reinterpret_cast<const vec3&>(root_upper)
         )) {
-        query.cur_node = bvh_query_node_pack(root_lower, root_upper);
-        query.have_node = true;
+        query.stack[0] = root_index;
+        query.count = 1;
     }
 
     return query;
@@ -2188,23 +2181,21 @@ CUDA_CALLABLE inline bool mesh_query_next_impl(mesh_query_aabb_t& query, int& in
             continue;
         }
 
-        if (!query.have_node) {
-            if (!query.count)
-                return false;
+        if (!query.count)
+            return false;
 
+        uint64_t node;
+        {
             const unsigned top = unsigned(query.stack[--query.count]);
             if (top & 0x80000000u) {
                 // payload pair: the node is reconstructed without any memory access
-                query.cur_node = bvh_query_stack_unpack(unsigned(query.stack[--query.count]), top);
+                node = bvh_query_stack_unpack(unsigned(query.stack[--query.count]), top);
             } else {
                 // index entry: it already passed its node test, so the AABB
                 // part of this load is unused and no re-test is needed
-                query.cur_node = bvh_query_node_load(mesh.bvh, int(top));
+                node = bvh_query_node_load(mesh.bvh, int(top));
             }
         }
-
-        const uint64_t node = query.cur_node;
-        query.have_node = false;
 
         if (bvh_query_node_is_leaf(node)) {
             const int start = bvh_query_node_lower_payload(node);
@@ -2246,23 +2237,24 @@ CUDA_CALLABLE inline bool mesh_query_next_impl(mesh_query_aabb_t& query, int& in
             query, reinterpret_cast<const vec3&>(right_lower), reinterpret_cast<const vec3&>(right_upper)
         );
 
-        if (hit_left) {
-            query.cur_node = bvh_query_node_pack(left_lower, left_upper);
-            query.have_node = true;
-            if (hit_right) {
-                // pair pushes stop at pair_limit so that slot usage can never
-                // exceed the stack for constructor-produced trees; the final
-                // guard only matters for depths beyond the construction bound
-                if (query.count <= query.pair_limit) {
-                    query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
-                    query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
-                } else if (query.count < BVH_QUERY_STACK_SIZE) {
-                    query.stack[query.count++] = right_index;
-                }
+        // push far (right) first so the near-preferred (left) child pops first;
+        // pair pushes stop at pair_limit so that slot usage can never exceed
+        // the stack for constructor-produced trees
+        if (hit_right) {
+            if (query.count <= query.pair_limit) {
+                query.stack[query.count++] = bvh_query_stack_slot_lo(right_lower);
+                query.stack[query.count++] = bvh_query_stack_slot_hi(right_upper);
+            } else if (query.count < BVH_QUERY_STACK_SIZE) {
+                query.stack[query.count++] = right_index;
             }
-        } else if (hit_right) {
-            query.cur_node = bvh_query_node_pack(right_lower, right_upper);
-            query.have_node = true;
+        }
+        if (hit_left) {
+            if (query.count <= query.pair_limit) {
+                query.stack[query.count++] = bvh_query_stack_slot_lo(left_lower);
+                query.stack[query.count++] = bvh_query_stack_slot_hi(left_upper);
+            } else if (query.count < BVH_QUERY_STACK_SIZE) {
+                query.stack[query.count++] = left_index;
+            }
         }
     }
 }
