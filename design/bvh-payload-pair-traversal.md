@@ -102,12 +102,15 @@ entries wait longest and go cold. Placing pairs deep-first measured 5-28% *slowe
   which is already the occupancy limiter.
 - **Local-memory stacks.** Measured 2.7-6x slower in iterator structs (defeats
   scalar replacement; the whole query state spills to local memory).
-- **All-pairs without the register-carried near child.** Measured equal to the full
-  design on the benchmark scene (the near child's stack round trip through shared
-  memory is nearly free). Kept the register carry for now because it is the
-  extensively validated form; dropping it is a candidate simplification tracked
-  separately -- it would remove the `cur_node`/`have_node` state machine at no
-  measured cost.
+- **All-pairs without the register-carried near child.** Superficially simpler (no
+  `cur_node`/`have_node` state machine), and an early experiment measured it equal --
+  but that experiment reused the far-child budget, which is unsound for all-pairs:
+  with both children transiting the stack, pending entries reach `max_depth` (not
+  `max_depth - 1`), so the safe budget shrinks to `62 - 2*max_depth`. With the
+  corrected budget it loses decisively: GPU +5% to +40% (deep-tree/sphere cases
+  worst, as the earlier index fallback bites), CPU +11% to +15% (doubled stack
+  traffic). The register carry is therefore load-bearing, not an optimization
+  garnish: it halves stack pressure, which is what lets the pair budget stretch.
 
 ## Performance
 
