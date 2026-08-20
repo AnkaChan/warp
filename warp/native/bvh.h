@@ -240,8 +240,24 @@ __device__ inline wp::BVHPackedNodeHalf bvh_load_node(const wp::BVHPackedNodeHal
     return nodes[index];
 #endif  // USE_LOAD4
 }
+
+// read-only loads for the remaining BVH/mesh query inputs (primitive indices,
+// item bounds, mesh vertices); plain pointer dereferences compile to generic
+// loads because the arrays are reached through a descriptor pointer, whereas
+// __ldg uses the read-only data path
+__device__ inline int bvh_load_int(const int* data, int index) { return __ldg(data + index); }
+
+__device__ inline vec3 bvh_load_vec3(const vec3* data, int index)
+{
+    const float* p = reinterpret_cast<const float*>(data + index);
+    return vec3(__ldg(p + 0), __ldg(p + 1), __ldg(p + 2));
+}
 #else
 inline wp::BVHPackedNodeHalf bvh_load_node(const wp::BVHPackedNodeHalf* nodes, int index) { return nodes[index]; }
+
+inline int bvh_load_int(const int* data, int index) { return data[index]; }
+
+inline vec3 bvh_load_vec3(const vec3* data, int index) { return data[index]; }
 #endif  // __CUDACC__
 
 CUDA_CALLABLE inline int clz(int x)
@@ -582,12 +598,12 @@ CUDA_CALLABLE inline bool bvh_query_next_impl(bvh_query_t& query, int& index, co
 
             // Fast path when the actual leaf range contains exactly one primitive
             if (end - start == 1) {
-                int primitive_index = bvh.primitive_indices[start];
+                int primitive_index = bvh_load_int(bvh.primitive_indices, start);
                 index = primitive_index;
                 query.bounds_nr = primitive_index;
                 return true;
             } else {
-                int primitive_index = bvh.primitive_indices[start + (query.primitive_counter++)];
+                int primitive_index = bvh_load_int(bvh.primitive_indices, start + (query.primitive_counter++));
 
                 // if already visited the last primitive in the leaf node
                 // move to the next node and reset the primitive counter to 0
@@ -598,9 +614,19 @@ CUDA_CALLABLE inline bool bvh_query_next_impl(bvh_query_t& query, int& index, co
                 else {
                     query.stack[query.count++] = node_index;
                 }
-                if (!bvh_query_test<QUERY_KIND>(
-                        query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], max_dist
-                    )) {
+                if constexpr (QUERY_KIND == BvhQueryKind::AABB) {
+                    // load the item bounds eagerly (read-only path) so the test
+                    // compiles to one predicate chain instead of a branch per
+                    // component; gated to AABB because the extra live registers
+                    // measurably hurt the heavier sphere/capsule instantiations
+                    const vec3 item_lower = bvh_load_vec3(bvh.item_lowers, primitive_index);
+                    const vec3 item_upper = bvh_load_vec3(bvh.item_uppers, primitive_index);
+                    if (!bvh_query_test<QUERY_KIND>(query, item_lower, item_upper, max_dist)) {
+                        continue;
+                    }
+                } else if (!bvh_query_test<QUERY_KIND>(
+                               query, bvh.item_lowers[primitive_index], bvh.item_uppers[primitive_index], max_dist
+                           )) {
                     continue;
                 }
                 index = primitive_index;
