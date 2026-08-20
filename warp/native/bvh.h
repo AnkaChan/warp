@@ -743,6 +743,141 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_aabb(uint64_t id, const vec3& lower, 
     return bvh_query(id, false, lower, upper, root);
 }
 
+// Experimental temporal-query frontier token layout. The low 31 bits store a
+// BVH node index. Bit 31 marks a leaf that overlapped the previous query; an
+// unmarked token is the root of a subtree pruned by that query. A complete
+// frontier partitions the BVH leaves between these two token kinds.
+CUDA_CALLABLE inline bool bvh_frontier_token_is_hit(int token) { return (unsigned(token) & 0x80000000u) != 0; }
+
+CUDA_CALLABLE inline int bvh_frontier_token_node(int token) { return int(unsigned(token) & 0x7fffffffu); }
+
+CUDA_CALLABLE inline bool bvh_frontier_token_is_valid(uint64_t id, int token)
+{
+    const BVH bvh = bvh_get(id);
+    const int node_index = bvh_frontier_token_node(token);
+    if (node_index < 0 || node_index >= bvh.num_nodes)
+        return false;
+
+    // A prior-hit token must remain a leaf. Refit preserves topology, so this
+    // also catches accidentally replaying a token across a rebuild.
+    if (bvh_frontier_token_is_hit(token))
+        return bvh_load_node(bvh.node_lowers, node_index).b != 0;
+    return true;
+}
+
+// Replay one token with the optimized regular AABB iterator. Exact replay
+// invokes this for every token in the prior frontier. The constructor retests
+// the token root against the current bounds before traversing its subtree.
+CUDA_CALLABLE inline bvh_query_t
+bvh_query_aabb_frontier_token(uint64_t id, const vec3& lower, const vec3& upper, int token)
+{
+    const BVH bvh = bvh_get(id);
+    const int node_index = bvh_frontier_token_node(token);
+    if (node_index < 0 || node_index >= bvh.num_nodes)
+        return bvh_query(bvh, false, lower, upper, *bvh.root);
+    return bvh_query(bvh, false, lower, upper, node_index);
+}
+
+CUDA_CALLABLE inline int bvh_frontier_token_primitive_count(uint64_t id, int token)
+{
+    const BVH bvh = bvh_get(id);
+    const int node_index = bvh_frontier_token_node(token);
+    if (node_index < 0 || node_index >= bvh.num_nodes)
+        return 0;
+
+    const BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
+    if (!node_lower.b)
+        return 0;
+    const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+    return int(node_upper.i) - int(node_lower.i);
+}
+
+// Return an original primitive index, not a slot in primitive_indices.
+CUDA_CALLABLE inline int bvh_frontier_token_primitive_at(uint64_t id, int token, int offset)
+{
+    const BVH bvh = bvh_get(id);
+    const int node_index = bvh_frontier_token_node(token);
+    if (node_index < 0 || node_index >= bvh.num_nodes || offset < 0)
+        return -1;
+
+    const BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
+    if (!node_lower.b)
+        return -1;
+    const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+    const int primitive_slot = int(node_lower.i) + offset;
+    if (primitive_slot >= int(node_upper.i))
+        return -1;
+    return bvh_load_int(bvh.primitive_indices, primitive_slot);
+}
+
+// Record the terminal nodes of an AABB traversal into a fixed-capacity token
+// segment. Starting at the global root records a complete frontier. Starting
+// at a prior token's node records its replacement frontier after a refit, so
+// concatenating the replacements supports rolling updates. The parent-link
+// walk deliberately avoids changing the regular iterator or its CUDA resource
+// use. Returns -1 on invalid input or overflow; callers must then fall back to
+// a global-root query and ignore the partial segment.
+CUDA_CALLABLE inline int bvh_query_aabb_frontier_record(
+    uint64_t id,
+    const vec3& lower,
+    const vec3& upper,
+    array_t<int>& tokens,
+    int token_offset,
+    int token_capacity,
+    int root
+)
+{
+    const BVH bvh = bvh_get(id);
+    const int root_index = (root == -1) ? *bvh.root : root;
+    if (!tokens.data || tokens.ndim != 1 || token_offset < 0 || token_capacity < 1
+        || token_offset > tokens.shape[0] - token_capacity || root_index < 0 || root_index >= bvh.num_nodes) {
+        return -1;
+    }
+
+    int token_count = 0;
+    int node_index = root_index;
+    int previous = -1;
+
+    for (;;) {
+        const BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
+
+        if (previous < 0) {
+            const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+            const bool hit = intersect_aabb_aabb(
+                lower, upper, reinterpret_cast<const vec3&>(node_lower), reinterpret_cast<const vec3&>(node_upper)
+            );
+
+            if (!hit || node_lower.b) {
+                if (token_count == token_capacity)
+                    return -1;
+                index(tokens, token_offset + token_count++)
+                    = int(unsigned(node_index) | ((hit && node_lower.b) ? 0x80000000u : 0u));
+
+                if (node_index == root_index)
+                    return token_count;
+                previous = node_index;
+                node_index = bvh_load_int(bvh.node_parents, node_index);
+                continue;
+            }
+
+            node_index = int(node_lower.i);
+            previous = ~bvh_load_int(bvh.node_parents, node_index);
+            continue;
+        }
+
+        if (previous == int(node_lower.i)) {
+            const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+            node_index = int(node_upper.i);
+            previous = ~bvh_load_int(bvh.node_parents, node_index);
+        } else if (node_index == root_index) {
+            return token_count;
+        } else {
+            previous = node_index;
+            node_index = bvh_load_int(bvh.node_parents, node_index);
+        }
+    }
+}
+
 CUDA_CALLABLE inline int bvh_find_exclusive_containment(
     const BVH& bvh, const vec3& lower, const vec3& upper, int start_node, int* containment_depth = nullptr
 )

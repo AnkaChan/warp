@@ -7046,6 +7046,85 @@ add_builtin(
 )
 
 add_builtin(
+    "bvh_query_aabb_frontier_record",
+    input_types={
+        "id": uint64,
+        "low": vec3,
+        "high": vec3,
+        "tokens": array(dtype=int),
+        "token_offset": int,
+        "token_capacity": int,
+        "root": int,
+    },
+    defaults={"root": -1},
+    value_type=int,
+    group="Geometry",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_query_aabb_frontier_token",
+    input_types={"id": uint64, "low": vec3, "high": vec3, "token": int},
+    value_type=BvhQuery,
+    group="Geometry",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_frontier_token_is_hit",
+    input_types={"token": int},
+    value_type=builtins.bool,
+    group="Geometry",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_frontier_token_node",
+    input_types={"token": int},
+    value_type=int,
+    group="Geometry",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_frontier_token_is_valid",
+    input_types={"id": uint64, "token": int},
+    value_type=builtins.bool,
+    group="Geometry",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_frontier_token_primitive_count",
+    input_types={"id": uint64, "token": int},
+    value_type=int,
+    group="Geometry",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_frontier_token_primitive_at",
+    input_types={"id": uint64, "token": int, "offset": int},
+    value_type=int,
+    group="Geometry",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
     "bvh_query_ray",
     input_types={"id": uint64, "start": vec3, "dir": vec3, "root": int},
     defaults={"root": -1},
