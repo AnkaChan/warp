@@ -65,6 +65,7 @@ void TopDownBVHBuilder::initialize_empty(BVH& bvh)
 {
     bvh.max_depth = 0;
     bvh.node_escapes = nullptr;
+    bvh.max_depth_ptr = nullptr;
     bvh.max_nodes = 0;
     bvh.node_lowers = nullptr;
     bvh.node_uppers = nullptr;
@@ -523,8 +524,9 @@ int TopDownBVHBuilder::build_recursive(
     if (assigned_node < 0)
         assert(node_index < bvh.max_nodes);
 
-    if (depth > bvh.max_depth)
-        bvh.max_depth = depth;
+    // record the deepest node, counting the root as depth 1
+    if (depth + 1 > bvh.max_depth)
+        bvh.max_depth = depth + 1;
 
     bounds3 b = calc_bounds(lowers, uppers, bvh.primitive_indices, start, end);
 

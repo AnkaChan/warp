@@ -407,7 +407,8 @@ __global__ void mark_packed_leaf_nodes(
     const uint64_t* __restrict__ keys,
     BVHPackedNodeHalf* __restrict__ lowers,
     BVHPackedNodeHalf* __restrict__ uppers,
-    const int leaf_size
+    const int leaf_size,
+    int* __restrict__ max_depth_out
 )
 {
     int node_index = blockDim.x * blockIdx.x + threadIdx.x;
@@ -422,6 +423,11 @@ __global__ void mark_packed_leaf_nodes(
             parent = parents[parent];
             depth++;
         }
+
+        // record the tree depth (root = 1) for bvh_query_pair_limit(); nodes
+        // muted below forced leaves clamp to the traversal bound
+        if (max_depth_out)
+            atomicMax(max_depth_out, ::min(depth, BVH_QUERY_STACK_SIZE));
 
         int left = range_lefts[node_index];
         // the LBVH constructor's range is defined as left <= i <= right
@@ -609,10 +615,12 @@ void LinearBVHBuilderGPU::build(
         (num_items, bvh.root, deltas, keys, num_children, bvh.primitive_indices, range_lefts, range_rights,
          bvh.node_parents, bvh.node_lowers, bvh.node_uppers)
     );
+    if (bvh.max_depth_ptr)
+        wp_memset_device(WP_CURRENT_CONTEXT, bvh.max_depth_ptr, 0, sizeof(int));
     wp_launch_device(
         WP_CURRENT_CONTEXT, mark_packed_leaf_nodes, bvh.max_nodes,
         (bvh.max_nodes, range_lefts, range_rights, bvh.node_parents, keys, bvh.node_lowers, bvh.node_uppers,
-         bvh.leaf_size)
+         bvh.leaf_size, bvh.max_depth_ptr)
     );
     // skip links must reflect the final leaf marking (capture-safe for rebuilds)
     wp_launch_device(
@@ -660,6 +668,11 @@ void copy_host_tree_to_device(void* context, BVH& bvh_host, BVH& bvh_device_on_h
 
     bvh_device_on_host.root = (int*)wp_alloc_device(context, sizeof(int), "(native:bvh)");
     wp_memcpy_h2d(context, bvh_device_on_host.root, bvh_host.root, sizeof(int));
+    // depth lives behind a device pointer so an in-place (graph-captured)
+    // LBVH rebuild of this tree can update it
+    bvh_device_on_host.max_depth_ptr = (int*)wp_alloc_device(context, sizeof(int), "(native:bvh)");
+    if (bvh_device_on_host.max_depth_ptr)
+        wp_memcpy_h2d(context, bvh_device_on_host.max_depth_ptr, &bvh_host.max_depth, sizeof(int));
     bvh_device_on_host.context = context;
 
     bvh_device_on_host.node_lowers = make_device_buffer_of(context, bvh_host.node_lowers, bvh_host.max_nodes);
@@ -761,6 +774,8 @@ void bvh_create_device(
         bvh_device_on_host.root = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int), "(native:bvh)");
         bvh_device_on_host.node_escapes
             = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh_device_on_host.max_nodes, "(native:bvh)");
+        bvh_device_on_host.max_depth_ptr = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int), "(native:bvh)");
+        bvh_device_on_host.max_depth = 0;
         bvh_device_on_host.primitive_indices
             = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * num_items, "(native:bvh)");
         bvh_device_on_host.item_lowers = lowers;
@@ -797,6 +812,8 @@ void bvh_destroy_device(BVH& bvh)
     bvh.root = NULL;
     wp_free_device(WP_CURRENT_CONTEXT, bvh.node_escapes);
     bvh.node_escapes = NULL;
+    wp_free_device(WP_CURRENT_CONTEXT, bvh.max_depth_ptr);
+    bvh.max_depth_ptr = NULL;
 }
 
 void bvh_refit_device(BVH& bvh)
