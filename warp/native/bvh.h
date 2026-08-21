@@ -939,6 +939,109 @@ CUDA_CALLABLE inline int bvh_query_aabb_frontier_record(
     }
 }
 
+// Atomically append the terminal nodes of one subtree traversal to a
+// query-owned output segment. Multiple threads may call this concurrently for
+// the complete, disjoint roots in one prior frontier. Each terminal reserves a
+// unique logical slot through output_counts[query_index]; token ordering within
+// the segment is therefore deliberately nondeterministic. The complete count
+// is accumulated even after overflow so callers can size a later attempt.
+//
+// A segment is transactional only when consumed after the append kernel:
+// overflow[query_index] must be zero and output_counts[query_index] must not
+// exceed its segment capacity. Otherwise every token in the partial segment
+// must be ignored and exactly one ordinary root traversal selected. The
+// caller owns the whole-frontier id/epoch/root gate, zero-initialization of
+// counts and overflow, stream ordering, and ping-pong storage for tokens,
+// counts, and overflow. Output tokens, counts, and overflow must not alias.
+// This helper performs no token validation or root fallback and leaves the
+// regular BVH query state unchanged. All arrays must be one-dimensional
+// positively strided int arrays. Fixed-capacity segments are derived from the
+// query index and are intrinsically disjoint. Returns the number of terminal
+// tokens attempted by this subtree, or -1 for locally invalid metadata.
+// Invalid metadata sets the sticky query overflow flag when that flag can be
+// addressed safely.
+CUDA_CALLABLE inline int bvh_query_aabb_frontier_record_atomic(
+    uint64_t id,
+    const vec3& lower,
+    const vec3& upper,
+    array_t<int>& output_tokens,
+    array_t<int>& output_counts,
+    array_t<int>& overflow,
+    int query_index,
+    int segment_capacity,
+    int root
+)
+{
+    const bool overflow_addressable = overflow.data && overflow.ndim == 1 && overflow.strides[0] >= int(sizeof(int))
+        && overflow.strides[0] % int(alignof(int)) == 0 && query_index >= 0 && query_index < overflow.shape[0];
+    if (!overflow_addressable)
+        return -1;
+
+    const bool tokens_valid = output_tokens.data && output_tokens.ndim == 1
+        && output_tokens.strides[0] >= int(sizeof(int)) && output_tokens.strides[0] % int(alignof(int)) == 0;
+    const bool counts_valid = output_counts.data && output_counts.ndim == 1
+        && output_counts.strides[0] >= int(sizeof(int)) && output_counts.strides[0] % int(alignof(int)) == 0
+        && query_index < output_counts.shape[0];
+    // Check q * capacity without performing an overflowing multiplication.
+    const bool segment_valid = segment_capacity > 0 && segment_capacity <= output_tokens.shape[0]
+        && query_index <= (output_tokens.shape[0] - segment_capacity) / segment_capacity;
+
+    const BVH bvh = bvh_get(id);
+    const int root_index = (root == -1 && bvh.root) ? *bvh.root : root;
+    if (!tokens_valid || !counts_valid || !segment_valid || root_index < 0 || root_index >= bvh.num_nodes) {
+        atomic_max(overflow, query_index, 1);
+        return -1;
+    }
+
+    const int segment_begin = query_index * segment_capacity;
+
+    int terminal_count = 0;
+    int node_index = root_index;
+    int previous = -1;
+
+    for (;;) {
+        const BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node_index);
+
+        if (previous < 0) {
+            const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+            const bool hit = intersect_aabb_aabb(
+                lower, upper, reinterpret_cast<const vec3&>(node_lower), reinterpret_cast<const vec3&>(node_upper)
+            );
+
+            if (!hit || node_lower.b) {
+                const int token = int(unsigned(node_index) | ((hit && node_lower.b) ? 0x80000000u : 0u));
+                const int slot = atomic_add(output_counts, query_index, 1);
+                ++terminal_count;
+                if (slot >= 0 && slot < segment_capacity)
+                    index(output_tokens, segment_begin + slot) = token;
+                else
+                    atomic_max(overflow, query_index, 1);
+
+                if (node_index == root_index)
+                    return terminal_count;
+                previous = node_index;
+                node_index = bvh_load_int(bvh.node_parents, node_index);
+                continue;
+            }
+
+            node_index = int(node_lower.i);
+            previous = ~bvh_load_int(bvh.node_parents, node_index);
+            continue;
+        }
+
+        if (previous == int(node_lower.i)) {
+            const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node_index);
+            node_index = int(node_upper.i);
+            previous = ~bvh_load_int(bvh.node_parents, node_index);
+        } else if (node_index == root_index) {
+            return terminal_count;
+        } else {
+            previous = node_index;
+            node_index = bvh_load_int(bvh.node_parents, node_index);
+        }
+    }
+}
+
 CUDA_CALLABLE inline int bvh_find_exclusive_containment(
     const BVH& bvh, const vec3& lower, const vec3& upper, int start_node, int* containment_depth = nullptr
 )

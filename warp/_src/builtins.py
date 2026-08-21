@@ -7065,6 +7065,45 @@ add_builtin(
 )
 
 add_builtin(
+    "bvh_query_aabb_frontier_record_atomic",
+    input_types={
+        "id": uint64,
+        "low": vec3,
+        "high": vec3,
+        "output_tokens": array(dtype=int),
+        "output_counts": array(dtype=int),
+        "overflow": array(dtype=int),
+        "query_index": int,
+        "segment_capacity": int,
+        "root": int,
+    },
+    value_type=int,
+    group="Geometry",
+    doc="""Atomically append one subtree's terminal cut to an experimental temporal AABB frontier.
+
+    Multiple threads may append the complete, disjoint prior-frontier subtrees for one query. Each terminal atomically
+    reserves a slot in the fixed-capacity segment beginning at ``query_index * segment_capacity`` and increments
+    ``output_counts[query_index]``. Output token ordering is nondeterministic. All arrays must be one-dimensional
+    positively strided ``int`` arrays. The output token, count, and overflow arrays must not alias. Zero the output
+    counts and overflow flags before the append kernel, and use ping-pong storage for all three outputs rather than
+    overlapping the input frontier or its metadata.
+
+    Append success is transactional only when the whole query is consumed after the kernel: ``overflow[query_index]``
+    must be zero and its output count must not exceed the segment capacity. Otherwise discard the entire partial
+    segment and select exactly one ordinary root traversal. This helper performs no topology gate, token validation,
+    or root fallback. If current candidates are obtained by scanning the newly appended cut, overflow also requires
+    the root traversal for the current query; if candidates were emitted independently during traversal, overflow
+    invalidates only the next-frame cache.
+
+    Returns the number of terminals attempted by this subtree, or -1 for locally invalid metadata. Packed hit leaves
+    may emit multiple primitives, so direct hit-token emission is exact only for leaf size one and is otherwise
+    conservative.""",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
     "bvh_frontier_topology_epoch",
     input_types={"id": uint64},
     value_type=int,
