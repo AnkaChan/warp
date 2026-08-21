@@ -259,8 +259,9 @@ void TopDownBVHBuilder::build(
     bvh.node_counts = nullptr;
     bvh.num_items = n;
 
-    bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int), "(native:bvh)"));
+    bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int) * BVH_ROOT_STORAGE_SIZE, "(native:bvh)"));
     bvh.root[0] = 0;
+    bvh.root[1] = BVH_TOPOLOGY_EPOCH_INITIAL;
 
     bvh.primitive_indices = static_cast<int*>(wp_alloc_host(sizeof(int) * n, "(native:bvh)"));
     for (int i = 0; i < n; ++i)
@@ -842,6 +843,8 @@ void bvh_refit_host(BVH& bvh)
 
 void bvh_rebuild_host(BVH& bvh, int constructor_type)
 {
+    const int previous_topology_epoch = bvh.root ? bvh.root[1] : 0;
+
     if (constructor_type == BVH_CONSTRUCTOR_CUBQL) {
         if (bvh.item_groups) {
             wp::set_error_string("Warp error: grouped BVHs are not supported with cuBQL construction");
@@ -858,6 +861,8 @@ void bvh_rebuild_host(BVH& bvh, int constructor_type)
             return;
         }
         bvh.constructor_type = constructor_type;
+        if (bvh.root && bvh.num_nodes > 0)
+            bvh.root[1] = bvh_next_topology_epoch(previous_topology_epoch);
         return;
     }
 
@@ -870,6 +875,8 @@ void bvh_rebuild_host(BVH& bvh, int constructor_type)
     builder.rebuild(bvh, constructor_type);
     bvh.constructor_type = constructor_type;
     bvh_refit_exclusive_host(bvh);
+    if (bvh.root && bvh.num_nodes > 0)
+        bvh.root[1] = bvh_next_topology_epoch(previous_topology_epoch);
 }
 
 }  // namespace wp

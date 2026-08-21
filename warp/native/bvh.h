@@ -23,6 +23,12 @@
 #define BVH_CONSTRUCTOR_LBVH (2)
 #define BVH_CONSTRUCTOR_CUBQL (-1)
 
+// root[0] stores the root node index. root[1] stores a non-zero topology
+// epoch used by temporal traversal caches. Keeping both values in the
+// existing allocation avoids growing BVH and the generic query state.
+#define BVH_ROOT_STORAGE_SIZE (2)
+#define BVH_TOPOLOGY_EPOCH_INITIAL (1)
+
 #ifndef WP_BVH_BLOCK_DIM
 #define WP_BVH_BLOCK_DIM 256
 #endif
@@ -206,9 +212,11 @@ struct BVH {
     // since we use packed leaf nodes, the number of them is no longer the number of items, but variable
     int num_leaf_nodes;
 
-    // pointer (CPU or GPU) to a single integer index in node_lowers, node_uppers
-    // representing the root of the tree, this is not always the first node
-    // for bottom-up builders
+    // pointer (CPU or GPU) to BVH_ROOT_STORAGE_SIZE integers. root[0] is the
+    // index in node_lowers/node_uppers representing the root of the tree; this
+    // is not always the first node for bottom-up builders. root[1] is a
+    // non-zero topology epoch. Refit preserves it, while a successful rebuild
+    // changes it so temporal traversal certificates can be invalidated.
     int* root;
 
     // maximum node depth of the tree counting the root as depth 1, stored
@@ -478,6 +486,12 @@ template <int dim> CUDA_CALLABLE inline uint32_t morton3(float x, float y, float
 
 CUDA_CALLABLE inline BVH bvh_get(uint64_t id) { return *(BVH*)(id); }
 
+CUDA_CALLABLE inline int bvh_next_topology_epoch(int epoch)
+{
+    const unsigned next = unsigned(epoch) + 1u;
+    return int(next == 0u ? unsigned(BVH_TOPOLOGY_EPOCH_INITIAL) : next);
+}
+
 CUDA_CALLABLE inline int bvh_get_num_bounds(uint64_t id)
 {
     BVH bvh = bvh_get(id);
@@ -744,13 +758,52 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_aabb(uint64_t id, const vec3& lower, 
 }
 
 // Experimental temporal-query frontier token layout. The low 31 bits store a
-// BVH node index. Bit 31 marks a leaf that overlapped the previous query; an
-// unmarked token is the root of a subtree pruned by that query. A complete
-// frontier partitions the BVH leaves between these two token kinds.
+// BVH node index. Bit 31 marks a leaf whose node bounds overlapped the previous
+// query; an unmarked token is the root of a subtree pruned by that query. With
+// packed leaves the hit tag does not imply that every item in the leaf
+// overlaps. A complete frontier partitions the BVH leaves between these two
+// token kinds.
 CUDA_CALLABLE inline bool bvh_frontier_token_is_hit(int token) { return (unsigned(token) & 0x80000000u) != 0; }
 
 CUDA_CALLABLE inline int bvh_frontier_token_node(int token) { return int(unsigned(token) & 0x7fffffffu); }
 
+CUDA_CALLABLE inline int bvh_frontier_topology_epoch(uint64_t id)
+{
+    const BVH bvh = bvh_get(id);
+    return bvh.root ? bvh_load_int(bvh.root, 1) : 0;
+}
+
+CUDA_CALLABLE inline int bvh_frontier_root(uint64_t id, int root)
+{
+    const BVH bvh = bvh_get(id);
+    const int root_index = (root == -1 && bvh.root) ? bvh_load_int(bvh.root, 0) : root;
+    return root_index >= 0 && root_index < bvh.num_nodes ? root_index : -1;
+}
+
+// Validate the O(1) identity shared by every token in a frontier. The caller
+// records all three values when constructing the complete terminal cut. A
+// false result invalidates the whole frontier: skip every token and perform
+// exactly one ordinary query from root. The object identifier protects
+// against tree swaps, the epoch protects against in-place rebuilds, and the
+// resolved root protects global/group/arbitrary-root selection.
+CUDA_CALLABLE inline bool
+bvh_frontier_is_valid(uint64_t id, uint64_t recorded_id, int recorded_epoch, int recorded_root, int root)
+{
+    if (id != recorded_id || recorded_epoch == 0)
+        return false;
+
+    const BVH bvh = bvh_get(id);
+    if (!bvh.root)
+        return false;
+
+    const int current_root = (root == -1) ? bvh_load_int(bvh.root, 0) : root;
+    return recorded_epoch == bvh_load_int(bvh.root, 1) && recorded_root == current_root && current_root >= 0
+        && current_root < bvh.num_nodes;
+}
+
+// This scalar structural check is useful for diagnostics, but it is not a
+// whole-frontier compatibility certificate. Call bvh_frontier_is_valid()
+// before consuming any tokens.
 CUDA_CALLABLE inline bool bvh_frontier_token_is_valid(uint64_t id, int token)
 {
     const BVH bvh = bvh_get(id);
@@ -758,23 +811,25 @@ CUDA_CALLABLE inline bool bvh_frontier_token_is_valid(uint64_t id, int token)
     if (node_index < 0 || node_index >= bvh.num_nodes)
         return false;
 
-    // A prior-hit token must remain a leaf. Refit preserves topology, so this
-    // also catches accidentally replaying a token across a rebuild.
+    // A prior-hit token must remain a leaf. This check alone cannot detect a
+    // rebuild that happens to leave the same index as a leaf; the whole-cut
+    // epoch gate above provides that protection.
     if (bvh_frontier_token_is_hit(token))
         return bvh_load_node(bvh.node_lowers, node_index).b != 0;
     return true;
 }
 
 // Replay one token with the optimized regular AABB iterator. Exact replay
-// invokes this for every token in the prior frontier. The constructor retests
-// the token root against the current bounds before traversing its subtree.
+// invokes this for every token in a whole frontier only after a successful
+// bvh_frontier_is_valid() gate. The constructor deliberately performs no
+// per-token validation or root fallback: an invalid frontier must instead
+// issue exactly one separate ordinary root query. The constructor retests the
+// token root against the current bounds before traversing its subtree.
 CUDA_CALLABLE inline bvh_query_t
 bvh_query_aabb_frontier_token(uint64_t id, const vec3& lower, const vec3& upper, int token)
 {
     const BVH bvh = bvh_get(id);
     const int node_index = bvh_frontier_token_node(token);
-    if (node_index < 0 || node_index >= bvh.num_nodes)
-        return bvh_query(bvh, false, lower, upper, *bvh.root);
     return bvh_query(bvh, false, lower, upper, node_index);
 }
 
@@ -792,7 +847,11 @@ CUDA_CALLABLE inline int bvh_frontier_token_primitive_count(uint64_t id, int tok
     return int(node_upper.i) - int(node_lower.i);
 }
 
-// Return an original primitive index, not a slot in primitive_indices.
+// Return an original primitive index, not a slot in primitive_indices. These
+// primitive helpers expose the entire packed leaf range without retesting
+// item bounds. Directly emitting the range is therefore a conservative
+// superset operation when leaf_size > 1. Exact replay must enumerate the
+// ordinary iterator returned by bvh_query_aabb_frontier_token().
 CUDA_CALLABLE inline int bvh_frontier_token_primitive_at(uint64_t id, int token, int offset)
 {
     const BVH bvh = bvh_get(id);
@@ -816,7 +875,8 @@ CUDA_CALLABLE inline int bvh_frontier_token_primitive_at(uint64_t id, int token,
 // concatenating the replacements supports rolling updates. The parent-link
 // walk deliberately avoids changing the regular iterator or its CUDA resource
 // use. Returns -1 on invalid input or overflow; callers must then fall back to
-// a global-root query and ignore the partial segment.
+// a global-root query and ignore the partial segment. Writes use Warp indexing
+// so one-dimensional positively strided token arrays are supported.
 CUDA_CALLABLE inline int bvh_query_aabb_frontier_record(
     uint64_t id,
     const vec3& lower,
@@ -828,8 +888,9 @@ CUDA_CALLABLE inline int bvh_query_aabb_frontier_record(
 )
 {
     const BVH bvh = bvh_get(id);
-    const int root_index = (root == -1) ? *bvh.root : root;
-    if (!tokens.data || tokens.ndim != 1 || token_offset < 0 || token_capacity < 1
+    const int root_index = (root == -1 && bvh.root) ? *bvh.root : root;
+    if (!tokens.data || tokens.ndim != 1 || tokens.strides[0] < int(sizeof(int))
+        || tokens.strides[0] % int(alignof(int)) != 0 || token_offset < 0 || token_capacity < 1
         || token_offset > tokens.shape[0] - token_capacity || root_index < 0 || root_index >= bvh.num_nodes) {
         return -1;
     }

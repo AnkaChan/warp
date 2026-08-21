@@ -49,6 +49,7 @@ __global__ void bvh_update_descriptor_after_lbvh_rebuild_kernel(BVH* bvh)
     bvh->num_nodes = bvh->max_nodes;
     bvh->num_leaf_nodes = bvh->num_items;
     bvh->constructor_type = BVH_CONSTRUCTOR_LBVH;
+    bvh->root[1] = bvh_next_topology_epoch(bvh->root[1]);
 }
 
 // for LBVH: this will start with some muted leaf nodes, but that is okay, we can still trace up because there parents
@@ -787,8 +788,8 @@ void copy_host_tree_to_device(void* context, BVH& bvh_host, BVH& bvh_device_on_h
     bvh_device_on_host.leaf_size = bvh_host.leaf_size;
     bvh_device_on_host.constructor_type = bvh_host.constructor_type;
 
-    bvh_device_on_host.root = (int*)wp_alloc_device(context, sizeof(int), "(native:bvh)");
-    wp_memcpy_h2d(context, bvh_device_on_host.root, bvh_host.root, sizeof(int));
+    bvh_device_on_host.root = (int*)wp_alloc_device(context, sizeof(int) * BVH_ROOT_STORAGE_SIZE, "(native:bvh)");
+    wp_memcpy_h2d(context, bvh_device_on_host.root, bvh_host.root, sizeof(int) * BVH_ROOT_STORAGE_SIZE);
     // Depth lives behind a device pointer so an in-place (graph-captured)
     // LBVH rebuild of this tree can update it.
     bvh_device_on_host.max_depth_ptr = (int*)wp_alloc_device(context, sizeof(int), "(native:bvh)");
@@ -911,7 +912,10 @@ void bvh_create_device(
             = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh_device_on_host.max_nodes, "(native:bvh)");
         bvh_device_on_host.node_counts
             = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * bvh_device_on_host.max_nodes, "(native:bvh)");
-        bvh_device_on_host.root = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int), "(native:bvh)");
+        bvh_device_on_host.root
+            = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * BVH_ROOT_STORAGE_SIZE, "(native:bvh)");
+        int root_storage[BVH_ROOT_STORAGE_SIZE] = { -1, BVH_TOPOLOGY_EPOCH_INITIAL };
+        wp_memcpy_h2d(WP_CURRENT_CONTEXT, bvh_device_on_host.root, root_storage, sizeof(int) * BVH_ROOT_STORAGE_SIZE);
         bvh_device_on_host.max_depth_ptr = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int), "(native:bvh)");
         bvh_device_on_host.max_depth = 0;
         bvh_device_on_host.primitive_indices

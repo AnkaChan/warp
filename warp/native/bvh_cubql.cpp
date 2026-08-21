@@ -199,7 +199,7 @@ static bool cubql_copy_native_order_bvh(
     bvh.node_parents = static_cast<int*>(wp_alloc_host(sizeof(int) * num_nodes, "(native:bvh)"));
     bvh.node_counts = nullptr;
     bvh.primitive_indices = static_cast<int*>(wp_alloc_host(sizeof(int) * num_prims, "(native:bvh)"));
-    bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int), "(native:bvh)"));
+    bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int) * BVH_ROOT_STORAGE_SIZE, "(native:bvh)"));
 
     if (!bvh.node_lowers || !bvh.node_uppers || !bvh.node_parents || !bvh.primitive_indices || !bvh.root) {
         wp::set_error_string("Warp error: failed to allocate native BVH storage for cuBQL conversion");
@@ -209,6 +209,7 @@ static bool cubql_copy_native_order_bvh(
 
     std::fill(bvh.node_parents, bvh.node_parents + num_nodes, -1);
     bvh.root[0] = 0;
+    bvh.root[1] = BVH_TOPOLOGY_EPOCH_INITIAL;
 
     for (uint32_t i = 0; i < num_prims; ++i) {
         if (prim_ids[i] > uint32_t(INT_MAX)) {
@@ -393,7 +394,7 @@ static bool cubql_copy_to_native_host_bvh(BVH& bvh, const cuBQL::bvh3f& native)
     bvh.node_counts = nullptr;
     bvh.primitive_indices
         = static_cast<int*>(wp_alloc_host(sizeof(int) * build.primitive_indices.size(), "(native:bvh)"));
-    bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int), "(native:bvh)"));
+    bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int) * BVH_ROOT_STORAGE_SIZE, "(native:bvh)"));
 
     if (!bvh.node_lowers || !bvh.node_uppers || !bvh.node_parents || !bvh.primitive_indices || !bvh.root) {
         wp::set_error_string("Warp error: failed to allocate native BVH storage for cuBQL conversion");
@@ -402,6 +403,7 @@ static bool cubql_copy_to_native_host_bvh(BVH& bvh, const cuBQL::bvh3f& native)
     }
 
     bvh.root[0] = root;
+    bvh.root[1] = BVH_TOPOLOGY_EPOCH_INITIAL;
 
     std::copy(build.node_lowers.begin(), build.node_lowers.end(), bvh.node_lowers);
     std::copy(build.node_uppers.begin(), build.node_uppers.end(), bvh.node_uppers);

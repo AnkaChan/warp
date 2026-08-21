@@ -252,7 +252,7 @@ static bool cubql_copy_native_order_host_bvh(
     bvh.node_parents = static_cast<int*>(wp_alloc_host(sizeof(int) * num_nodes, "(native:bvh)"));
     bvh.node_counts = nullptr;
     bvh.primitive_indices = static_cast<int*>(wp_alloc_host(sizeof(int) * num_prims, "(native:bvh)"));
-    bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int), "(native:bvh)"));
+    bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int) * BVH_ROOT_STORAGE_SIZE, "(native:bvh)"));
 
     if (!bvh.node_lowers || !bvh.node_uppers || !bvh.node_parents || !bvh.primitive_indices || !bvh.root) {
         wp::set_error_string("Warp error: failed to allocate native BVH storage for cuBQL conversion");
@@ -262,6 +262,7 @@ static bool cubql_copy_native_order_host_bvh(
 
     std::fill(bvh.node_parents, bvh.node_parents + num_nodes, -1);
     bvh.root[0] = 0;
+    bvh.root[1] = BVH_TOPOLOGY_EPOCH_INITIAL;
 
     for (uint32_t i = 0; i < num_prims; ++i) {
         if (prim_ids[i] > uint32_t(INT_MAX)) {
@@ -445,7 +446,7 @@ static bool cubql_copy_to_native_host_bvh(
     bvh.node_counts = nullptr;
     bvh.primitive_indices
         = static_cast<int*>(wp_alloc_host(sizeof(int) * build.primitive_indices.size(), "(native:bvh)"));
-    bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int), "(native:bvh)"));
+    bvh.root = static_cast<int*>(wp_alloc_host(sizeof(int) * BVH_ROOT_STORAGE_SIZE, "(native:bvh)"));
 
     if (!bvh.node_lowers || !bvh.node_uppers || !bvh.node_parents || !bvh.primitive_indices || !bvh.root) {
         wp::set_error_string("Warp error: failed to allocate native BVH storage for cuBQL conversion");
@@ -454,6 +455,7 @@ static bool cubql_copy_to_native_host_bvh(
     }
 
     bvh.root[0] = root;
+    bvh.root[1] = BVH_TOPOLOGY_EPOCH_INITIAL;
 
     std::copy(build.node_lowers.begin(), build.node_lowers.end(), bvh.node_lowers);
     std::copy(build.node_uppers.begin(), build.node_uppers.end(), bvh.node_uppers);
@@ -482,7 +484,7 @@ static inline bool cubql_copy_native_order_device(BVH& bvh, const cuBQL::bvh3f& 
     bvh.node_parents = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * native.numNodes, "(native:bvh)");
     bvh.node_counts = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * native.numNodes, "(native:bvh)");
     bvh.primitive_indices = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * native.numPrims, "(native:bvh)");
-    bvh.root = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int), "(native:bvh)");
+    bvh.root = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int) * BVH_ROOT_STORAGE_SIZE, "(native:bvh)");
 
     if (!bvh.node_lowers || !bvh.node_uppers || !bvh.node_parents || !bvh.node_counts || !bvh.primitive_indices
         || !bvh.root) {
@@ -491,8 +493,8 @@ static inline bool cubql_copy_native_order_device(BVH& bvh, const cuBQL::bvh3f& 
         return false;
     }
 
-    int root_index = 0;
-    wp_memcpy_h2d(WP_CURRENT_CONTEXT, bvh.root, &root_index, sizeof(int));
+    int root_storage[BVH_ROOT_STORAGE_SIZE] = { 0, BVH_TOPOLOGY_EPOCH_INITIAL };
+    wp_memcpy_h2d(WP_CURRENT_CONTEXT, bvh.root, root_storage, sizeof(int) * BVH_ROOT_STORAGE_SIZE);
     // cuBQL rebuilds recreate the tree host-side, so a plain device copy of
     // the depth (rather than a kernel-updated value) stays correct.
     bvh.max_depth_ptr = (int*)wp_alloc_device(WP_CURRENT_CONTEXT, sizeof(int), "(native:bvh)");
@@ -676,9 +678,18 @@ void cubql_bvh_rebuild_device(BVH& bvh)
     vec3* uppers = bvh.item_uppers;
     const int num_items = bvh.num_items;
     const int leaf_size = bvh.leaf_size;
+    int previous_topology_epoch = 0;
+    if (bvh.root) {
+        wp_memcpy_d2h(WP_CURRENT_CONTEXT, &previous_topology_epoch, bvh.root + 1, sizeof(int));
+        wp_cuda_context_synchronize(WP_CURRENT_CONTEXT);
+    }
 
     bvh_destroy_device(bvh);
     cubql_bvh_create_device(context, lowers, uppers, num_items, leaf_size, bvh);
+    if (bvh.root && bvh.num_nodes > 0) {
+        int next_topology_epoch = bvh_next_topology_epoch(previous_topology_epoch);
+        wp_memcpy_h2d(WP_CURRENT_CONTEXT, bvh.root + 1, &next_topology_epoch, sizeof(int));
+    }
 }
 
 #else  // WP_DISABLE_CUBQL

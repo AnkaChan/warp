@@ -7065,10 +7065,69 @@ add_builtin(
 )
 
 add_builtin(
+    "bvh_frontier_topology_epoch",
+    input_types={"id": uint64},
+    value_type=int,
+    group="Geometry",
+    doc="""Return the internal topology epoch used by experimental temporal BVH frontiers.
+
+    A successful BVH rebuild changes this 32-bit epoch, while a refit preserves it. Record it together with the BVH
+    identifier and resolved query root when creating a complete frontier. A frontier cache belongs to the lifetime of
+    that BVH object and must be discarded before the object is destroyed or the 32-bit epoch can wrap.""",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_frontier_root",
+    input_types={"id": uint64, "root": int},
+    defaults={"root": -1},
+    value_type=int,
+    group="Geometry",
+    doc="""Resolve the root identity used by an experimental temporal BVH frontier.
+
+    Pass the same root selection to :func:`bvh_query_aabb_frontier_record` and
+    :func:`bvh_frontier_is_valid`. The global root is resolved when ``root`` is -1. Invalid roots return -1.""",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_frontier_is_valid",
+    input_types={
+        "id": uint64,
+        "recorded_id": uint64,
+        "recorded_epoch": int,
+        "recorded_root": int,
+        "root": int,
+    },
+    defaults={"root": -1},
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Validate the O(1) identity shared by every token in an experimental temporal BVH frontier.
+
+    ``recorded_id``, ``recorded_epoch``, and ``recorded_root`` must be captured when the complete frontier is recorded.
+    A false result invalidates the whole frontier: skip every token and issue exactly one ordinary query from ``root``.
+    This gate detects a BVH swap, successful in-place rebuild, or root change. It intentionally does not validate token
+    storage; the caller must also retain a complete, non-overflowed frontier produced for the recorded identity.""",
+    hidden=True,
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
     "bvh_query_aabb_frontier_token",
     input_types={"id": uint64, "low": vec3, "high": vec3, "token": int},
     value_type=BvhQuery,
     group="Geometry",
+    doc="""Replay one token from an experimental temporal AABB frontier.
+
+    Call :func:`bvh_frontier_is_valid` once for the whole frontier before invoking this constructor for any token.
+    The constructor intentionally performs no per-token validation or root fallback. If the whole-frontier gate fails,
+    skip every token and issue exactly one ordinary root query instead. The ordinary iterator retests every item bound
+    in packed leaves and therefore preserves exact query semantics.""",
     hidden=True,
     export=False,
     is_differentiable=False,
@@ -7109,6 +7168,11 @@ add_builtin(
     input_types={"id": uint64, "token": int},
     value_type=int,
     group="Geometry",
+    doc="""Return the number of primitives in the packed leaf referenced by a frontier token.
+
+    This does not retest individual primitive bounds. Directly emitting the returned leaf range is conservative
+    superset behavior when the BVH leaf size is greater than one; use the ordinary frontier-token iterator for exact
+    replay.""",
     hidden=True,
     export=False,
     is_differentiable=False,
@@ -7119,6 +7183,10 @@ add_builtin(
     input_types={"id": uint64, "token": int, "offset": int},
     value_type=int,
     group="Geometry",
+    doc="""Return a primitive from the packed leaf referenced by a frontier token.
+
+    This does not retest the primitive bound. Direct leaf-range emission is a conservative superset operation when the
+    BVH leaf size is greater than one; use the ordinary frontier-token iterator for exact replay.""",
     hidden=True,
     export=False,
     is_differentiable=False,
