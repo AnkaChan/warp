@@ -242,9 +242,13 @@ __device__ inline wp::BVHPackedNodeHalf bvh_load_node(const wp::BVHPackedNodeHal
 }
 
 // read-only loads for the remaining BVH/mesh query inputs (primitive indices,
-// item bounds, mesh vertices); plain pointer dereferences compile to generic
-// loads because the arrays are reached through a descriptor pointer, whereas
-// __ldg uses the read-only data path
+// item bounds, mesh vertex indices); plain pointer dereferences compile to
+// generic loads because the arrays are reached through a descriptor pointer,
+// whereas __ldg uses the read-only data path. AABB queries also load the
+// candidate bounds into locals up front so the short-circuit overlap test
+// compiles to a single predicate chain instead of a branch per component;
+// the eager loads stay gated to the AABB instantiations because the extra
+// live registers measurably hurt the heavier sphere/capsule instantiations
 __device__ inline int bvh_load_int(const int* data, int index) { return __ldg(data + index); }
 
 __device__ inline vec3 bvh_load_vec3(const vec3* data, int index)
@@ -615,10 +619,6 @@ CUDA_CALLABLE inline bool bvh_query_next_impl(bvh_query_t& query, int& index, co
                     query.stack[query.count++] = node_index;
                 }
                 if constexpr (QUERY_KIND == BvhQueryKind::AABB) {
-                    // load the item bounds eagerly (read-only path) so the test
-                    // compiles to one predicate chain instead of a branch per
-                    // component; gated to AABB because the extra live registers
-                    // measurably hurt the heavier sphere/capsule instantiations
                     const vec3 item_lower = bvh_load_vec3(bvh.item_lowers, primitive_index);
                     const vec3 item_upper = bvh_load_vec3(bvh.item_uppers, primitive_index);
                     if (!bvh_query_test<QUERY_KIND>(query, item_lower, item_upper, max_dist)) {

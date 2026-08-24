@@ -2652,8 +2652,6 @@ struct SphereNodeTest {
 struct AabbPrimitiveTest {
     CUDA_CALLABLE bool operator()(const mesh_query_aabb_t& q, const Mesh& m, int pi) const
     {
-        // load the face bounds eagerly (read-only path) so the test compiles
-        // to one predicate chain instead of a branch per component
         const vec3 face_lower = bvh_load_vec3(m.lowers, pi);
         const vec3 face_upper = bvh_load_vec3(m.uppers, pi);
         return intersect_aabb_aabb(q.input_lower, q.input_upper, face_lower, face_upper);
