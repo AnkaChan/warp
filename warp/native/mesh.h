@@ -2458,20 +2458,6 @@ struct mesh_query_aabb_t {
 };
 
 
-// Node-overlap test for a mesh query. IsSphere=true uses exact sphere-AABB test;
-// IsSphere=false folds to the original intersect_aabb_aabb test.
-template <bool IsSphere>
-CUDA_CALLABLE inline bool
-mesh_query_node_test(const mesh_query_aabb_t& query, const vec3& node_lower, const vec3& node_upper)
-{
-    if constexpr (IsSphere) {
-        return intersect_sphere_aabb(query.input_lower, query.radius_sq, node_lower, node_upper);
-    } else {
-        return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
-    }
-}
-
-
 #if BVH_SHARED_STACK
 // One shared-memory traversal stack per kernel, shared by every mesh query kind.
 // Allocated outside the templated factory: each template instantiation would
