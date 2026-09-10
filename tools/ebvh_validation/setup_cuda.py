@@ -9,7 +9,7 @@ import urllib.request
 VERSION = "12.6.3"
 BASE = "https://developer.download.nvidia.com/compute/cuda/redist/"
 ROOT = pathlib.Path(__file__).resolve().parents[2] / "_build" / "ebvh-cuda-12.6.3"
-PACKAGES = ("cuda_nvcc", "cuda_cudart", "cuda_cccl", "cuda_nvrtc", "cuda_cuobjdump")
+PACKAGES = ("cuda_nvcc", "cuda_cudart", "cuda_cccl", "cuda_nvrtc", "cuda_cuobjdump", "libnvjitlink")
 
 
 def main():
