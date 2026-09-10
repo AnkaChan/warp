@@ -174,7 +174,7 @@ def benchmark(commands, args, device):
     wp.synchronize_device(device)
     names = list(graphs)
     burn_start = time.perf_counter()
-    while time.perf_counter() - burn_start < 2.0:
+    while time.perf_counter() - burn_start < getattr(args, "burn_seconds", 2.0):
         for name in names:
             wp.capture_launch(graphs[name])
         wp.synchronize_device(device)

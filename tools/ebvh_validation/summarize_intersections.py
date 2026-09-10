@@ -41,8 +41,8 @@ def main():
         for key, records in groups.items():
             print("CASE", key, "processes", len(records))
             for name in records[0][1]:
-                times = [m[name] for _, m in records]
-                ratios = [m["root"] / m[name] for _, m in records]
+                times = [m[name] for _, m in records if name in m]
+                ratios = [m["root"] / m[name] for _, m in records if name in m]
                 print(
                     name,
                     "ms",
@@ -51,6 +51,8 @@ def main():
                     round(statistics.median(ratios), 4),
                     "range",
                     [round(min(ratios), 4), round(max(ratios), 4)],
+                    "processes",
+                    len(times),
                 )
             record, means = records[0]
             if "stackless_fallback_fraction" in record:
@@ -63,9 +65,25 @@ def main():
                     record["mean_hits"],
                 )
             if "frames" in record:
+                refits = [
+                    statistics.mean(f["refit_ms"] for f in r["frames"])
+                    for r, _ in records
+                ]
+                ordinary_refits = [
+                    statistics.mean(f["ordinary_refit_ms"] for f in r["frames"])
+                    for r, _ in records
+                ]
+                total_ratios = [
+                    (ordinary_refits[i] + m["ordinary_root"]) / (refits[i] + m["fused"])
+                    for i, (_, m) in enumerate(records)
+                ]
                 print(
                     "mean_refit_ms",
-                    statistics.mean(f["refit_ms"] for f in record["frames"]),
+                    statistics.median(refits),
+                    "ordinary_refit_ms",
+                    statistics.median(ordinary_refits),
+                    "total_vs_ordinary",
+                    statistics.median(total_ratios),
                     "mean_hits",
                     statistics.mean(f["mean_hits"] for f in record["frames"]),
                 )
@@ -82,6 +100,9 @@ def main():
             rows = list(csv.DictReader(stream, skipinitialspace=True))
         active = [r for r in rows if float(r["utilization.gpu [%]"].split()[0]) > 10]
         clocks = sorted({int(r["clocks.current.sm [MHz]"].split()[0]) for r in active})
+        memory_clocks = sorted(
+            {int(r["clocks.current.memory [MHz]"].split()[0]) for r in active}
+        )
         print(
             "TELEMETRY",
             run_id,
@@ -89,6 +110,8 @@ def main():
             len(active),
             "observed_sm_mhz",
             clocks,
+            "observed_memory_mhz",
+            memory_clocks,
         )
 
 

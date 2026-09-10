@@ -13,6 +13,9 @@ def main():
         "--group", choices=("all", "aabb", "ray", "temporal"), default="all"
     )
     parser.add_argument("--passes", type=int, default=1)
+    parser.add_argument(
+        "--aabb-modes", help="Override static AABB arms for confirmation runs"
+    )
     args = parser.parse_args()
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
         raise RuntimeError("Use run_claimed.sh")
@@ -63,6 +66,8 @@ def main():
                 "--output",
                 str(task / f"2026-09-10-{suffix}.jsonl"),
             ]
+            if script == "aabb_probe.py" and args.aabb_modes:
+                command.extend(["--modes", args.aabb_modes])
             print(
                 "PASS", repeat, "CASE", index + 1, "of", len(cases), command, flush=True
             )

@@ -172,7 +172,12 @@ def main():
                     raise AssertionError("Brute AABB reference mismatch")
         timings = benchmark(
             commands,
-            argparse.Namespace(batch=50, seconds=1.5 / args.frames, repeats=1),
+            argparse.Namespace(
+                batch=50,
+                seconds=1.5 / args.frames,
+                repeats=1,
+                burn_seconds=2.0 if frame == 1 else 0.05,
+            ),
             device,
         )[0]
         records.append(
