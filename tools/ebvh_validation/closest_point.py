@@ -17,7 +17,7 @@ import numpy as np
 import warp as wp
 from warp.examples.benchmarks.benchmark_bvh_queries import _morton_order, make_mesh_data
 
-VERSION = "ebvh-exact-cp-v2"
+VERSION = "ebvh-exact-cp-v3"
 print(f"[EBVH] {VERSION}", flush=True)
 
 
@@ -58,7 +58,7 @@ def find_nodes(
 
 
 def make_kernel(mode):
-    @wp.kernel(module="unique")
+    @wp.kernel(module="unique", module_options={"enable_backward": False, "fast_math": True})
     def query(
         mesh: wp.uint64,
         points: wp.array(dtype=wp.vec3),
@@ -275,7 +275,6 @@ def main():
         faces = wp.empty(args.queries, dtype=int, device=device)
         positions = wp.empty(args.queries, dtype=wp.vec3, device=device)
         kernel = make_kernel(name)
-        wp.set_module_options({"enable_backward": False, "fast_math": True}, module=kernel.module.name)
         commands[name] = wp.launch(
             kernel,
             dim=args.queries,
