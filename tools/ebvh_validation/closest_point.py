@@ -17,7 +17,7 @@ import numpy as np
 import warp as wp
 from warp.examples.benchmarks.benchmark_bvh_queries import _morton_order, make_mesh_data
 
-VERSION = "ebvh-exact-cp-v4"
+VERSION = "ebvh-exact-cp-v5"
 print(f"[EBVH] {VERSION}", flush=True)
 
 
@@ -38,7 +38,7 @@ def node_depth(id: wp.uint64, node: int) -> int: ...
     // Benchmark-only oracle: node was certified on these exact inputs outside timing.
     if (node != leaf)
         wp::mesh_query_point_no_sign_traverse<false, true>(mesh, node, leaf, point, d2, face, v, w);
-    return wp::vec3(float(face), 1.0f-v-w, v);
+    return wp::vec3(static_cast<float>(face), 1.0f-v-w, v);
 """)
 def oracle_query(id: wp.uint64, point: wp.vec3, seed: int, node: int) -> wp.vec3: ...
 
