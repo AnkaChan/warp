@@ -18,6 +18,10 @@ def make_probe(mode):
         "walk": "auto query = wp::bvh_query_aabb_exclusive(id, low, high, seed);",
         "cached": "auto query = wp::bvh_query_aabb_exclusive_cached(id, low, high, node);",
         "oracle": "auto query = wp::bvh_query_aabb(id, low, high, node);",
+        "fused": "auto query = wp::bvh_query_aabb_exclusive_update(id, low, high, node, false);",
+        "fused_refine": "auto query = wp::bvh_query_aabb_exclusive_update(id, low, high, node, true);",
+        "peeling": "auto query = wp::bvh_query_aabb_exclusive_cached_peeling(id, low, high, node);",
+        "bottom_up": "auto query = wp::bvh_query_aabb_exclusive_cached_bottom_up(id, low, high, node);",
         "update": """
             node = wp::bvh_find_exclusive_containment(bvh, low, high, node);
             auto query = wp::bvh_query_aabb_exclusive_cached(id, low, high, node);
@@ -76,6 +80,25 @@ def initialize_nodes(id: wp.uint64, lows: wp.array(dtype=wp.vec3), highs: wp.arr
     nodes[i] = wp.bvh_query_aabb_exclusive_node(id, lows[i], highs[i], seeds[i])
 
 
+@wp.func_native("""
+    const auto bvh = wp::bvh_get(id);
+    int depth;
+    wp::bvh_find_exclusive_containment(bvh, low, high, node, &depth);
+    int maximum = bvh.max_depth_ptr ? *bvh.max_depth_ptr : bvh.max_depth;
+    int remaining = maximum - 1 - depth;
+    return wp::vec3(static_cast<float>(depth), static_cast<float>(remaining),
+                    static_cast<float>(depth < 0 || remaining < 0 || remaining > BVH_CACHED_QUERY_STACK_SIZE));
+""")
+def stack_diagnostic(id: wp.uint64, low: wp.vec3, high: wp.vec3, node: int) -> wp.vec3: ...
+
+
+@wp.kernel
+def diagnose(id: wp.uint64, lows: wp.array(dtype=wp.vec3), highs: wp.array(dtype=wp.vec3),
+             nodes: wp.array(dtype=int), stats: wp.array(dtype=wp.vec3)):
+    i = wp.tid()
+    stats[i] = stack_diagnostic(id, lows[i], highs[i], nodes[i])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--primitives", type=int, default=1000000)
@@ -83,6 +106,7 @@ def main():
     parser.add_argument("--seconds", type=float, default=1.5)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--batch", type=int, default=100)
+    parser.add_argument("--modes", default="root,walk,cached,oracle,fused,fused_refine,peeling")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if not os.environ.get("CUDA_VISIBLE_DEVICES"):
@@ -99,7 +123,10 @@ def main():
     wp.launch(initialize_nodes, args.queries, [bvh.id, qlo_wp, qhi_wp, seeds_wp, nodes], device=device)
     commands, outputs = {}, {}
     kernels = {}
-    for mode in ("root", "walk", "cached", "oracle", "update", "refine"):
+    stats = wp.empty(args.queries, dtype=wp.vec3, device=device)
+    wp.launch(diagnose, args.queries, [bvh.id, qlo_wp, qhi_wp, nodes, stats], device=device)
+    stats_np = stats.numpy()
+    for mode in args.modes.split(","):
         kernel = make_probe(mode)
         kernels[mode] = kernel
         out = [wp.empty(args.queries, dtype=dtype, device=device) for dtype in (int, wp.uint32, int)]
@@ -129,10 +156,11 @@ def main():
             np.testing.assert_array_equal(np.sort(actual_ids[j, :actual_counts[j]]), expected)
     print("CORRECT: all counts/checksums and sampled complete sets", flush=True)
     timings = benchmark(commands, args, device)
-    record = {"version": "ebvh-aabb-probe-v1", "args": {k: str(v) if isinstance(v, Path) else v
+    record = {"version": "ebvh-aabb-probe-v2", "args": {k: str(v) if isinstance(v, Path) else v
                                                         for k, v in vars(args).items()},
               "run_id": os.environ.get("EBVH_RUN_ID"), "timings": timings,
-              "mean_hits": float(root_counts.mean()), "set_checks": len(sample) * len(kernels)}
+              "mean_hits": float(root_counts.mean()), "set_checks": len(sample) * len(kernels),
+              "mean_depth": float(stats_np[:, 0].mean()), "stackless_fallback_fraction": float(stats_np[:, 2].mean())}
     with args.output.open("a") as stream:
         stream.write(json.dumps(record) + "\n")
 
