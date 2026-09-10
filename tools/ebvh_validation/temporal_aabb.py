@@ -14,7 +14,7 @@ from temporal_cp import PairCommand
 
 import warp as wp
 
-VERSION = "ebvh-temporal-aabb-v2"
+VERSION = "ebvh-temporal-aabb-v3"
 print(VERSION, flush=True)
 
 
@@ -44,6 +44,7 @@ def main():
         qlo, qhi = queries - radius, queries + radius
     lowers, uppers = [wp.array(x, dtype=wp.vec3, device=device) for x in (lo, hi)]
     bvh = wp.Bvh(lowers, uppers, constructor="sah", leaf_size=1, enable_exclusive=True)
+    ordinary_bvh = wp.Bvh(lowers, uppers, constructor="sah", leaf_size=1)
     query_lowers, query_uppers = [
         wp.array(x, dtype=wp.vec3, device=device) for x in (qlo, qhi)
     ]
@@ -64,16 +65,16 @@ def main():
             wp.empty(args.queries, dtype=d, device=device)
             for d in (int, wp.uint32, int)
         ]
-        for name in ("root", "cached_query", "fused", "periodic")
+        for name in ("root", "ordinary_root", "cached_query", "fused", "periodic")
     }
     ids = wp.empty(1, dtype=int, device=device)
 
-    def command(mode, cache_name, output_name):
+    def command(mode, cache_name, output_name, tree=bvh):
         return wp.launch(
             make_probe(mode),
             args.queries,
             [
-                bvh.id,
+                tree.id,
                 query_lowers,
                 query_uppers,
                 seed_wp,
@@ -87,6 +88,7 @@ def main():
         )
 
     root = command("root", "legacy", "root")
+    ordinary_root = command("root", "legacy", "ordinary_root", ordinary_bvh)
     cached = command("cached", "legacy", "cached_query")
     fused = command("fused", "fused", "fused")
     periodic_plain = command("fused", "periodic", "periodic")
@@ -100,7 +102,15 @@ def main():
         record_cmd=True,
     )
     legacy_full = PairCommand(cached, refresh)
-    for cmd in (root, cached, fused, periodic_plain, periodic_refine, legacy_full):
+    for cmd in (
+        root,
+        ordinary_root,
+        cached,
+        fused,
+        periodic_plain,
+        periodic_refine,
+        legacy_full,
+    ):
         cmd.launch()
     wp.synchronize_device(device)
     records = []
@@ -126,13 +136,17 @@ def main():
         query_lowers.assign(current_qlo)
         query_uppers.assign(current_qhi)
         wp.synchronize_device(device)
-        start = time.perf_counter()
-        bvh.refit()
-        wp.synchronize_device(device)
-        refit_ms = (time.perf_counter() - start) * 1000.0
+        refit_times = {}
+        trees = [("exclusive", bvh), ("ordinary", ordinary_bvh)]
+        for name, tree in trees if frame % 2 == 0 else reversed(trees):
+            start = time.perf_counter()
+            tree.refit()
+            wp.synchronize_device(device)
+            refit_times[name] = (time.perf_counter() - start) * 1000.0
         periodic = periodic_refine if frame % 8 == 0 else periodic_plain
         commands = {
             "root": root,
+            "ordinary_root": ordinary_root,
             "cached_query": cached,
             "cached_with_refresh": legacy_full,
             "fused": fused,
@@ -164,7 +178,8 @@ def main():
         records.append(
             {
                 "frame": frame,
-                "refit_ms": refit_ms,
+                "refit_ms": refit_times["exclusive"],
+                "ordinary_refit_ms": refit_times["ordinary"],
                 "mean_hits": float(reference[0].mean()),
                 "cache_changed_fraction": float(
                     np.mean(arrays["fused"][2].numpy() != caches["fused"].numpy())
