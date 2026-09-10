@@ -7,14 +7,14 @@ import time
 from pathlib import Path
 
 import numpy as np
-from aabb_probe import initialize_nodes, make_aabb_data, make_probe
+from aabb_probe import diagnose, initialize_nodes, make_aabb_data, make_probe
 from closest_point import benchmark, make_sheet
 from provenance import source_record
 from temporal_cp import PairCommand
 
 import warp as wp
 
-VERSION = "ebvh-temporal-aabb-v3"
+VERSION = "ebvh-temporal-aabb-v4"
 print(VERSION, flush=True)
 
 
@@ -68,6 +68,7 @@ def main():
         for name in ("root", "ordinary_root", "cached_query", "fused", "periodic")
     }
     ids = wp.empty(1, dtype=int, device=device)
+    diagnostics = wp.empty(args.queries, dtype=wp.vec3, device=device)
 
     def command(mode, cache_name, output_name, tree=bvh):
         return wp.launch(
@@ -154,6 +155,13 @@ def main():
         }
         for cmd in commands.values():
             cmd.launch()
+        wp.launch(
+            diagnose,
+            args.queries,
+            [bvh.id, query_lowers, query_uppers, caches["legacy"], diagnostics],
+            device=device,
+        )
+        diagnostic_values = diagnostics.numpy()
         reference = [x.numpy() for x in arrays["root"][:2]]
         for out in arrays.values():
             np.testing.assert_array_equal(out[0].numpy(), reference[0])
@@ -185,6 +193,8 @@ def main():
                 "frame": frame,
                 "refit_ms": refit_times["exclusive"],
                 "ordinary_refit_ms": refit_times["ordinary"],
+                "cached_stackless_fraction": float(diagnostic_values[:, 2].mean()),
+                "cached_mean_depth": float(diagnostic_values[:, 0].mean()),
                 "mean_hits": float(reference[0].mean()),
                 "cache_changed_fraction": float(
                     np.mean(arrays["fused"][2].numpy() != caches["fused"].numpy())
