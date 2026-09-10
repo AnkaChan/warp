@@ -252,6 +252,7 @@ Geometry
    bvh_query_aabb_exclusive
    bvh_query_aabb_exclusive_cached
    bvh_query_aabb_exclusive_node
+   bvh_query_aabb_exclusive_update
    bvh_query_aabb_tiled
    bvh_query_next
    bvh_query_next_tiled

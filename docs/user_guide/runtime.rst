@@ -2515,6 +2515,21 @@ kernel initializes one cache entry per query and reuses it on later launches:
             count += 1
         hit_counts[tid] = count
 
+For moving queries, :func:`wp.bvh_query_aabb_exclusive_update() <warp._src.lang.bvh_query_aabb_exclusive_update>`
+also writes the revalidated containment node back through its ``cached_node`` argument. Replace the cached query
+construction above with the following, then iterate over its hits as usual:
+
+.. code:: python
+
+    query = wp.bvh_query_aabb_exclusive_update(bvh_id, lowers[tid], uppers[tid], node)
+    cached_nodes[tid] = node
+
+This avoids a separate primitive-to-node search when maintaining a cache across frames. It uses the regular traversal
+stack and remains suitable when motion requires a shallow start. Set ``refine=True`` to search containing children
+for a deeper start, for example periodically or after a query shrinks. Refinement adds work and is not necessarily
+faster. An invalid cache such as ``-1`` starts from the root; refinement can initialize it without a primitive seed.
+Keep one cache entry per query and avoid concurrent writes to the same entry.
+
 Unsigned closest-point queries have corresponding warm-start paths. These paths also need a mesh constructed with
 ``enable_exclusive=True`` for acceleration, including the seeded path, which uses the primitive-to-leaf mapping. Without
 that metadata they safely fall back to the regular query. Pass a face from a nearby or previous query to
