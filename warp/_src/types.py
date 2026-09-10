@@ -2149,6 +2149,12 @@ class BvhQueryTiled:
     _wp_native_name_ = "bvh_query_thread_block_t"
 
 
+class BvhQueryAabbPeeling:
+    """Internal state for experimental bottom-up BVH traversal."""
+
+    _wp_native_name_ = "bvh_query_aabb_peeling_t"
+
+
 # definition just for kernel type (cannot be a parameter), see mesh.h
 class MeshQueryAABB:
     """Object used to track state during mesh traversal."""
@@ -7420,6 +7426,7 @@ simple_type_codes = {
     MeshQueryPoint: "mqp",
     MeshQueryRay: "mqr",
     BvhQuery: "bvhq",
+    BvhQueryAabbPeeling: "bvhqp",
     # Textures are added at the end of the file to avoid circular imports
 }
 

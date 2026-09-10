@@ -65,3 +65,17 @@ boundaries. Refinement must recover leaf certificates from a root cache on
 separated bounds. Performance tests use a claimed GPU, observed clock telemetry,
 warmup, interleaved CUDA graph samples and explicit cache-maintenance costs.
 No performance ratio is asserted in a unit test.
+
+## Isolate experimental iterator dispatch
+
+The imported AABB peeling prototype originally added a mode branch to the regular
+`bvh_query_next` implementation. At 1M bounds, the measured root query increased
+from about 0.787 ms to 1.351 ms even though it never requested peeling. Relative
+speedups against that slower root are unsuitable for evaluating the final change.
+
+Use a distinct internal `BvhQueryAabbPeeling` type for the bottom-up constructors
+and an overload of `bvh_query_next` for that type. Both modes retain the same state
+layout and existing correctness tests. Regular query dispatch returns to its base
+implementation, allowing compilation to exclude the experimental traversal body.
+Keep the original timings as negative evidence and repeat the final comparisons
+with a fresh kernel-cache directory after this change.

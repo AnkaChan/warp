@@ -767,6 +767,17 @@ struct bvh_query_t {
     bool last_query_valid;
 };
 
+// Keep the experimental bottom-up iterator out of ordinary query dispatch.
+// Sharing the state layout is useful, but sharing the dispatch body prevents
+// CUDA from eliminating peeling state in regular AABB traversal loops.
+struct bvh_query_aabb_peeling_t : bvh_query_t {
+    CUDA_CALLABLE bvh_query_aabb_peeling_t()
+        : bvh_query_t()
+    {
+    }
+    CUDA_CALLABLE inline bvh_query_aabb_peeling_t& operator+=(const bvh_query_aabb_peeling_t& other) { return *this; }
+};
+
 CUDA_CALLABLE inline bvh_query_t
 bvh_query(const BVH& bvh, bool is_ray, const vec3& lower, const vec3& upper, int root, bool use_payload_pairs = true)
 {
@@ -970,7 +981,7 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_aabb_exclusive_update(
     return bvh_query(bvh, false, lower, upper, node);
 }
 
-CUDA_CALLABLE inline bvh_query_t bvh_query_aabb_exclusive_cached_bottom_up_impl(
+CUDA_CALLABLE inline bvh_query_aabb_peeling_t bvh_query_aabb_exclusive_cached_bottom_up_impl(
     uint64_t id, const vec3& lower, const vec3& upper, int cached_node, bool peel
 )
 {
@@ -985,7 +996,7 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_aabb_exclusive_cached_bottom_up_impl(
     // the root. This fallback is selected before any primitive can be emitted,
     // so it cannot duplicate results.
     const int start_node = valid_cache ? cached_node : root;
-    bvh_query_t query;
+    bvh_query_aabb_peeling_t query;
     query.bounds_nr = -1;
     query.bvh = bvh;
     query.input_lower = lower;
@@ -1000,13 +1011,13 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_aabb_exclusive_cached_bottom_up_impl(
     return query;
 }
 
-CUDA_CALLABLE inline bvh_query_t
+CUDA_CALLABLE inline bvh_query_aabb_peeling_t
 bvh_query_aabb_exclusive_cached_bottom_up(uint64_t id, const vec3& lower, const vec3& upper, int cached_node)
 {
     return bvh_query_aabb_exclusive_cached_bottom_up_impl(id, lower, upper, cached_node, false);
 }
 
-CUDA_CALLABLE inline bvh_query_t
+CUDA_CALLABLE inline bvh_query_aabb_peeling_t
 bvh_query_aabb_exclusive_cached_peeling(uint64_t id, const vec3& lower, const vec3& upper, int cached_node)
 {
     return bvh_query_aabb_exclusive_cached_bottom_up_impl(id, lower, upper, cached_node, true);
@@ -1521,10 +1532,13 @@ CUDA_CALLABLE inline bool bvh_query_next(bvh_query_t& query, int& index, const f
         return bvh_query_next_ray(query, index, max_dist);
     else if (query.pair_limit == -BVH_QUERY_STACK_SIZE - 1)
         return bvh_query_next_aabb_stackless(query, index);
-    else if (query.pair_limit == BVH_AABB_BOTTOM_UP_MODE || query.pair_limit == BVH_AABB_PEELING_MODE)
-        return bvh_query_next_aabb_bottom_up(query, index);
     else
         return bvh_query_next_aabb(query, index);
+}
+
+CUDA_CALLABLE inline bool bvh_query_next(bvh_query_aabb_peeling_t& query, int& index, const float& max_dist)
+{
+    return bvh_query_next_aabb_bottom_up(query, index);
 }
 
 CUDA_CALLABLE inline int iter_next(bvh_query_t& query) { return query.bounds_nr; }

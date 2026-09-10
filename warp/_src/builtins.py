@@ -7075,7 +7075,7 @@ add_builtin(
 add_builtin(
     "bvh_query_aabb_exclusive_cached_bottom_up",
     input_types={"id": uint64, "low": vec3, "high": vec3, "cached_node": int},
-    value_type=BvhQuery,
+    value_type=BvhQueryAabbPeeling,
     group="Geometry",
     doc="""Construct an exact bottom-up AABB query from a cached Exclusive BVH node.
 
@@ -7096,7 +7096,7 @@ add_builtin(
 add_builtin(
     "bvh_query_aabb_exclusive_cached_peeling",
     input_types={"id": uint64, "low": vec3, "high": vec3, "cached_node": int},
-    value_type=BvhQuery,
+    value_type=BvhQueryAabbPeeling,
     group="Geometry",
     doc="""Construct an exact restricted face-peeling AABB query from a cached Exclusive BVH node.
 
@@ -7213,6 +7213,18 @@ add_builtin(
         index: The index of the current bound
         max_dist: The maximum distance along the ray to check for intersections for ray queries. Not effective for aabb query.""",
     export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
+    "bvh_query_next",
+    input_types={"query": BvhQueryAabbPeeling, "index": int, "max_dist": float},
+    defaults={"max_dist": math.inf},
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Advance an experimental bottom-up AABB query.""",
+    export=False,
+    hidden=True,
     is_differentiable=False,
 )
 
