@@ -18,6 +18,7 @@ import warp as wp
 from warp.examples.benchmarks.benchmark_bvh_queries import _morton_order, make_mesh_data
 
 VERSION = "ebvh-exact-cp-v5"
+ARMS = ("root", "warm", "walk", "cached", "gated", "oracle")
 print(f"[EBVH] {VERSION}", flush=True)
 
 
@@ -268,7 +269,7 @@ def main():
     )
     init_command.launch()
     depth_np = depths.numpy()
-    arms = ("root", "warm", "walk", "cached", "gated", "oracle")
+    arms = ARMS
     outputs = {}
     commands = {}
     for name in arms:
