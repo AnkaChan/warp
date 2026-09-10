@@ -17,7 +17,7 @@ import numpy as np
 import warp as wp
 from warp.examples.benchmarks.benchmark_bvh_queries import _morton_order, make_mesh_data
 
-VERSION = "ebvh-exact-cp-v3"
+VERSION = "ebvh-exact-cp-v4"
 print(f"[EBVH] {VERSION}", flush=True)
 
 
@@ -73,23 +73,23 @@ def make_kernel(mode):
         v = float(0.0)
         if wp.static(mode == "root"):
             result = wp.mesh_query_point_no_sign(mesh, points[i], 1.0e6)
-            face, u, v = result.face, result.u, result.v
+            face, u, v = int(result.face), float(result.u), float(result.v)
         elif wp.static(mode == "warm"):
             result = wp.mesh_query_point_no_sign_seeded(mesh, points[i], 1.0e6, seeds[i])
-            face, u, v = result.face, result.u, result.v
+            face, u, v = int(result.face), float(result.u), float(result.v)
         elif wp.static(mode == "walk"):
             result = wp.mesh_query_point_no_sign_exclusive(mesh, points[i], 1.0e6, seeds[i])
-            face, u, v = result.face, result.u, result.v
+            face, u, v = int(result.face), float(result.u), float(result.v)
         elif wp.static(mode == "cached"):
             result = wp.mesh_query_point_no_sign_exclusive_cached(mesh, points[i], 1.0e6, seeds[i], nodes[i])
-            face, u, v = result.face, result.u, result.v
+            face, u, v = int(result.face), float(result.u), float(result.v)
         elif wp.static(mode == "gated"):
             if node_depth(mesh, nodes[i]) >= 8:
                 result = wp.mesh_query_point_no_sign_exclusive_cached(mesh, points[i], 1.0e6, seeds[i], nodes[i])
-                face, u, v = result.face, result.u, result.v
+                face, u, v = int(result.face), float(result.u), float(result.v)
             else:
                 result = wp.mesh_query_point_no_sign_seeded(mesh, points[i], 1.0e6, seeds[i])
-                face, u, v = result.face, result.u, result.v
+                face, u, v = int(result.face), float(result.u), float(result.v)
         elif wp.static(mode == "oracle"):
             oracle = oracle_query(mesh, points[i], seeds[i], nodes[i])
             face, u, v = int(oracle[0]), oracle[1], oracle[2]
