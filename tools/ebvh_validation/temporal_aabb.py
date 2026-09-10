@@ -14,7 +14,7 @@ from temporal_cp import PairCommand
 
 import warp as wp
 
-VERSION = "ebvh-temporal-aabb-v4"
+VERSION = "ebvh-temporal-aabb-v5"
 print(VERSION, flush=True)
 
 
@@ -113,6 +113,9 @@ def main():
         legacy_full,
     ):
         cmd.launch()
+    # Load both native refit paths before collecting steady-frame costs.
+    bvh.refit()
+    ordinary_bvh.refit()
     wp.synchronize_device(device)
     records = []
     for frame in range(1, args.frames + 1):
