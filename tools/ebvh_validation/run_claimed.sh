@@ -10,6 +10,7 @@ export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 ebvh_log_dir=/home/horde/Code/AI-Docs/AI-Logs/Newton/tasks/ebvh-validation
 ebvh_run_id=$(date -u +%Y-%m-%dT%H%M%S)-$$
 ebvh_locked=0
+export EBVH_CLOCK_MHZ="${EBVH_CLOCK_MHZ:-2490}"
 ebvh_monitor_pid=
 cleanup() {
     if [ -n "$ebvh_monitor_pid" ]; then
@@ -24,7 +25,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if sudo -n nvidia-smi -i "$CUDA_VISIBLE_DEVICES" -lgc 2490; then
+if sudo -n nvidia-smi -i "$CUDA_VISIBLE_DEVICES" -lgc "$EBVH_CLOCK_MHZ"; then
     ebvh_locked=1
 else
     echo '[EBVH] Clock lock unavailable; use interleaved repeats and recorded telemetry.'

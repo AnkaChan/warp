@@ -320,6 +320,7 @@ def main():
         "gpu": device.name,
         "architecture": device.arch,
         "clock_locked": os.environ.get("EBVH_CLOCK_LOCKED") == "1",
+        "requested_clock_mhz": os.environ.get("EBVH_CLOCK_MHZ", "2490"),
         "build_ms": build_ms,
         "cache_initialization_ms": initialization_ms,
         "cache_kind": "same-query precomputed, revalidated except oracle",
