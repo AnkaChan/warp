@@ -94,6 +94,21 @@ def main():
                     "mean_hits",
                     statistics.mean(f["mean_hits"] for f in record["frames"]),
                 )
+                existing_pipeline_ratios = [
+                    sum(
+                        f["refit_ms"] + f["timing"]["cached_with_refresh"]["mean_ms"]
+                        for f in r["frames"][1:]
+                    )
+                    / sum(
+                        f["refit_ms"] + f["timing"]["fused"]["mean_ms"]
+                        for f in r["frames"][1:]
+                    )
+                    for r, _ in records
+                ]
+                print(
+                    "total_vs_existing_cached_pipeline",
+                    statistics.median(existing_pipeline_ratios),
+                )
                 diagnosed = [
                     f
                     for r, _ in records
