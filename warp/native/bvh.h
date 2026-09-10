@@ -926,6 +926,50 @@ bvh_query_aabb_exclusive_cached(uint64_t id, const vec3& lower, const vec3& uppe
 #endif
 }
 
+// Return the next temporal cache without a second seed-to-root walk. The
+// regular stack handles shallow certificates without the small cached stack's
+// parent-link fallback. Refinement is optional because probing child E-boxes
+// on every successful cache reuse can cost more than the prefix it removes.
+CUDA_CALLABLE inline bvh_query_t bvh_query_aabb_exclusive_update(
+    uint64_t id, const vec3& lower, const vec3& upper, int& cached_node, bool refine = false
+)
+{
+    const BVH bvh = bvh_get(id);
+    int node = bvh_find_exclusive_containment(bvh, lower, upper, cached_node);
+
+    if (refine && bvh_has_exclusive(bvh)) {
+        for (int step = 0; step < BVH_QUERY_STACK_SIZE; ++step) {
+            if (node < 0 || node >= bvh.num_nodes)
+                break;
+            const BVHPackedNodeHalf node_lower = bvh_load_node(bvh.node_lowers, node);
+            if (node_lower.b)
+                break;
+            const BVHPackedNodeHalf node_upper = bvh_load_node(bvh.node_uppers, node);
+            const int left = int(node_lower.i);
+            const int right = int(node_upper.i);
+            if (left < 0 || left >= bvh.num_nodes || right < 0 || right >= bvh.num_nodes)
+                break;
+
+            const BVHExclusiveNode left_exclusive = bvh_get_exclusive_node(bvh, left);
+            if (bvh_exclusive_node_depth(left_exclusive) >= 0
+                && bvh_exclusive_contains_strict(left_exclusive, lower, upper)) {
+                node = left;
+                continue;
+            }
+            const BVHExclusiveNode right_exclusive = bvh_get_exclusive_node(bvh, right);
+            if (bvh_exclusive_node_depth(right_exclusive) >= 0
+                && bvh_exclusive_contains_strict(right_exclusive, lower, upper)) {
+                node = right;
+                continue;
+            }
+            break;
+        }
+    }
+
+    cached_node = node;
+    return bvh_query(bvh, false, lower, upper, node);
+}
+
 CUDA_CALLABLE inline bvh_query_t bvh_query_aabb_exclusive_cached_bottom_up_impl(
     uint64_t id, const vec3& lower, const vec3& upper, int cached_node, bool peel
 )

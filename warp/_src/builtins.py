@@ -7046,6 +7046,33 @@ add_builtin(
 )
 
 add_builtin(
+    "bvh_query_aabb_exclusive_update",
+    input_types={"id": uint64, "low": vec3, "high": vec3, "cached_node": int, "refine": builtins.bool},
+    defaults={"refine": False},
+    value_type=BvhQuery,
+    group="Geometry",
+    doc="""Construct an AABB query and update its temporal Exclusive BVH cache.
+
+    Revalidate ``cached_node`` against the current exclusive bounds and write the accepted node back to this
+    input/output argument. Store it for the next query to avoid recomputing a containment node from a primitive seed.
+    The query uses the regular traversal stack, including when motion leaves only a shallow containment certificate.
+    A stale or invalid node, or missing Exclusive BVH metadata, safely falls back to the global root.
+
+    Set ``refine`` to descend through strictly containing child exclusive boxes. This can recover deeper cached
+    starts after a query shrinks, or initialize a cache from the root. Refinement adds child-box tests and can be
+    requested periodically instead of on every frame. Create ``id`` with ``enable_exclusive=True`` to enable caching.
+
+    Args:
+        id: The BVH identifier
+        low: The lower bound of the query box in BVH space
+        high: The upper bound of the query box in BVH space
+        cached_node: Input/output containment node; updated to the current traversal start
+        refine: Whether to search for deeper strictly containing children""",
+    export=False,
+    is_differentiable=False,
+)
+
+add_builtin(
     "bvh_query_aabb_exclusive_cached_bottom_up",
     input_types={"id": uint64, "low": vec3, "high": vec3, "cached_node": int},
     value_type=BvhQuery,

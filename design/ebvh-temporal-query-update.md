@@ -22,9 +22,11 @@ containment, not a promised speedup on every BVH query.
 Add `bvh_query_aabb_exclusive_update(id, low, high, cached_node, refine=False)`.
 The node argument is an input/output variable, following the existing query-next
 index convention. The constructor finds a valid current containment node once,
-writes it back, and initializes the existing cached iterator from that certified
-node. This shares the small-stack traversal and safe fallback with the current API.
-The caller stores the resulting node for its next query.
+writes it back, and initializes the regular iterator from that certified node.
+The full traversal stack avoids the current cached API's slow parent-link fallback
+when the remaining subtree is too deep for its 16-entry shared stack. The 1M-bound
+probe measured that fallback at about 4.4x slower than root traversal. The caller
+stores the resulting node for its next query.
 
 The default path only climbs. It adds no child search to successful cache reuse.
 Optional refinement descends through strictly containing child exclusive boxes;
