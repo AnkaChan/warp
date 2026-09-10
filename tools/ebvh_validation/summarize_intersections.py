@@ -66,19 +66,26 @@ def main():
                 )
             if "frames" in record:
                 refits = [
-                    statistics.mean(f["refit_ms"] for f in r["frames"])
+                    statistics.mean(f["refit_ms"] for f in r["frames"][1:])
                     for r, _ in records
                 ]
                 ordinary_refits = [
-                    statistics.mean(f["ordinary_refit_ms"] for f in r["frames"])
+                    statistics.mean(f["ordinary_refit_ms"] for f in r["frames"][1:])
                     for r, _ in records
                 ]
                 total_ratios = [
-                    (ordinary_refits[i] + m["ordinary_root"]) / (refits[i] + m["fused"])
-                    for i, (_, m) in enumerate(records)
+                    sum(
+                        f["ordinary_refit_ms"] + f["timing"]["ordinary_root"]["mean_ms"]
+                        for f in r["frames"][1:]
+                    )
+                    / sum(
+                        f["refit_ms"] + f["timing"]["fused"]["mean_ms"]
+                        for f in r["frames"][1:]
+                    )
+                    for r, _ in records
                 ]
                 print(
-                    "mean_refit_ms",
+                    "refit_frames_2_to_25_ms",
                     statistics.median(refits),
                     "ordinary_refit_ms",
                     statistics.median(ordinary_refits),
@@ -87,6 +94,21 @@ def main():
                     "mean_hits",
                     statistics.mean(f["mean_hits"] for f in record["frames"]),
                 )
+                diagnosed = [
+                    f
+                    for r, _ in records
+                    for f in r["frames"]
+                    if "cached_stackless_fraction" in f
+                ]
+                if diagnosed:
+                    print(
+                        "mean_cached_fallback_fraction",
+                        statistics.mean(
+                            f["cached_stackless_fraction"] for f in diagnosed
+                        ),
+                        "mean_cached_depth",
+                        statistics.mean(f["cached_mean_depth"] for f in diagnosed),
+                    )
             if "hit_fraction" in record:
                 print(
                     "hit_fraction",
