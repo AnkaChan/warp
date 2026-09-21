@@ -972,6 +972,86 @@ def test_set_mesh_points(test, device):
             test.assertTrue(((query_results_min_dist1.numpy() - query_results_min_dist2.numpy()) < 1e-5).all())
 
 
+def make_radius_boundary_kernel(variant):
+    @wp.kernel
+    def query_radius_boundary(
+        mesh: wp.uint64,
+        points: wp.array[wp.vec3],
+        radii: wp.array[float],
+        hits: wp.array[int],
+        faces: wp.array[int],
+        positions: wp.array[wp.vec3],
+    ):
+        tid = wp.tid()
+        query = wp.mesh_query_point_no_sign(mesh, points[tid], radii[tid])
+        if wp.static(variant == "signed"):
+            query = wp.mesh_query_point(mesh, points[tid], radii[tid])
+        elif wp.static(variant == "parity"):
+            query = wp.mesh_query_point_sign_parity(mesh, points[tid], radii[tid])
+        elif wp.static(variant == "winding"):
+            query = wp.mesh_query_point_sign_winding_number(mesh, points[tid], radii[tid])
+        hits[tid] = int(query.result)
+        if query.result:
+            faces[tid] = query.face
+            positions[tid] = wp.mesh_eval_position(mesh, query.face, query.u, query.v)
+
+    return query_radius_boundary
+
+
+def test_mesh_query_point_radius_boundary(test, device):
+    """Keep strict-radius rejection and nearest-face selection across the shared variants."""
+    vertices = wp.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0], [1.0, 0.0, 2.0], [0.0, 1.0, 2.0]],
+        dtype=wp.vec3,
+        device=device,
+    )
+    indices = wp.array([0, 1, 2, 3, 4, 5], dtype=int, device=device)
+    points_np = np.array([[0.25, 0.25, z] for z in [1, 1, 1, 0, 0, 0.25, 1.75]], dtype=np.float32)
+    points = wp.array(points_np, dtype=wp.vec3, device=device)
+    radii = wp.array(
+        [0.5, 1.0, np.nextafter(np.float32(1), np.float32(2)), 0.0, 1.0e-6, 0.5, 0.5],
+        dtype=float,
+        device=device,
+    )
+    constructors = ["sah", "median"] if device.is_cpu else ["sah", "lbvh"]
+    if wp.is_cubql_available():
+        constructors.append("cubql")
+    for constructor, leaf_size in itertools.product(constructors, [1, 8]):
+        mesh = wp.Mesh(
+            vertices,
+            indices,
+            bvh_constructor=constructor,
+            bvh_leaf_size=leaf_size,
+            support_winding_number=constructor != "cubql",
+        )
+        variants = ["unsigned", "signed", "parity"]
+        if constructor != "cubql":
+            variants.append("winding")
+        reference_faces = None
+        for variant in variants:
+            with test.subTest(constructor=constructor, leaf_size=leaf_size, variant=variant):
+                hits = wp.zeros(7, dtype=int, device=device)
+                faces = wp.full(7, -1, dtype=int, device=device)
+                positions = wp.zeros(7, dtype=wp.vec3, device=device)
+                wp.launch(
+                    make_radius_boundary_kernel(variant),
+                    7,
+                    inputs=[mesh.id, points, radii, hits, faces, positions],
+                    device=device,
+                )
+                np.testing.assert_array_equal(hits.numpy(), [0, 0, 1, 0, 1, 1, 1])
+                faces_np = faces.numpy()
+                np.testing.assert_array_equal(faces_np[[4, 5, 6]], [0, 0, 1])
+                test.assertIn(faces_np[2], [0, 1])
+                if reference_faces is None:
+                    reference_faces = faces_np
+                else:
+                    np.testing.assert_array_equal(faces_np, reference_faces)
+                np.testing.assert_allclose(
+                    positions.numpy()[[4, 5, 6]], [[0.25, 0.25, 0], [0.25, 0.25, 0], [0.25, 0.25, 2]], atol=0
+                )
+
+
 devices = get_test_devices()
 
 
@@ -1003,6 +1083,9 @@ add_function_test(TestMeshQueryPoint, "test_mesh_query_point", test_mesh_query_p
 add_function_test(TestMeshQueryPoint, "test_mesh_query_furthest_point", test_mesh_query_furthest_point, devices=devices)
 add_function_test(TestMeshQueryPoint, "test_adj_mesh_query_point", test_adj_mesh_query_point, devices=devices)
 add_function_test(TestMeshQueryPoint, "test_set_mesh_points", test_set_mesh_points, devices=devices)
+add_function_test(
+    TestMeshQueryPoint, "test_mesh_query_point_radius_boundary", test_mesh_query_point_radius_boundary, devices=devices
+)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
