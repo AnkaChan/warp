@@ -845,6 +845,76 @@ def test_mesh_query_ray_parallel_slab_boundaries(test, device):
 devices = get_test_devices()
 
 
+@wp.func_native(
+    snippet="""
+    float t = -1.0f, u, v, sign = 0.0f;
+    wp::vec3 normal;
+    int face = -1;
+    const bool hit = wp::mesh_query_ray_ordered(mesh, start, direction, max_t, t, u, v, sign, normal, face);
+    return wp::vec4(static_cast<float>(hit), t, static_cast<float>(face), sign);
+    """
+)
+def query_ordered_result(mesh: wp.uint64, start: wp.vec3, direction: wp.vec3, max_t: float) -> wp.vec4: ...
+
+
+@wp.func_native(
+    snippet="""
+    float sign = 0.0f;
+    wp::mesh_query_ray_closest_sign(wp::mesh_get(mesh), start, direction, sign);
+    return sign;
+    """
+)
+def query_closest_sign_result(mesh: wp.uint64, start: wp.vec3, direction: wp.vec3) -> float: ...
+
+
+@wp.kernel
+def query_ray_variants(
+    mesh: wp.uint64,
+    starts: wp.array[wp.vec3],
+    max_t: wp.array[float],
+    closest: wp.array[wp.vec4],
+    ordered: wp.array[wp.vec4],
+    signs: wp.array[float],
+):
+    tid = wp.tid()
+    direction = wp.vec3(0.0, 0.0, -1.0)
+    query = wp.mesh_query_ray(mesh, starts[tid], direction, max_t[tid])
+    closest[tid] = wp.vec4(0.0, -1.0, -1.0, 0.0)
+    if query.result:
+        closest[tid] = wp.vec4(1.0, query.t, float(query.face), query.sign)
+    ordered[tid] = query_ordered_result(mesh, starts[tid], direction, max_t[tid])
+    signs[tid] = query_closest_sign_result(mesh, starts[tid], direction)
+
+
+def test_mesh_query_ray_native_variants(test, device):
+    """Exercise the ordered and closest-sign leaf loops, including strict max-t misses."""
+    vertices = wp.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 2], [1, 0, 2], [0, 1, 2]], dtype=wp.vec3, device=device
+    )
+    indices = wp.array([0, 1, 2, 3, 4, 5], dtype=int, device=device)
+    starts = wp.array([[0.25, 0.25, 3], [0.25, 0.25, 3], [2, 2, 3], [0.25, 0.25, 1]], dtype=wp.vec3, device=device)
+    radii = wp.array([4.0, 1.0, 4.0, 4.0], dtype=float, device=device)
+    constructors = ["sah", "median"] if device.is_cpu else ["sah", "lbvh"]
+    if wp.is_cubql_available():
+        constructors.append("cubql")
+    for constructor in constructors:
+        for leaf_size in [1, 8]:
+            with test.subTest(constructor=constructor, leaf_size=leaf_size):
+                mesh = wp.Mesh(vertices, indices, bvh_constructor=constructor, bvh_leaf_size=leaf_size)
+                closest = wp.empty(4, dtype=wp.vec4, device=device)
+                ordered = wp.empty(4, dtype=wp.vec4, device=device)
+                signs = wp.empty(4, dtype=float, device=device)
+                wp.launch(
+                    query_ray_variants, 4, inputs=[mesh.id, starts, radii, closest, ordered, signs], device=device
+                )
+                closest_np = closest.numpy()
+                np.testing.assert_array_equal(closest_np[:, :3], [[1, 1, 1], [0, -1, -1], [0, -1, -1], [1, 1, 0]])
+                np.testing.assert_array_equal(ordered.numpy(), closest_np)
+                sign_values = signs.numpy()
+                test.assertNotEqual(sign_values[0], 0)
+                np.testing.assert_array_equal(sign_values, [closest_np[0, 3], closest_np[0, 3], 0, closest_np[3, 3]])
+
+
 class TestMeshQueryRay(unittest.TestCase):
     def test_mesh_query_codegen_adjoints_with_select(self):
         def kernel_fn(
@@ -876,6 +946,9 @@ add_function_test(
     devices=devices,
 )
 add_function_test(TestMeshQueryRay, "test_mesh_query_ray_and_groups", test_mesh_query_ray_and_groups, devices=devices)
+add_function_test(
+    TestMeshQueryRay, "test_mesh_query_ray_native_variants", test_mesh_query_ray_native_variants, devices=devices
+)
 
 
 if __name__ == "__main__":
