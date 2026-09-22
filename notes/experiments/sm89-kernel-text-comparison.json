@@ -1,0 +1,95 @@
+{
+  "target": "sm_89",
+  "rows": [
+    {
+      "variant": "closest",
+      "before": "notes/experiments/resources-main-final/closest/sm_89.cubin",
+      "after": "notes/experiments/resources-final/closest/sm_89.cubin",
+      "before_sections": {
+        ".text.get_mesh_ray_kernel__locals__mesh_ray_variant_aedfe848_cuda_kernel_forward": {
+          "sha256": "067bd454a07ec0b5e30c05c35c85e274c7b7fc5674f42b994ca2cee0d85e0b76",
+          "size": 17792
+        }
+      },
+      "after_sections": {
+        ".text.get_mesh_ray_kernel__locals__mesh_ray_variant_aedfe848_cuda_kernel_forward": {
+          "sha256": "067bd454a07ec0b5e30c05c35c85e274c7b7fc5674f42b994ca2cee0d85e0b76",
+          "size": 17792
+        }
+      },
+      "kernel_text_equal": true
+    },
+    {
+      "variant": "any",
+      "before": "notes/experiments/resources-main-final/any/sm_89.cubin",
+      "after": "notes/experiments/resources-final/any/sm_89.cubin",
+      "before_sections": {
+        ".text.get_mesh_ray_kernel__locals__mesh_ray_variant_c5620dc5_cuda_kernel_forward": {
+          "sha256": "13bfd3b881eb3f3cefe438f704c4823bd6b1a80b65568effbe96b993912cf58c",
+          "size": 17920
+        }
+      },
+      "after_sections": {
+        ".text.get_mesh_ray_kernel__locals__mesh_ray_variant_c5620dc5_cuda_kernel_forward": {
+          "sha256": "13bfd3b881eb3f3cefe438f704c4823bd6b1a80b65568effbe96b993912cf58c",
+          "size": 17920
+        }
+      },
+      "kernel_text_equal": true
+    },
+    {
+      "variant": "ordered",
+      "before": "notes/experiments/resources-main-final/ordered/sm_89.cubin",
+      "after": "notes/experiments/resources-final/ordered/sm_89.cubin",
+      "before_sections": {
+        ".text.get_mesh_ray_kernel__locals__mesh_ray_variant_66344456_cuda_kernel_forward": {
+          "sha256": "404cd6614e030b944b3c4d36718c3f08b52010146259cf0248545d4efb424df2",
+          "size": 16128
+        }
+      },
+      "after_sections": {
+        ".text.get_mesh_ray_kernel__locals__mesh_ray_variant_66344456_cuda_kernel_forward": {
+          "sha256": "404cd6614e030b944b3c4d36718c3f08b52010146259cf0248545d4efb424df2",
+          "size": 16128
+        }
+      },
+      "kernel_text_equal": true
+    },
+    {
+      "variant": "count",
+      "before": "notes/experiments/resources-main-final/count/sm_89.cubin",
+      "after": "notes/experiments/resources-final/count/sm_89.cubin",
+      "before_sections": {
+        ".text.get_mesh_ray_kernel__locals__mesh_ray_variant_106fca8d_cuda_kernel_forward": {
+          "sha256": "d4f7ea7fd1c1898bb9e79f4a3f35276efddfbc6f4cca7b1af6e2326211faf4c8",
+          "size": 14720
+        }
+      },
+      "after_sections": {
+        ".text.get_mesh_ray_kernel__locals__mesh_ray_variant_106fca8d_cuda_kernel_forward": {
+          "sha256": "d4f7ea7fd1c1898bb9e79f4a3f35276efddfbc6f4cca7b1af6e2326211faf4c8",
+          "size": 14720
+        }
+      },
+      "kernel_text_equal": true
+    },
+    {
+      "variant": "sign",
+      "before": "notes/experiments/resources-main-final/sign/sm_89.cubin",
+      "after": "notes/experiments/resources-final/sign/sm_89.cubin",
+      "before_sections": {
+        ".text.get_mesh_ray_kernel__locals__mesh_ray_variant_b8b70a8c_cuda_kernel_forward": {
+          "sha256": "eebd496f042893240219381cb8755b61e1c4cdb72d4876c6e7199477c1c49dc8",
+          "size": 14592
+        }
+      },
+      "after_sections": {
+        ".text.get_mesh_ray_kernel__locals__mesh_ray_variant_b8b70a8c_cuda_kernel_forward": {
+          "sha256": "eebd496f042893240219381cb8755b61e1c4cdb72d4876c6e7199477c1c49dc8",
+          "size": 14592
+        }
+      },
+      "kernel_text_equal": true
+    }
+  ]
+}
