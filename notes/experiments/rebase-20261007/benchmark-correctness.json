@@ -1,0 +1,67 @@
+{
+  "timings_valid_for_comparison": false,
+  "reason": "Other compute processes were present on the claimed GPU; repeat variation reached 59.31%.",
+  "runs": [
+    {
+      "file": "candidate-r1.jsonl",
+      "file_sha256": "3bb44154fe0abf6be2265d5efce4053ebb17a441ad33a5555f489ebf9d7c93ab",
+      "commit": "8582277411ea8d2f775a2f6acd6d46c325929500",
+      "warp_file": "/home/horde/Code/Graphics/warp-working-copies/warp-bvh-regression-astra/warp/__init__.py",
+      "mesh_sha256": "6a9adcdd361830c5c95bc8ebd73c9e8d9d5091d864f990ea802dfa00a13fba3d",
+      "native_sha256": "d31920a91f0fa95dd4ff6d7c313bf3ed1bf251590da9a34fd8702f9b473f0635",
+      "cells": 22,
+      "cuda_visible_devices": "0"
+    },
+    {
+      "file": "candidate-r2.jsonl",
+      "file_sha256": "c951508c0403ae227ac6852f81c91e72b1611d943b51b36747985cd7481f9ab9",
+      "commit": "8582277411ea8d2f775a2f6acd6d46c325929500",
+      "warp_file": "/home/horde/Code/Graphics/warp-working-copies/warp-bvh-regression-astra/warp/__init__.py",
+      "mesh_sha256": "6a9adcdd361830c5c95bc8ebd73c9e8d9d5091d864f990ea802dfa00a13fba3d",
+      "native_sha256": "d31920a91f0fa95dd4ff6d7c313bf3ed1bf251590da9a34fd8702f9b473f0635",
+      "cells": 22,
+      "cuda_visible_devices": "0"
+    },
+    {
+      "file": "candidate-r3.jsonl",
+      "file_sha256": "cac8db0c7a209a417d44dd3c1e0dc995e596e82c88d9e2101bc08c6709386cb6",
+      "commit": "8582277411ea8d2f775a2f6acd6d46c325929500",
+      "warp_file": "/home/horde/Code/Graphics/warp-working-copies/warp-bvh-regression-astra/warp/__init__.py",
+      "mesh_sha256": "6a9adcdd361830c5c95bc8ebd73c9e8d9d5091d864f990ea802dfa00a13fba3d",
+      "native_sha256": "d31920a91f0fa95dd4ff6d7c313bf3ed1bf251590da9a34fd8702f9b473f0635",
+      "cells": 22,
+      "cuda_visible_devices": "0"
+    },
+    {
+      "file": "main-r1.jsonl",
+      "file_sha256": "5d0a5bfa2139082dabc41a08581d3b089235df775d224662fb3183f1e8955eb6",
+      "commit": "416985fed1f214c71c7f29ca6013a222b574549c",
+      "warp_file": "/home/horde/Code/Graphics/warp-working-copies/warp-bvh-regression-astra/.worktrees/rebase-main-416985fed/warp/__init__.py",
+      "mesh_sha256": "f002dbbe37096e1a47baa188991b0542a4b506e680307964a3aff4a2a440985b",
+      "native_sha256": "7abda9ac37387993657bc9d247f1e9ff83181c7b5d0e1140a4a538bb1b8e5151",
+      "cells": 22,
+      "cuda_visible_devices": "0"
+    },
+    {
+      "file": "main-r2.jsonl",
+      "file_sha256": "1b713ebaac73a4cf1b7aaf4e3b885845bffde3e4e31603aefa4fb55fc66301da",
+      "commit": "416985fed1f214c71c7f29ca6013a222b574549c",
+      "warp_file": "/home/horde/Code/Graphics/warp-working-copies/warp-bvh-regression-astra/.worktrees/rebase-main-416985fed/warp/__init__.py",
+      "mesh_sha256": "f002dbbe37096e1a47baa188991b0542a4b506e680307964a3aff4a2a440985b",
+      "native_sha256": "7abda9ac37387993657bc9d247f1e9ff83181c7b5d0e1140a4a538bb1b8e5151",
+      "cells": 22,
+      "cuda_visible_devices": "0"
+    },
+    {
+      "file": "main-r3.jsonl",
+      "file_sha256": "c95d1f696c197529246880c520339709b620ecd44a31b7f0eca8f04ffb4c12ee",
+      "commit": "416985fed1f214c71c7f29ca6013a222b574549c",
+      "warp_file": "/home/horde/Code/Graphics/warp-working-copies/warp-bvh-regression-astra/.worktrees/rebase-main-416985fed/warp/__init__.py",
+      "mesh_sha256": "f002dbbe37096e1a47baa188991b0542a4b506e680307964a3aff4a2a440985b",
+      "native_sha256": "7abda9ac37387993657bc9d247f1e9ff83181c7b5d0e1140a4a538bb1b8e5151",
+      "cells": 22,
+      "cuda_visible_devices": "0"
+    }
+  ],
+  "all_output_hashes_equal": true
+}

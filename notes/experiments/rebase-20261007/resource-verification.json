@@ -1,0 +1,28 @@
+{
+  "compilations": 312,
+  "kernel_entries": 572,
+  "spills": [],
+  "changed_resources_vs_pre_rebase": [
+    [
+      "cuda130",
+      "candidate",
+      "count",
+      "sm_110",
+      "get_mesh_ray_kernel__locals__mesh_ray_variant_106fca8d_cuda_kernel_forward",
+      {
+        "registers": [
+          63,
+          64
+        ]
+      }
+    ]
+  ],
+  "changed_code_vs_pre_rebase": [
+    [
+      "cuda130",
+      "candidate",
+      "count",
+      "sm_110"
+    ]
+  ]
+}

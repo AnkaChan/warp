@@ -1,8 +1,10 @@
 # BVH/mesh query regression investigation
 
-**October 7 update:** upstream is now `b5ea46659`, after Eric fully reverted #1844 (`e6a149729`) and partially rolled back #1840 (`45c001d471`). The latter restores ordinary index loads for closest-hit, any-hit, ordered, and count-intersections on all architectures; AABB, closest-sign, and #1843 packed-leaf cursors remain. See the [fresh upstream audit](experiments/upstream-reverts-20261007.md). The September timing tables below remain measurements against their pinned September sources, not October main.
+**October 7 rebase:** this branch now descends from freshly fetched upstream `416985fed`, including the GH-1991 SAH depth cap. The rebased point and ray commits are `5384109a7` and `bdf6a7bb9`; the ray commit includes the selected ordinary-load exception for Thor count-intersections. See the [rebase validation](experiments/rebase-validation-20261007.md) and [independent integration review](experiments/rebase-review-20261007.md). The previous branch tip is preserved locally as `ankac/warp-bvh-regression-astra-before-rebase-20261007` at `ed1cca9ce`.
 
-The user has selected avoiding regressions relative to the original parent for count-intersections. The separate Thor ordinary-load option is therefore the selected local count candidate; October upstream already uses ordinary loads for this path. The original local candidate commits and September handoff archive are preserved as historical artifacts. Fresh PTX/CUBIN and occupancy findings are in the [October architecture review](experiments/occupancy-review-20261007.md).
+The earlier [October 7 upstream audit](experiments/upstream-reverts-20261007.md) examined `b5ea46659`, after Eric fully reverted #1844 (`e6a149729`) and partially rolled back #1840 (`45c001d471`). The latter restores ordinary index loads for closest-hit, any-hit, ordered, and count-intersections on all architectures; AABB, closest-sign, and #1843 packed-leaf cursors remain. The September timing tables below retain their pinned September sources and must not be read as timings against the rebased upstream.
+
+The user selected avoiding regressions relative to the original parent for count-intersections. That option is now integrated into the rebased ray commit rather than remaining a separate patch. The original candidate commits, patches, and September handoff archive are historical artifacts. The [October architecture review](experiments/occupancy-review-20261007.md) remains applicable to the known signed-point occupancy concern; rebasing does not establish Thor runtime recovery.
 
 Local investigation on 2026-09-21–22, NVIDIA L40, driver 570.158.01. **Thor runtime validation remains outstanding.** These are independently reviewable local candidates, not a release decision. No remote changes were made.
 
@@ -72,7 +74,7 @@ Three diagnostic variants changed only the affected ray leaf loops: one ordinary
 | SM 100, 103, 110 | 62 | 69 | 62 | 320 B / 0 |
 | SM 120, 121 | 63 | 61 | 61 | 320 B / 0 |
 
-The candidate uses ordinary loads for closest-hit on SM 100/103/110, and any-hit/ordered only on SM 110. All other paths/targets retain read-only loads. At 256 threads, the affected closest-hit register budget returns from three to four register-limited blocks per SM. This is compiler-resource evidence for SM 100/103, and additionally Eric's runtime evidence for Thor; it is not a runtime validation on B200/B300.
+The original September candidate uses ordinary loads for closest-hit on SM 100/103/110, and any-hit/ordered only on SM 110. The rebased candidate additionally uses ordinary loads for count-intersections on SM 110, as described below. All other paths/targets retain read-only loads. At 256 threads, the affected closest-hit register budget returns from three to four register-limited blocks per SM. This is compiler-resource evidence for SM 100/103, and additionally Eric's runtime evidence for Thor; it is not a runtime validation on B200/B300.
 
 The ordered and closest-sign benchmark wrappers have different resource totals from Eric's exact probes; their parent/candidate comparisons are recorded for these wrappers without claiming those absolute counts reproduce his. All 30 path/target combinations of the scoped candidate match the selected parent or integration resource tuple, including stack/spills.
 
@@ -82,7 +84,7 @@ A separate three-repeat comparison of main against the all-ordinary diagnostic f
 
 For all five benchmark ray kernels, the CUDA 13 **SM 89 machine-code `.text` sections are byte-identical to pristine current main**. This directly checks preservation of those L40 kernel instructions. `compare_kernel_text.py` reproduces the comparison; `sm89-kernel-text-comparison.json` records the section hashes and sizes. Whole CUBIN hashes differ, so the claim is specifically about executable kernel sections.
 
-Count-intersections stays read-only in the main candidate. The separate `1840-count-ordinary-thor-option.patch` switches its four loads only on SM 110. Eric's data says that option removes packed-leaf losses but sacrifices the 9.91% CuBQL/default gain. Both options are retained for review; no release priority has been assumed. Split-load resource experiments alone cannot tell whether either subset preserves that runtime gain on Thor.
+The original September candidate left count-intersections read-only. The separate `1840-count-ordinary-thor-option.patch` switches its four loads only on SM 110; that option is now included in the rebased ray commit following the user's preference to avoid regressions versus the parent. Eric's data says it removes packed-leaf losses but sacrifices the 9.91% CuBQL/default gain. Split-load resource experiments alone cannot tell whether either subset preserves that runtime gain on Thor.
 
 ## Correctness and remaining validation
 
