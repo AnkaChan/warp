@@ -43,6 +43,7 @@ def parse_ptxas_resources(log):
                     "stack_bytes": None,
                     "spill_store_bytes": None,
                     "spill_load_bytes": None,
+                    "static_shared_bytes": None,
                 },
             )
             if entry:
@@ -59,6 +60,8 @@ def parse_ptxas_resources(log):
         registers = re.search(r"Used\s+(\d+)\s+registers", line)
         if registers:
             current["registers"] = int(registers.group(1))
+            shared = re.search(r"(\d+) bytes smem", line)
+            current["static_shared_bytes"] = int(shared.group(1)) if shared else 0
     return list(records.values())
 
 
@@ -144,6 +147,8 @@ class Nvrtc:
             "nvrtcGetProgramLog": [pointer, pointer],
             "nvrtcGetCUBINSize": [pointer, size_ptr],
             "nvrtcGetCUBIN": [pointer, pointer],
+            "nvrtcGetPTXSize": [pointer, size_ptr],
+            "nvrtcGetPTX": [pointer, pointer],
         }
         for name, arguments in signatures.items():
             function = getattr(self.lib, name)
@@ -179,7 +184,7 @@ class Nvrtc:
         self.check(getattr(self.lib, f"nvrtcGet{kind}")(program, data))
         return data.raw
 
-    def compile(self, source, name, options):
+    def compile(self, source, name, options, emit_ptx=False):
         program = ctypes.c_void_p()
         self.check(self.lib.nvrtcCreateProgram(ctypes.byref(program), source, name.encode(), 0, None, None))
         try:
@@ -187,7 +192,8 @@ class Nvrtc:
             result = self.lib.nvrtcCompileProgram(program, len(options), encoded_options)
             log = self.buffer(program, "ProgramLog").rstrip(b"\0").decode(errors="replace")
             cubin = self.buffer(program, "CUBIN") if result == 0 else None
-            return result, log, cubin
+            ptx = self.buffer(program, "PTX").rstrip(b"\0") if result == 0 and emit_ptx else None
+            return result, log, cubin, ptx
         finally:
             self.lib.nvrtcDestroyProgram(ctypes.byref(program))
 
@@ -205,6 +211,8 @@ def main():
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--nvrtc", type=Path, default=DEFAULT_NVRTC)
+    parser.add_argument("--all-supported", action="store_true", help="Compile every integer target reported by NVRTC")
+    parser.add_argument("--emit-ptx", action="store_true", help="Save and check PTX as well as the assembled CUBIN")
     parser.add_argument(
         "--targets", type=parse_target, nargs="+", default=["sm_89", "sm_100", "sm_103", "sm_110", "sm_120", "sm_121"]
     )
@@ -258,7 +266,8 @@ def main():
         print(f"NVRTC unavailable: {error}", file=sys.stderr)
         return 1
 
-    for target in args.targets:
+    targets = [f"sm_{arch}" for arch in compiler.supported_architectures] if args.all_supported else args.targets
+    for target in targets:
         target_number = int(re.search(r"\d+", target).group())
         options = [
             f"--gpu-architecture={target}",
@@ -291,7 +300,7 @@ def main():
                 row.update(status="unsupported", error="Architecture absent from NVRTC's supported architecture list")
                 log = row["error"] + "\n"
             else:
-                result, log, cubin = compiler.compile(source, args.source.name, options)
+                result, log, cubin, ptx = compiler.compile(source, args.source.name, options, args.emit_ptx)
                 row["nvrtc_result"] = result
                 row["resources"] = parse_ptxas_resources(log)
                 if result:
@@ -303,6 +312,21 @@ def main():
                     row["actual_architecture"] = cubin_architecture(cubin)
                     if row["actual_architecture"]["sm"] != target_number:
                         row.update(status="architecture_mismatch", error="ELF SM differs from requested target")
+                    if ptx is not None:
+                        ptx_path = args.out / f"{target}.ptx"
+                        ptx_path.write_bytes(ptx)
+                        ptx_text = ptx.decode()
+                        ptx_target = re.search(r"(?m)^\s*\.target\s+(sm_\d+[af]?)", ptx_text)
+                        ptx_version = re.search(r"(?m)^\s*\.version\s+([\d.]+)", ptx_text)
+                        row["ptx"] = {
+                            "file": ptx_path.name,
+                            "sha256": hashlib.sha256(ptx).hexdigest(),
+                            "target": ptx_target.group(1) if ptx_target else None,
+                            "version": ptx_version.group(1) if ptx_version else None,
+                            "entries": re.findall(r"\.entry\s+([^\s(]+)", ptx_text),
+                        }
+                        if row["ptx"]["target"] != target or not row["ptx"]["entries"]:
+                            row.update(status="ptx_mismatch", error="PTX target differs or PTX has no entry points")
                     if not row["resources"] or any(item["registers"] is None for item in row["resources"]):
                         row["resource_warning"] = (
                             "Some resource counts are unavailable; inspect the raw compilation log"

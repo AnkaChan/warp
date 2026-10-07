@@ -1,5 +1,9 @@
 # BVH/mesh query regression investigation
 
+**October 7 update:** upstream is now `b5ea46659`, after Eric fully reverted #1844 (`e6a149729`) and partially rolled back #1840 (`45c001d471`). The latter restores ordinary index loads for closest-hit, any-hit, ordered, and count-intersections on all architectures; AABB, closest-sign, and #1843 packed-leaf cursors remain. See the [fresh upstream audit](experiments/upstream-reverts-20261007.md). The September timing tables below remain measurements against their pinned September sources, not October main.
+
+The user has selected avoiding regressions relative to the original parent for count-intersections. The separate Thor ordinary-load option is therefore the selected local count candidate; October upstream already uses ordinary loads for this path. The original local candidate commits and September handoff archive are preserved as historical artifacts. Fresh PTX/CUBIN and occupancy findings are in the [October architecture review](experiments/occupancy-review-20261007.md).
+
 Local investigation on 2026-09-21–22, NVIDIA L40, driver 570.158.01. **Thor runtime validation remains outstanding.** These are independently reviewable local candidates, not a release decision. No remote changes were made.
 
 ## Primary evidence and pinned sources

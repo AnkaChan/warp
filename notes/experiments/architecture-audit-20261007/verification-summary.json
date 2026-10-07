@@ -1,0 +1,42 @@
+{
+  "cuda13": {
+    "compilations": 300,
+    "kernel_entries": 540,
+    "arches": [
+      75,
+      80,
+      86,
+      87,
+      88,
+      89,
+      90,
+      100,
+      103,
+      110,
+      120,
+      121
+    ],
+    "spill_records": []
+  },
+  "cuda126": {
+    "compilations": 350,
+    "kernel_entries": 630,
+    "arches": [
+      50,
+      52,
+      53,
+      60,
+      61,
+      62,
+      70,
+      72,
+      75,
+      80,
+      86,
+      87,
+      89,
+      90
+    ],
+    "spill_records": []
+  }
+}

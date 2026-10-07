@@ -7,6 +7,16 @@ from compile_resources import cubin_architecture, parse_ptxas_resources
 
 
 class TestResourceExtraction(unittest.TestCase):
+    def test_shared_memory_is_not_confused_with_constant_memory(self):
+        log = """ptxas info : Compiling entry function 'ray' for 'sm_110'
+ptxas info : Used 62 registers, 1024 bytes smem, 368 bytes cmem[0]
+ptxas info : Compiling entry function 'small' for 'sm_89'
+ptxas info : Used 32 registers, 368 bytes cmem[0]
+"""
+        rows = parse_ptxas_resources(log)
+        self.assertEqual(rows[0].get("static_shared_bytes"), 1024)
+        self.assertEqual(rows[1].get("static_shared_bytes"), 0)
+
     def test_keep_each_kernel_stack_spill_and_register_counts(self):
         log = """ptxas info    : Compiling entry function 'closest' for 'sm_110'
 ptxas info    : Function properties for closest
@@ -27,6 +37,7 @@ ptxas info    : Used 63 registers, 368 bytes cmem[0]
                     "stack_bytes": 320,
                     "spill_store_bytes": 8,
                     "spill_load_bytes": 4,
+                    "static_shared_bytes": 0,
                 },
                 {
                     "name": "anyhit",
@@ -35,6 +46,7 @@ ptxas info    : Used 63 registers, 368 bytes cmem[0]
                     "stack_bytes": 320,
                     "spill_store_bytes": 0,
                     "spill_load_bytes": 0,
+                    "static_shared_bytes": 0,
                 },
             ],
         )
@@ -50,6 +62,7 @@ ptxas info    : Used 63 registers, 368 bytes cmem[0]
                     "stack_bytes": None,
                     "spill_store_bytes": None,
                     "spill_load_bytes": None,
+                    "static_shared_bytes": None,
                 }
             ],
         )
