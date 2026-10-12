@@ -436,6 +436,7 @@ struct bvh_query_t {
         , prim_end(0)
         , input_lower()
         , input_upper()
+        , ray_sign_masks()
         , bounds_nr(0)
         , last_query_valid(true)
         , kind(BvhQueryKind::AABB)
@@ -467,6 +468,7 @@ struct bvh_query_t {
     // inputs
     wp::vec3 input_lower;  // start for ray
     wp::vec3 input_upper;  // dir for ray
+    wp::vec3i ray_sign_masks;  // ray_aabb_sign_masks(rcp dir), used by the RAY node test
 
     int bounds_nr;
     // Tracks whether the most recent bvh_query_next() / tile_bvh_query_next() call
@@ -505,9 +507,11 @@ bvh_query_test(const bvh_query_t& query, const vec3& node_lower, const vec3& nod
         );
         return hit && !(t > max_dist);
     } else if constexpr (QUERY_KIND == BvhQueryKind::RAY) {
-        // Plain ray: original slab test with its original half-open max_dist bound.
+        // Plain ray: closed-box slab test (exact for axis-aligned rays on slab planes) with
+        // the original half-open max_dist bound.
         float t = FLT_MAX;
-        bool hit = intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
+        bool hit
+            = intersect_ray_aabb(query.input_lower, query.input_upper, query.ray_sign_masks, node_lower, node_upper, t);
         return hit && !(t >= max_dist);
     } else {
         return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
@@ -553,6 +557,7 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, c
 {
     bvh_query_t query = bvh_query(id, start, 1.0f / dir, root);
     query.kind = BvhQueryKind::RAY;
+    query.ray_sign_masks = ray_aabb_sign_masks(query.input_upper);
     return query;
 }
 

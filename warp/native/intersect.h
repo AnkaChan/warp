@@ -124,6 +124,12 @@ CUDA_CALLABLE inline vec2 furthest_point_to_triangle(const vec3& a, const vec3& 
     return vec2(0.0f, 0.0f);  // c is furthest
 }
 
+// Fast slab test. Assumes that on every axis where the origin lies exactly on a slab plane
+// the reciprocal direction is finite: a zero direction component (rcp_dir = +-inf) with
+// the origin on that slab's plane gives 0 * inf = NaN, and the NaN-ignoring min/max below
+// then collapse the slab interval and miss the box. Callers with axis-aligned rays must
+// use intersect_ray_aabb_robust() or the exact sign-mask overload of intersect_ray_aabb()
+// below (GH-2011).
 CUDA_CALLABLE inline bool
 intersect_ray_aabb(const vec3& pos, const vec3& rcp_dir, const vec3& lower, const vec3& upper, float& t)
 {
@@ -143,6 +149,73 @@ intersect_ray_aabb(const vec3& pos, const vec3& rcp_dir, const vec3& lower, cons
     l2 = (upper[2] - pos[2]) * rcp_dir[2];
     lmin = max(min(l1, l2), lmin);
     lmax = min(max(l1, l2), lmax);
+
+    bool hit = ((lmax >= 0.f) & (lmax >= lmin));
+    if (hit)
+        t = lmin;
+
+    return hit;
+}
+
+// Bitwise select: b where the mask bits are set, a elsewhere. The mask is all ones or all
+// zeros, so this is a branch-free float select that needs no predicate register: a single
+// LOP3 on CUDA. The CPU build uses a plain conditional, which Clang lowers to a select.
+CUDA_CALLABLE inline float bit_select(float a, float b, int32 mask)
+{
+#if defined(__CUDA_ARCH__)
+    const uint32 m = static_cast<uint32>(mask);
+    return __uint_as_float((__float_as_uint(a) & ~m) | (__float_as_uint(b) & m));
+#else
+    return mask ? b : a;
+#endif
+}
+
+// Per-axis selection masks for the exact intersect_ray_aabb() overload: all bits set
+// where the ray direction (equivalently its reciprocal) is negative. Compute once per ray
+// and store with the query so the traversal loop carries no per-node sign comparison.
+CUDA_CALLABLE inline vec3i ray_aabb_sign_masks(const vec3& rcp_dir)
+{
+    vec3i masks(rcp_dir[0] < 0.0f ? -1 : 0, rcp_dir[1] < 0.0f ? -1 : 0, rcp_dir[2] < 0.0f ? -1 : 0);
+#if defined(__CUDA_ARCH__)
+    // Hide the masks' origin from the compiler. Otherwise it folds the bitwise selects in
+    // intersect_ray_aabb() back into compare + select, and ptxas re-evaluates the three
+    // compares on every node test instead of keeping them live (measured 1-3% slower).
+    asm("" : "+r"(masks[0]), "+r"(masks[1]), "+r"(masks[2]));
+#endif
+    return masks;
+}
+
+// Exact slab test of a ray against a closed box, with precomputed sign masks
+// (sign_masks = ray_aabb_sign_masks(rcp_dir)). The ray is pos + t * dir for t >= 0 and
+// rcp_dir is the componentwise reciprocal of dir, infinite where dir is zero.
+//
+// The near/far distances of each slab are picked by the sign of the direction instead of
+// with min/max. When the origin lies exactly on the plane of a slab the ray is parallel
+// to, that slab's distance is 0 * inf = NaN; the NaN-ignoring min/max accumulation drops
+// it and leaves the slab unconstrained, which is the exact closed-box answer (GH-2011).
+// For finite reciprocals the result is identical to the fast slab test above, at the same
+// instruction count. A zero-length direction is not supported. On a hit, t receives the
+// unclamped entry parameter (negative if the origin is inside the box).
+CUDA_CALLABLE inline bool intersect_ray_aabb(
+    const vec3& pos, const vec3& rcp_dir, const vec3i& sign_masks, const vec3& lower, const vec3& upper, float& t
+)
+{
+    float l1, l2, lmin, lmax;
+
+    l1 = (lower[0] - pos[0]) * rcp_dir[0];
+    l2 = (upper[0] - pos[0]) * rcp_dir[0];
+    lmin = bit_select(l1, l2, sign_masks[0]);
+    lmax = bit_select(l2, l1, sign_masks[0]);
+
+    l1 = (lower[1] - pos[1]) * rcp_dir[1];
+    l2 = (upper[1] - pos[1]) * rcp_dir[1];
+    lmin = max(bit_select(l1, l2, sign_masks[1]), lmin);
+    lmax = min(bit_select(l2, l1, sign_masks[1]), lmax);
+
+    l1 = (lower[2] - pos[2]) * rcp_dir[2];
+    l2 = (upper[2] - pos[2]) * rcp_dir[2];
+    lmin = max(bit_select(l1, l2, sign_masks[2]), lmin);
+    lmax = min(bit_select(l2, l1, sign_masks[2]), lmax);
 
     bool hit = ((lmax >= 0.f) & (lmax >= lmin));
     if (hit)

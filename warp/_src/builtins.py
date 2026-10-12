@@ -9318,7 +9318,9 @@ add_builtin(
     doc="""Construct a ray query against a BVH.
 
     Returns a query that iterates over every item in the BVH whose stored bounding box is
-    intersected by the ray. Advance the query and read each result with :func:`bvh_query_next`.
+    intersected by the ray. Bounding boxes are closed, so a ray that only touches a box,
+    for example one running exactly along a face, intersects it. Advance the query and read
+    each result with :func:`bvh_query_next`.
     ``start`` and ``dir`` are given in BVH space, i.e. the same coordinate space as
     the ``lowers``/``uppers`` arrays passed to :class:`warp.Bvh`. ``dir`` need not be normalized,
     but the ``max_dist`` cutoff of :func:`bvh_query_next` is measured in multiples of its length,
@@ -9771,7 +9773,8 @@ add_builtin(
     :func:`~warp.tile_bvh_query_next` in a loop guarded by :func:`~warp.tile_query_valid`.
     Results are returned in unspecified order and are not sorted along the ray. The ray is
     one-sided and unbounded, so bounds entirely behind ``start`` are never reported and there is
-    no maximum distance.
+    no maximum distance. Bounding boxes are closed, so a ray that only touches a box, for
+    example one running exactly along a face, intersects it.
 
     Only one BVH query may be active per block; exhaust it before constructing another.
 

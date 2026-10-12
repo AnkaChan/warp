@@ -21,6 +21,7 @@ struct bvh_query_thread_block_t {
         , is_ray(false)
         , input_lower()
         , input_upper()
+        , ray_sign_masks()
     {
     }
 
@@ -46,6 +47,7 @@ struct bvh_query_thread_block_t {
     // inputs
     wp::vec3 input_lower;
     wp::vec3 input_upper;
+    wp::vec3i ray_sign_masks;  // ray_aabb_sign_masks(rcp dir), used by the ray node test
     bool is_ray;
 };
 
@@ -55,7 +57,9 @@ bvh_query_intersection_test(const bvh_query_thread_block_t& query, const vec3& n
 {
     if (query.is_ray) {
         float t = 0.0f;
-        return intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
+        return intersect_ray_aabb(
+            query.input_lower, query.input_upper, query.ray_sign_masks, node_lower, node_upper, t
+        );
     } else {
         return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
     }
@@ -369,7 +373,9 @@ CUDA_CALLABLE inline bvh_query_thread_block_t tile_bvh_query_aabb(uint64_t id, c
 // New tile-based ray query function
 CUDA_CALLABLE inline bvh_query_thread_block_t tile_bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir)
 {
-    return bvh_query_thread_block(id, true, start, 1.0f / dir);
+    bvh_query_thread_block_t query = bvh_query_thread_block(id, true, start, 1.0f / dir);
+    query.ray_sign_masks = ray_aabb_sign_masks(query.input_upper);
+    return query;
 }
 
 #else

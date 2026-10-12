@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import ctypes
+import math
 import unittest
 
 import numpy as np
@@ -1097,6 +1098,258 @@ def tile_bvh_query_valid_ray_kernel(
             wp.atomic_add(bounds_intersected, result_idx, 1)
 
 
+@wp.kernel
+def bvh_query_ray_batch(
+    bvh_id: wp.uint64,
+    starts: wp.array[wp.vec3],
+    dirs: wp.array[wp.vec3],
+    max_dists: wp.array[float],
+    hit_counts: wp.array[int],
+    hit_matrix: wp.array2d[int],
+):
+    i = wp.tid()
+    query = wp.bvh_query_ray(bvh_id, starts[i], dirs[i])
+    bounds_nr = int(0)
+    count = int(0)
+
+    while wp.bvh_query_next(query, bounds_nr, max_dists[i]):
+        hit_matrix[i, bounds_nr] = 1
+        count += 1
+
+    hit_counts[i] = count
+
+
+@wp.kernel
+def tile_bvh_query_ray_batch(
+    bvh_id: wp.uint64,
+    starts: wp.array[wp.vec3],
+    dirs: wp.array[wp.vec3],
+    hit_counts: wp.array[int],
+    hit_matrix: wp.array2d[int],
+):
+    i, _j = wp.tid()
+    query = wp.tile_bvh_query_ray(bvh_id, starts[i], dirs[i])
+
+    while wp.tile_query_valid(query):
+        result_tile = wp.tile_bvh_query_next(query)
+        result_idx = wp.untile(result_tile)
+        if result_idx >= 0:
+            hit_matrix[i, result_idx] = 1
+            wp.atomic_add(hit_counts, i, 1)
+
+
+def ray_hits_closed_aabb(start, direction, lower, upper, max_dist=math.inf):
+    """Exact closed-box ray/AABB reference evaluated in double precision.
+
+    The ray domain is ``t >= 0`` and the box is closed, so touching counts as a hit.
+    A zero direction component makes the ray parallel to that slab: it passes only if
+    the origin lies within the slab. ``max_dist`` is half-open on the entry parameter,
+    matching :func:`warp.bvh_query_next`.
+    """
+    t_enter, t_exit = -math.inf, math.inf
+    for i in range(3):
+        if direction[i] == 0.0:
+            if start[i] < lower[i] or start[i] > upper[i]:
+                return 0
+        else:
+            t1 = (lower[i] - start[i]) / direction[i]
+            t2 = (upper[i] - start[i]) / direction[i]
+            t_enter = max(t_enter, min(t1, t2))
+            t_exit = min(t_exit, max(t1, t2))
+    return 1 if (t_exit >= 0.0 and t_exit >= t_enter and t_enter < max_dist) else 0
+
+
+def _check_ray_cases(test, device, lower, upper, cases):
+    """Run the scalar and tiled ray queries against one box for a list of labeled cases."""
+    for label, start, direction, max_dist, expected in cases:
+        test.assertEqual(
+            ray_hits_closed_aabb(start, direction, lower, upper, max_dist), expected, f"reference: {label}"
+        )
+
+    num_cases = len(cases)
+    starts = wp.array(np.array([c[1] for c in cases], dtype=np.float32), dtype=wp.vec3, device=device)
+    dirs = wp.array(np.array([c[2] for c in cases], dtype=np.float32), dtype=wp.vec3, device=device)
+    max_dists = wp.array(np.array([c[3] for c in cases], dtype=np.float32), dtype=float, device=device)
+
+    bvh = wp.Bvh(
+        wp.array([lower], dtype=wp.vec3, device=device),
+        wp.array([upper], dtype=wp.vec3, device=device),
+    )
+
+    hit_counts = wp.zeros(num_cases, dtype=int, device=device)
+    hit_matrix = wp.zeros((num_cases, 1), dtype=int, device=device)
+    wp.launch(
+        bvh_query_ray_batch,
+        dim=num_cases,
+        inputs=[bvh.id, starts, dirs, max_dists, hit_counts, hit_matrix],
+        device=device,
+    )
+    counts = hit_counts.numpy()
+    for k, (label, _start, _direction, _max_dist, expected) in enumerate(cases):
+        test.assertEqual(counts[k], expected, f"scalar ray query: {label}")
+
+    # the tiled query has no max_dist, so only compare the unbounded cases
+    hit_counts_tiled = wp.zeros(num_cases, dtype=int, device=device)
+    hit_matrix_tiled = wp.zeros((num_cases, 1), dtype=int, device=device)
+    wp.launch_tiled(
+        tile_bvh_query_ray_batch,
+        dim=num_cases,
+        inputs=[bvh.id, starts, dirs, hit_counts_tiled, hit_matrix_tiled],
+        device=device,
+        block_dim=64,
+    )
+    counts_tiled = hit_counts_tiled.numpy()
+    for k, (label, _start, _direction, max_dist, expected) in enumerate(cases):
+        if math.isinf(max_dist):
+            test.assertEqual(counts_tiled[k], expected, f"tiled ray query: {label}")
+
+
+def test_bvh_query_ray_boundary_faces(test, device):
+    """Rays that run exactly along a face, edge, or corner of a box must hit it (GH-2011).
+
+    A zero direction component gives an infinite reciprocal. When the origin also lies
+    exactly on that slab's plane the slab test computed ``0 * inf = NaN``, and the
+    NaN-ignoring ``min``/``max`` collapsed the slab interval to a single infinity, so the
+    box was reported as missed. Boxes are closed sets: a ray that touches a box anywhere,
+    including lying in one of its faces, intersects it.
+    """
+
+    def ulp(x, toward):
+        return float(np.nextafter(np.float32(x), np.float32(toward)))
+
+    # box spanning x in [0.5, 1], y and z in [-1, 1]
+    lower = (0.5, -1.0, -1.0)
+    upper = (1.0, 1.0, 1.0)
+    cases = []  # (label, start, direction, max_dist, expected)
+    for y in (-1.0, 0.0, 1.0):
+        for z in (-1.0, 0.0, 1.0):
+            cases.append((f"+x ray at y={y} z={z}", (0.0, y, z), (1.0, 0.0, 0.0), math.inf, 1))
+            cases.append((f"-x ray at y={y} z={z}", (2.0, y, z), (-1.0, 0.0, 0.0), math.inf, 1))
+            cases.append((f"+x ray, negative zeros, y={y} z={z}", (0.0, y, z), (1.0, -0.0, -0.0), math.inf, 1))
+    cases += [
+        ("+y ray on x=lower face", (0.5, -2.0, 0.0), (0.0, 1.0, 0.0), math.inf, 1),
+        ("+y ray on x=upper face", (1.0, -2.0, 0.0), (0.0, 1.0, 0.0), math.inf, 1),
+        ("+z ray along x=lower y=upper edge", (0.5, 1.0, -2.0), (0.0, 0.0, 1.0), math.inf, 1),
+        ("-z ray along x=upper y=lower edge", (1.0, -1.0, 2.0), (0.0, 0.0, -1.0), math.inf, 1),
+        ("origin on near x face", (0.5, 0.0, 0.0), (1.0, 0.0, 0.0), math.inf, 1),
+        ("origin on far x face, leaving", (1.0, 0.0, 0.0), (1.0, 0.0, 0.0), math.inf, 1),
+        ("origin beyond far x face", (1.5, 0.0, 0.0), (1.0, 0.0, 0.0), math.inf, 0),
+        ("origin inside", (0.75, 0.0, 0.0), (1.0, 0.0, 0.0), math.inf, 1),
+        ("one ulp outside lower y face", (0.0, ulp(-1.0, -2.0), 0.0), (1.0, 0.0, 0.0), math.inf, 0),
+        ("one ulp inside lower y face", (0.0, ulp(-1.0, 0.0), 0.0), (1.0, 0.0, 0.0), math.inf, 1),
+        ("one ulp outside upper z face", (0.0, 0.0, ulp(1.0, 2.0)), (1.0, 0.0, 0.0), math.inf, 0),
+        ("parallel, well outside", (0.0, -1.5, 0.0), (1.0, 0.0, 0.0), math.inf, 0),
+        ("oblique through corner", (0.0, -1.5, -1.5), (1.0, 1.0, 1.0), math.inf, 1),
+        ("oblique touching far corner", (0.0, -1.5, -1.5), (1.0, 0.5, 0.5), math.inf, 1),
+        ("oblique miss", (0.0, -1.5, -1.5), (1.0, 0.25, 0.5), math.inf, 0),
+        # max_dist is half-open on the entry parameter, which is 0.5 for this ray
+        ("face ray, max_dist equal to entry", (0.0, -1.0, 0.0), (1.0, 0.0, 0.0), 0.5, 0),
+        ("face ray, max_dist just beyond entry", (0.0, -1.0, 0.0), (1.0, 0.0, 0.0), ulp(0.5, 1.0), 1),
+    ]
+    _check_ray_cases(test, device, lower, upper, cases)
+
+    # flat box: the z slab has zero thickness
+    flat_lower = (0.0, 0.0, 0.0)
+    flat_upper = (2.0, 2.0, 0.0)
+    flat_cases = [
+        ("crossing the flat box", (1.0, 1.0, 1.0), (0.0, 0.0, -1.0), math.inf, 1),
+        ("coplanar ray through the flat box", (-1.0, 1.0, 0.0), (1.0, 0.0, 0.0), math.inf, 1),
+        ("coplanar ray along the flat box edge", (-1.0, 2.0, 0.0), (1.0, 0.0, 0.0), math.inf, 1),
+        ("parallel ray above the flat box", (-1.0, 1.0, 0.5), (1.0, 0.0, 0.0), math.inf, 0),
+    ]
+    _check_ray_cases(test, device, flat_lower, flat_upper, flat_cases)
+
+
+def test_bvh_query_ray_boundary_randomized(test, device):
+    """Compare ray queries with an exact closed-box reference on a grid-aligned scene.
+
+    Box corners snap to an integer grid so faces coincide, some boxes are degenerate, and
+    rays are axis-aligned, planar, or diagonal with origins on grid planes and power-of-two
+    direction components, so every slab computation is exact and boundary coincidences are
+    common.
+    """
+    rng = np.random.default_rng(2011)
+    grid = 4
+    num_boxes = 48
+    num_rays = 160
+
+    corner = rng.integers(0, grid, size=(num_boxes, 3))
+    size = rng.integers(0, 3, size=(num_boxes, 3))
+    size[: num_boxes // 2] = np.maximum(size[: num_boxes // 2], 1)
+    lowers = corner.astype(np.float32)
+    uppers = (corner + size).astype(np.float32)
+
+    starts = np.zeros((num_rays, 3), dtype=np.float32)
+    dirs = np.zeros((num_rays, 3), dtype=np.float32)
+    components = (-4.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 4.0)
+    for r in range(num_rays):
+        starts[r] = rng.integers(-2, 2 * grid + 4, size=3) * 0.5
+        kind = r % 3
+        if kind == 0:  # axis-aligned, with signed zeros on the other axes
+            d = np.array([rng.choice([0.0, -0.0]) for _ in range(3)])
+            d[rng.integers(0, 3)] = rng.choice(components)
+        elif kind == 1:  # planar: one zero component
+            d = rng.choice(components, size=3)
+            d[rng.integers(0, 3)] = rng.choice([0.0, -0.0])
+        else:  # diagonal through corners and edges
+            d = rng.choice(components, size=3)
+        dirs[r] = d
+    max_dists = np.full(num_rays, np.inf, dtype=np.float32)
+    max_dists[::4] = 1.5
+
+    def expected_matrix(dists):
+        out = np.zeros((num_rays, num_boxes), dtype=np.int32)
+        for r in range(num_rays):
+            for b in range(num_boxes):
+                out[r, b] = ray_hits_closed_aabb(
+                    starts[r].tolist(), dirs[r].tolist(), lowers[b].tolist(), uppers[b].tolist(), float(dists[r])
+                )
+        return out
+
+    expected = expected_matrix(max_dists)
+    expected_unbounded = expected_matrix(np.full(num_rays, np.inf))
+
+    lowers_wp = wp.array(lowers, dtype=wp.vec3, device=device)
+    uppers_wp = wp.array(uppers, dtype=wp.vec3, device=device)
+    starts_wp = wp.array(starts, dtype=wp.vec3, device=device)
+    dirs_wp = wp.array(dirs, dtype=wp.vec3, device=device)
+    max_dists_wp = wp.array(max_dists, dtype=float, device=device)
+
+    bvh_kwargs = [{"constructor": "sah", "leaf_size": 1}, {"constructor": "median", "leaf_size": 4}]
+    if device.is_cuda:
+        bvh_kwargs.append({"constructor": "lbvh", "leaf_size": 1})
+
+    for kwargs in bvh_kwargs:
+        bvh = wp.Bvh(lowers_wp, uppers_wp, **kwargs)
+
+        hit_counts = wp.zeros(num_rays, dtype=int, device=device)
+        hit_matrix = wp.zeros((num_rays, num_boxes), dtype=int, device=device)
+        wp.launch(
+            bvh_query_ray_batch,
+            dim=num_rays,
+            inputs=[bvh.id, starts_wp, dirs_wp, max_dists_wp, hit_counts, hit_matrix],
+            device=device,
+        )
+        np.testing.assert_array_equal(hit_matrix.numpy(), expected, err_msg=f"scalar ray query, {kwargs}")
+        np.testing.assert_array_equal(hit_counts.numpy(), expected.sum(axis=1), err_msg=f"scalar hit counts, {kwargs}")
+
+        hit_counts_tiled = wp.zeros(num_rays, dtype=int, device=device)
+        hit_matrix_tiled = wp.zeros((num_rays, num_boxes), dtype=int, device=device)
+        wp.launch_tiled(
+            tile_bvh_query_ray_batch,
+            dim=num_rays,
+            inputs=[bvh.id, starts_wp, dirs_wp, hit_counts_tiled, hit_matrix_tiled],
+            device=device,
+            block_dim=64,
+        )
+        np.testing.assert_array_equal(
+            hit_matrix_tiled.numpy(), expected_unbounded, err_msg=f"tiled ray query, {kwargs}"
+        )
+        np.testing.assert_array_equal(
+            hit_counts_tiled.numpy(), expected_unbounded.sum(axis=1), err_msg=f"tiled hit counts, {kwargs}"
+        )
+
+
 devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
 cuda_devices_with_mempool = get_cuda_test_devices_with_mempool()
@@ -1228,11 +1481,18 @@ add_function_test(TestBvh, "test_tile_bvh_query_ray", test_tile_bvh_query_ray, d
 add_function_test(TestBvh, "test_bvh_query_aabb_tiled", test_bvh_query_aabb_tiled, devices=devices)
 add_function_test(TestBvh, "test_bvh_query_ray_tiled", test_bvh_query_ray_tiled, devices=devices)
 
+# Boundary (closed-box) semantics for ray queries (GH-2011).
+add_function_test(TestBvh, "test_bvh_query_ray_boundary_faces", test_bvh_query_ray_boundary_faces, devices=devices)
+add_function_test(
+    TestBvh, "test_bvh_query_ray_boundary_randomized", test_bvh_query_ray_boundary_randomized, devices=devices
+)
+
 for name, func in (
     ("test_tile_bvh_query_aabb", test_tile_bvh_query),
     ("test_tile_bvh_query_ray", test_tile_bvh_query_ray),
     ("test_bvh_query_aabb_tiled", test_bvh_query_aabb_tiled),
     ("test_bvh_query_ray_tiled", test_bvh_query_ray_tiled),
+    ("test_bvh_query_ray_boundary_faces", test_bvh_query_ray_boundary_faces),
 ):
     add_function_test(
         TestBvh,
