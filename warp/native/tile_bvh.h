@@ -21,7 +21,6 @@ struct bvh_query_thread_block_t {
         , is_ray(false)
         , input_lower()
         , input_upper()
-        , ray_sign_masks()
     {
     }
 
@@ -47,7 +46,6 @@ struct bvh_query_thread_block_t {
     // inputs
     wp::vec3 input_lower;
     wp::vec3 input_upper;
-    wp::vec3i ray_sign_masks;  // ray_aabb_sign_masks(rcp dir), used by the ray node test
     bool is_ray;
 };
 
@@ -56,9 +54,12 @@ CUDA_CALLABLE inline bool
 bvh_query_intersection_test(const bvh_query_thread_block_t& query, const vec3& node_lower, const vec3& node_upper)
 {
     if (query.is_ray) {
+        // Exact closed-box slab test. The sign masks are derived here rather than stored so
+        // the block-cooperative traversal, which is synchronization bound, keeps no extra
+        // registers live; the compiler folds them into compare + select per node test.
         float t = 0.0f;
         return intersect_ray_aabb(
-            query.input_lower, query.input_upper, query.ray_sign_masks, node_lower, node_upper, t
+            query.input_lower, query.input_upper, ray_aabb_sign_masks(query.input_upper), node_lower, node_upper, t
         );
     } else {
         return intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
@@ -373,9 +374,7 @@ CUDA_CALLABLE inline bvh_query_thread_block_t tile_bvh_query_aabb(uint64_t id, c
 // New tile-based ray query function
 CUDA_CALLABLE inline bvh_query_thread_block_t tile_bvh_query_ray(uint64_t id, const vec3& start, const vec3& dir)
 {
-    bvh_query_thread_block_t query = bvh_query_thread_block(id, true, start, 1.0f / dir);
-    query.ray_sign_masks = ray_aabb_sign_masks(query.input_upper);
-    return query;
+    return bvh_query_thread_block(id, true, start, 1.0f / dir);
 }
 
 #else

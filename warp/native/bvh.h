@@ -468,7 +468,7 @@ struct bvh_query_t {
     // inputs
     wp::vec3 input_lower;  // start for ray
     wp::vec3 input_upper;  // dir for ray
-    wp::vec3i ray_sign_masks;  // ray_aabb_sign_masks(rcp dir), used by the RAY node test
+    wp::vec3i ray_sign_masks;  // ray_aabb_sign_masks_opaque(rcp dir), used by the RAY node test
 
     int bounds_nr;
     // Tracks whether the most recent bvh_query_next() / tile_bvh_query_next() call
@@ -557,7 +557,7 @@ CUDA_CALLABLE inline bvh_query_t bvh_query_ray(uint64_t id, const vec3& start, c
 {
     bvh_query_t query = bvh_query(id, start, 1.0f / dir, root);
     query.kind = BvhQueryKind::RAY;
-    query.ray_sign_masks = ray_aabb_sign_masks(query.input_upper);
+    query.ray_sign_masks = ray_aabb_sign_masks_opaque(query.input_upper);
     return query;
 }
 

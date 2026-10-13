@@ -171,22 +171,33 @@ CUDA_CALLABLE inline float bit_select(float a, float b, int32 mask)
 }
 
 // Per-axis selection masks for the exact intersect_ray_aabb() overload: all bits set
-// where the ray direction (equivalently its reciprocal) is negative. Compute once per ray
-// and store with the query so the traversal loop carries no per-node sign comparison.
+// where the ray direction (equivalently its reciprocal) is negative.
+//
+// Used inline at the call site, the compiler folds the bitwise selects back into
+// compare + select on the sign of rcp_dir, which costs three compares per node test but
+// keeps no extra registers live across a traversal loop.
 CUDA_CALLABLE inline vec3i ray_aabb_sign_masks(const vec3& rcp_dir)
 {
-    vec3i masks(rcp_dir[0] < 0.0f ? -1 : 0, rcp_dir[1] < 0.0f ? -1 : 0, rcp_dir[2] < 0.0f ? -1 : 0);
+    return vec3i(rcp_dir[0] < 0.0f ? -1 : 0, rcp_dir[1] < 0.0f ? -1 : 0, rcp_dir[2] < 0.0f ? -1 : 0);
+}
+
+// Same masks, made opaque to the compiler so they stay plain registers: the bitwise selects
+// in intersect_ray_aabb() then compile to single LOP3 instructions with no per-node compare.
+// Use this when the masks are computed once per ray and stored with the query for a
+// traversal loop whose node test is the hot path (the scalar bvh_query_ray()). It costs three
+// live registers for the duration of the traversal.
+CUDA_CALLABLE inline vec3i ray_aabb_sign_masks_opaque(const vec3& rcp_dir)
+{
+    vec3i masks = ray_aabb_sign_masks(rcp_dir);
 #if defined(__CUDA_ARCH__)
-    // Hide the masks' origin from the compiler. Otherwise it folds the bitwise selects in
-    // intersect_ray_aabb() back into compare + select, and ptxas re-evaluates the three
-    // compares on every node test instead of keeping them live (measured 1-3% slower).
     asm("" : "+r"(masks[0]), "+r"(masks[1]), "+r"(masks[2]));
 #endif
     return masks;
 }
 
 // Exact slab test of a ray against a closed box, with precomputed sign masks
-// (sign_masks = ray_aabb_sign_masks(rcp_dir)). The ray is pos + t * dir for t >= 0 and
+// (sign_masks = ray_aabb_sign_masks(rcp_dir) or ray_aabb_sign_masks_opaque(rcp_dir)). The
+// ray is pos + t * dir for t >= 0 and
 // rcp_dir is the componentwise reciprocal of dir, infinite where dir is zero.
 //
 // The near/far distances of each slab are picked by the sign of the direction instead of
